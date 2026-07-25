@@ -16,6 +16,8 @@ import {
   estimateTokensFromText,
   logCost,
 } from '../services/cost-logger';
+import { resolveModelRoute } from '../catalog';
+import { getProvider } from '../providers';
 import { logRequestDump } from '../services/request-dump-logger';
 import {
   formatUpstreamError,
@@ -371,6 +373,69 @@ function flushBufferedChunks(
   res.end();
 }
 
+interface FallbackRoute {
+  adapter: ProviderAdapter;
+  model: string;
+}
+
+/**
+ * Resolve the configured rate-limit fallback model alias into a provider + upstream model.
+ * Returns null if RATE_LIMIT_FALLBACK_MODEL is not set or can't be resolved.
+ */
+async function resolveRateLimitFallback(): Promise<FallbackRoute | null> {
+  const fallbackModel = appConfig.rateLimitFallbackModel;
+  if (!fallbackModel) return null;
+
+  const route = await resolveModelRoute(fallbackModel);
+  if (!route) {
+    console.warn(
+      `[rate-limit-fallback] could not resolve "${fallbackModel}" — check RATE_LIMIT_FALLBACK_MODEL`,
+    );
+    return null;
+  }
+
+  return { adapter: getProvider(route.provider), model: route.upstreamModel };
+}
+
+type ChatMessage = { role: string; content: string | unknown };
+
+function applyPromptOverrides(
+  messages: ChatMessage[] | undefined,
+): ChatMessage[] | undefined {
+  if (!messages || messages.length === 0) return messages;
+
+  const prefix = appConfig.systemPrompt;
+  const suffix = appConfig.systemPromptSuffix;
+  if (!prefix && !suffix) return messages;
+
+  const cloned = messages.map((m) => ({ ...m }));
+
+  // Prepend to the system message (create one if none exists)
+  if (prefix) {
+    const sysIdx = cloned.findIndex((m) => m.role === 'system');
+    if (sysIdx >= 0) {
+      const prev = typeof cloned[sysIdx].content === 'string' ? cloned[sysIdx].content : '';
+      cloned[sysIdx] = { ...cloned[sysIdx], content: prefix + '\n\n' + (prev as string) };
+    } else {
+      // Insert system message at the beginning
+      cloned.unshift({ role: 'system', content: prefix });
+    }
+  }
+
+  // Append to the last user message
+  if (suffix) {
+    for (let i = cloned.length - 1; i >= 0; i--) {
+      if (cloned[i].role === 'user') {
+        const prev = typeof cloned[i].content === 'string' ? cloned[i].content : '';
+        cloned[i] = { ...cloned[i], content: (prev as string) + '\n\n' + suffix };
+        break;
+      }
+    }
+  }
+
+  return cloned;
+}
+
 export async function forwardChatCompletion(
   adapter: ProviderAdapter,
   activeModel: string,
@@ -386,6 +451,10 @@ export async function forwardChatCompletion(
   const headers = forwardHeaders(incomingHeaders, adapter.config.apiKey);
   const streaming = Boolean(body.stream);
 
+  // Apply system prompt overrides
+  const messages = applyPromptOverrides(body.messages);
+  const patchedPayload = { ...payload, messages };
+
   logOutgoing({
     provider: adapter.id,
     url,
@@ -398,7 +467,7 @@ export async function forwardChatCompletion(
     // Gonka garbage-protection: buffer, detect, retry
     if (adapter.id === 'gonka') {
       await forwardStreamWithGarbageProtection(
-        adapter, model, payload, headers, url, body, requestCtx, promptEstimate, res,
+        adapter, model, patchedPayload, headers, url, body, requestCtx, promptEstimate, res,
       );
       return;
     }
@@ -410,14 +479,38 @@ export async function forwardChatCompletion(
     let upstream: AxiosResponse<NodeJS.ReadableStream> | null = null;
 
     try {
-      upstream = await resilientPost<NodeJS.ReadableStream>(url, payload, {
+      upstream = await resilientPost<NodeJS.ReadableStream>(url, patchedPayload, {
         headers,
         responseType: 'stream',
         validateStatus: () => true,
       });
-      const upstreamFailed = upstream.status >= 400;
+      const upstreamStatus = upstream.status;
+      const upstreamFailed = upstreamStatus >= 400;
 
-      res.status(upstream.status);
+      // Rate-limit fallback: if 429 and fallback configured, reroute non-streaming
+      if (upstreamStatus === 429) {
+        const fallback = await resolveRateLimitFallback();
+        if (fallback) {
+          const logMsg = `rate limited (429), falling back to ${fallback.adapter.id}/${fallback.model}`;
+          console.log(`[${new Date().toISOString().slice(11, 19)}] RATE_LIMIT ${adapter.id} | ${truncateMiddle(model, 40)} | ${logMsg}`);
+          logProxyError({ provider: adapter.id, model, message: logMsg });
+
+          // Drain and destroy the 429 stream
+          (upstream.data as NodeJS.ReadableStream & { destroy?: () => void }).destroy?.();
+          upstream = null;
+
+          await forwardChatCompletion(
+            fallback.adapter,
+            fallback.model,
+            body,
+            incomingHeaders,
+            res,
+          );
+          return;
+        }
+      }
+
+      res.status(upstreamStatus);
       res.setHeader('X-Accel-Buffering', 'no');
       res.setHeader('Cache-Control', 'no-cache, no-transform');
       for (const [key, value] of Object.entries(upstream.headers)) {
@@ -453,9 +546,9 @@ export async function forwardChatCompletion(
         });
       });
 
-      const upstreamStatus = upstream?.status ?? 502;
+      const finalStatus = upstream?.status ?? 502;
       const errorDetail = upstreamFailed
-        ? formatUpstreamError(upstreamStatus, rawErrorBody)
+        ? formatUpstreamError(finalStatus, rawErrorBody)
         : undefined;
 
       await recordUsage(
@@ -463,7 +556,7 @@ export async function forwardChatCompletion(
         promptEstimate, upstreamFailed ? '' : completionText,
         requestCtx,
         {
-          requestBody: body, upstreamUrl: url, status: upstreamStatus,
+          requestBody: body, upstreamUrl: url, status: finalStatus,
           stream: true,
           responseBody: upstreamFailed ? rawErrorBody : completionText,
           error: errorDetail,
@@ -471,7 +564,7 @@ export async function forwardChatCompletion(
       );
 
       logResponse({
-        provider: adapter.id, model, status: upstreamStatus,
+        provider: adapter.id, model, status: finalStatus,
         preview: completionText, stream: true, detail: errorDetail,
       });
     } catch (err) {
@@ -490,10 +583,29 @@ export async function forwardChatCompletion(
 
   // === Non-streaming path ===
   try {
-    const upstream = await resilientPost(url, payload, {
+    const upstream = await resilientPost(url, patchedPayload, {
       headers,
       validateStatus: () => true,
     });
+
+    // Rate-limit fallback for non-streaming requests
+    if (upstream.status === 429) {
+      const fallback = await resolveRateLimitFallback();
+      if (fallback) {
+        const logMsg = `rate limited (429), falling back to ${fallback.adapter.id}/${fallback.model}`;
+        console.log(`[${new Date().toISOString().slice(11, 19)}] RATE_LIMIT ${adapter.id} | ${truncateMiddle(model, 40)} | ${logMsg}`);
+        logProxyError({ provider: adapter.id, model, message: logMsg });
+
+        await forwardChatCompletion(
+          fallback.adapter,
+          fallback.model,
+          body,
+          incomingHeaders,
+          res,
+        );
+        return;
+      }
+    }
 
     const upstreamFailed = upstream.status >= 400;
     let errorDetail = upstreamFailed
@@ -524,7 +636,7 @@ export async function forwardChatCompletion(
 
         // Re-do the non-streaming request
         try {
-          const retryResp = await resilientPost(url, payload, {
+          const retryResp = await resilientPost(url, patchedPayload, {
             headers, validateStatus: () => true,
           });
           const retryFailed = retryResp.status >= 400;

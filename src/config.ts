@@ -35,6 +35,13 @@ export const appConfig = {
     : path.join(logsDir, 'costs.log'),
   reqLogDir: path.join(logsDir, 'req'),
   modelAllow: loadModelAllowPatterns(),
+  /** When a provider returns 429 (rate limited), retry with this model alias.
+   *  Example: "gonka/Kimi-K2.6".  Leave empty to disable rate-limit fallback. */
+  rateLimitFallbackModel: env('RATE_LIMIT_FALLBACK_MODEL'),
+  /** Prepended to the system message of every outgoing chat completion. */
+  systemPrompt: env('SYSTEM_PROMPT'),
+  /** Appended to the last user message of every outgoing chat completion. */
+  systemPromptSuffix: env('SYSTEM_PROMPT_SUFFIX'),
   gpu: {
     lmStudioNativeUrl: env('LOCAL_NATIVE_URL', 'http://localhost:1234'),
     lmStudioCli: env(
