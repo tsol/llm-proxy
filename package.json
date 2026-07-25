@@ -1,0 +1,25 @@
+{
+  "name": "hermes-llm-proxy",
+  "version": "1.0.0",
+  "description": "OpenAI-compatible LLM router for Hermes (LM Studio, Gonka, Google Gemini, Cursor SDK)",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts"
+  },
+  "dependencies": {
+    "@cursor/sdk": "^1.0.22",
+    "axios": "^1.7.9",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}
