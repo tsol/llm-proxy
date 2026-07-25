@@ -406,6 +406,56 @@ export class GoogleProvider extends OpenAICompatibleProvider {
 
 const STATIC_DEEPSEEK_MODELS = ['deepseek-v4-flash', 'deepseek-v4-pro'];
 
+export class GroqProvider extends OpenAICompatibleProvider {
+  async listModelsDetailed(): Promise<ModelListResult> {
+    const result = await super.listModelsDetailed();
+
+    // Parse per-model pricing from Groq API response.
+    // Groq returns dollars-per-token; convert to dollars-per-million.
+    const url = `${this.config.baseUrl.replace(/\/$/, '')}/models`;
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    if (this.config.apiKey) {
+      headers.Authorization = `Bearer ${this.config.apiKey}`;
+    }
+    try {
+      const { data } = await resilientGet<{
+        data?: Array<{
+          id: string;
+          pricing?: { prompt?: string; completion?: string; input_cache_read?: string };
+        }>;
+      }>(url, { headers, timeout: 15000 });
+      for (const m of data?.data ?? []) {
+        if (!m.id || !m.pricing) continue;
+        const inputPrice = Number(m.pricing.prompt ?? 0);
+        const outputPrice = Number(m.pricing.completion ?? 0);
+        const cacheRead = Number(m.pricing.input_cache_read ?? 0);
+        this.pricingOverrides.set(m.id, {
+          inputPerMillion: inputPrice > 0 ? inputPrice * 1_000_000 : 0,
+          outputPerMillion: outputPrice > 0 ? outputPrice * 1_000_000 : 0,
+          ...(cacheRead > 0 ? { cacheReadPerMillion: cacheRead * 1_000_000 } : {}),
+        });
+      }
+    } catch {
+      // pricing stays at provider defaults
+    }
+
+    return result;
+  }
+
+  protected staticModels(): OpenAIModel[] {
+    // Never used as fallback — live fetch always succeeds for Groq.
+    // Return default model only as a last resort.
+    return [
+      {
+        id: this.config.defaultModel,
+        object: 'model' as const,
+        created: 0,
+        owned_by: this.config.ownedBy,
+      },
+    ];
+  }
+}
+
 export class DeepSeekProvider extends OpenAICompatibleProvider {
   getPricing(model: string): ProviderPricing {
     return getDeepSeekModelPricing(model, this.config.pricing);
@@ -454,6 +504,8 @@ export function createProvider(config: ProviderConfig): ProviderAdapter {
       return new CursorProvider(config);
     case 'deepseek':
       return new DeepSeekProvider(config);
+    case 'groq':
+      return new GroqProvider(config);
     default:
       throw new Error(`Unsupported provider: ${config.id}`);
   }

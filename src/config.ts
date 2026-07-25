@@ -126,6 +126,20 @@ export const providerConfigs: Record<ProviderId, ProviderConfig> = {
       defaultModel: 'deepseek-v4-flash',
     },
   ),
+  groq: providerConfig(
+    'groq',
+    'GROQ',
+    'groq',
+    undefined,
+    {
+      inputPerMillion: 0,
+      outputPerMillion: 0,
+    },
+    {
+      baseUrl: 'https://api.groq.com/openai/v1',
+      defaultModel: 'llama-4-maverick-17b-instruct',
+    },
+  ),
 };
 
 export function normalizeTarget(target: string): ProviderId {
@@ -135,7 +149,8 @@ export function normalizeTarget(target: string): ProviderId {
     target === 'gonka' ||
     target === 'google' ||
     target === 'cursor' ||
-    target === 'deepseek'
+    target === 'deepseek' ||
+    target === 'groq'
   ) {
     return target;
   }

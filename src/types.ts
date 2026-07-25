@@ -1,4 +1,4 @@
-export type ProviderId = 'local' | 'gonka' | 'google' | 'cursor' | 'deepseek';
+export type ProviderId = 'local' | 'gonka' | 'google' | 'cursor' | 'deepseek' | 'groq';
 
 /** Legacy alias used by switch-model.sh / TODO doc */
 export type RouterTarget = ProviderId | 'remote';
