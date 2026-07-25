@@ -407,10 +407,12 @@ export class GoogleProvider extends OpenAICompatibleProvider {
 const STATIC_DEEPSEEK_MODELS = ['deepseek-v4-flash', 'deepseek-v4-pro'];
 
 export class GroqProvider extends OpenAICompatibleProvider {
+  private modelMaxTokens = new Map<string, number>();
+
   async listModelsDetailed(): Promise<ModelListResult> {
     const result = await super.listModelsDetailed();
 
-    // Parse per-model pricing from Groq API response.
+    // Parse per-model pricing + max_tokens from Groq API response.
     // Groq returns dollars-per-token; convert to dollars-per-million.
     const url = `${this.config.baseUrl.replace(/\/$/, '')}/models`;
     const headers: Record<string, string> = { Accept: 'application/json' };
@@ -422,24 +424,35 @@ export class GroqProvider extends OpenAICompatibleProvider {
         data?: Array<{
           id: string;
           pricing?: { prompt?: string; completion?: string; input_cache_read?: string };
+          max_completion_tokens?: number;
         }>;
       }>(url, { headers, timeout: 15000 });
       for (const m of data?.data ?? []) {
-        if (!m.id || !m.pricing) continue;
-        const inputPrice = Number(m.pricing.prompt ?? 0);
-        const outputPrice = Number(m.pricing.completion ?? 0);
-        const cacheRead = Number(m.pricing.input_cache_read ?? 0);
-        this.pricingOverrides.set(m.id, {
-          inputPerMillion: inputPrice > 0 ? inputPrice * 1_000_000 : 0,
-          outputPerMillion: outputPrice > 0 ? outputPrice * 1_000_000 : 0,
-          ...(cacheRead > 0 ? { cacheReadPerMillion: cacheRead * 1_000_000 } : {}),
-        });
+        if (!m.id) continue;
+        if (m.pricing) {
+          const inputPrice = Number(m.pricing.prompt ?? 0);
+          const outputPrice = Number(m.pricing.completion ?? 0);
+          const cacheRead = Number(m.pricing.input_cache_read ?? 0);
+          this.pricingOverrides.set(m.id, {
+            inputPerMillion: inputPrice > 0 ? inputPrice * 1_000_000 : 0,
+            outputPerMillion: outputPrice > 0 ? outputPrice * 1_000_000 : 0,
+            ...(cacheRead > 0 ? { cacheReadPerMillion: cacheRead * 1_000_000 } : {}),
+          });
+        }
+        if (typeof m.max_completion_tokens === 'number' && m.max_completion_tokens > 0) {
+          this.modelMaxTokens.set(m.id, m.max_completion_tokens);
+        }
       }
     } catch {
       // pricing stays at provider defaults
     }
 
     return result;
+  }
+
+  /** Get the model's max output token limit (from API), or undefined if unknown. */
+  getModelMaxTokens(modelId: string): number | undefined {
+    return this.modelMaxTokens.get(modelId);
   }
 
   protected staticModels(): OpenAIModel[] {

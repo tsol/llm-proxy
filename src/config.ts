@@ -38,6 +38,9 @@ export const appConfig = {
   /** When a provider returns 429 (rate limited), retry with this model alias.
    *  Example: "gonka/Kimi-K2.6".  Leave empty to disable rate-limit fallback. */
   rateLimitFallbackModel: env('RATE_LIMIT_FALLBACK_MODEL'),
+  /** General fallback model for any upstream failure (timeout, 5xx, network error).
+   *  Default: gonka/Kimi-K2.6.  Leave empty to disable. */
+  generalFallbackModel: env('GENERAL_FALLBACK_MODEL', 'gonka/Kimi-K2.6'),
   /** Prepended to the system message of every outgoing chat completion. */
   systemPrompt: env('SYSTEM_PROMPT'),
   /** Appended to the last user message of every outgoing chat completion. */
@@ -155,8 +158,7 @@ export function normalizeTarget(target: string): ProviderId {
     target === 'local' ||
     target === 'gonka' ||
     target === 'google' ||
-    target === 'cursor' ||
-    target === 'deepseek' ||
+    target === 'cursor' /    target === 'deepseek' ||
     target === 'groq'
   ) {
     return target;

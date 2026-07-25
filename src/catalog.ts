@@ -561,6 +561,23 @@ function findEntry(requested: string): CatalogEntry | undefined {
   const direct = entriesByKey.get(raw) ?? entriesByKey.get(norm(raw));
   if (direct) return direct;
 
+  // Support "provider/model" format (e.g. "gonka/Kimi-K2.6")
+  const slashIdx = raw.indexOf('/');
+  if (slashIdx > 0) {
+    const providerPart = norm(raw.slice(0, slashIdx));
+    const modelPart = norm(raw.slice(slashIdx + 1));
+    const byProvider = catalogEntries.find(
+      (e) =>
+        e.provider === providerPart &&
+        (norm(e.safeId) === modelPart ||
+         norm(e.model.id) === modelPart ||
+         norm(e.upstreamId) === modelPart ||
+         norm(shortAlias(e.upstreamId)) === modelPart ||
+         norm(e.upstreamId).endsWith(`/${modelPart}`)),
+    );
+    if (byProvider) return byProvider;
+  }
+
   const lower = norm(raw);
   const exact = catalogEntries.find(
     (e) =>
