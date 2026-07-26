@@ -73,8 +73,85 @@ Available Hermes providers (configured by `./run.sh configure`):
 ## Configuration
 
 Copy `.env.example` to `.env` and fill in API keys.  
-Model aliases and fallback chains are defined there via `MODEL{n}_ALIAS` / `MODEL{n}_TRY`.  
 Rate limits and model quirks are in `src/providers/model-metadata.json`.
+
+### Model Aliases
+
+Aliases map user-facing names to fallback chains of `provider/model` entries. They come from two sources, merged at startup:
+
+1. **`.env` (locked)** — `MODEL{n}_ALIAS` + `MODEL{n}_TRY`. Cannot be changed at runtime.
+2. **`store/aliases.json` (user-managed)** — persisted JSON, created and modified via the `/v1/aliases` API.
+
+Env aliases always take precedence. If a store alias has the same name as an env alias, the env one wins.
+
+### Alias Management API
+
+```
+GET    /v1/aliases             — list all aliases (locked + user)
+GET    /v1/aliases/resolved    — show the merged alias map used by the router
+GET    /v1/aliases/:name       — get a single alias by name
+POST   /v1/aliases             — create a new user alias
+PUT    /v1/aliases/:name       — update an existing user alias (change chain)
+DELETE /v1/aliases/:name       — delete a user alias
+```
+
+**Locked aliases** (defined in `.env`) return `"locked": true` and cannot be modified or deleted — API returns 403.
+
+**Creating an alias:**
+
+```bash
+curl -X POST http://localhost:5001/v1/aliases \
+  -H "Content-Type: application/json" \
+  -d '{
+    "alias": "my-fast-model",
+    "chain": ["groq/llama-4-maverick-17b-instruct", "gonka/Kimi-K2.6"]
+  }'
+```
+
+Response (201):
+```json
+{
+  "alias": "my-fast-model",
+  "chain": ["groq/llama-4-maverick-17b-instruct", "gonka/Kimi-K2.6"],
+  "locked": false,
+  "updated_at": "2026-07-26T15:00:00.000Z"
+}
+```
+
+**Updating an alias:**
+
+```bash
+curl -X PUT http://localhost:5001/v1/aliases/my-fast-model \
+  -H "Content-Type: application/json" \
+  -d '{
+    "chain": ["cerebras/gpt-oss-120b", "deepseek/deepseek-v4-flash"]
+  }'
+```
+
+**Deleting an alias:**
+
+```bash
+curl -X DELETE http://localhost:5001/v1/aliases/my-fast-model
+```
+
+**Listing all aliases:**
+
+```bash
+curl http://localhost:5001/v1/aliases
+```
+
+Response:
+```json
+{
+  "object": "list",
+  "data": [
+    { "alias": "gemma-4-12b", "chain": ["local/google/gemma-4-12b-qat"], "locked": true },
+    { "alias": "my-fast-model", "chain": ["groq/llama-4-maverick-17b-instruct", "gonka/Kimi-K2.6"], "locked": false }
+  ]
+}
+```
+
+After modifying aliases via API, they persist in `store/aliases.json` and survive restarts. No restart needed — the router uses the merged map immediately.
 
 ## Quick Start
 

@@ -6,6 +6,7 @@ import { getDefaultModelId, startCatalogRefresh, startConnectivityWatchdog } fro
 import { chatRouter } from './routes/chat';
 import { modelsRouter } from './routes/models';
 import { adminRouter } from './routes/admin';
+import { aliasesRouter } from './routes/aliases';
 import { gpuRouter } from './routes/gpu';
 import { ensureReqLogDir, rotateReqLogs } from './services/request-dump-logger';
 
@@ -21,6 +22,7 @@ app.get('/health', (_req, res) => {
 app.use('/v1', chatRouter);
 app.use('/v1', modelsRouter);
 app.use('/v1', adminRouter);
+app.use('/v1', aliasesRouter);
 app.use('/v1', gpuRouter);
 
 // Per-provider mount: /deepseek/v1/chat/completions, /cerebras/v1/models, etc.

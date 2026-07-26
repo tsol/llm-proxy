@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "aliases": {
+    "kimi": [
+      "gonka/Kimi-K2.6",
+      "gonka/MiniMaxAI/MiniMax-M2.7",
+      "deepseek/deepseek-v4-flash"
+    ]
+  }
+}

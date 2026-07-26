@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import type { ProviderConfig, ProviderId, ProviderPricing, ProviderRateLimits, ModelQuirkOverrides } from './types';
 import { loadModelAllowPatterns } from './model-filter';
 import { getMetadataRateLimits, getMetadataModelQuirks } from './providers/metadata';
+import { setEnvAliases, getMergedAliases } from './services/alias-store';
 
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
@@ -71,21 +72,23 @@ export const appConfig = {
   rateLimitFallbackModel: env('RATE_LIMIT_FALLBACK_MODEL'),
   generalFallbackModel: env('GENERAL_FALLBACK_MODEL', 'gonka/Kimi-K2.6'),
   /** Named model aliases with fallback chains.
-   *  MODEL1_ALIAS=gemma-4-12b   MODEL1_TRY=local/google/gemma-4-12b-qat,gonka/Kimi-K2.6
-   *  MODEL2_ALIAS=deepseek-v4    MODEL2_TRY=deepseek/deepseek-v4-flash,deepseek/deepseek-v4-pro
-   *  On failure, the proxy tries each MODEL{n}_TRY entry in order.
+   *  Sources (merged, env overrides store):
+   *    .env — MODEL{n}_ALIAS / MODEL{n}_TRY
+   *    store/aliases.json — user-managed via /v1/aliases API
+   *  On failure, the proxy tries each chain entry in order.
    *  Per-provider endpoints (/deepseek/v1/...) have no fallback — only the root /v1 does. */
   modelAliases: (() => {
-    const aliases = new Map<string, string[]>();
+    const envMap = new Map<string, string[]>();
     for (let i = 1; ; i++) {
       const alias = env(`MODEL${i}_ALIAS`);
       const tryChain = env(`MODEL${i}_TRY`);
       if (!alias) break;
       if (!tryChain) continue;
       const chain = tryChain.split(',').map((s) => s.trim()).filter(Boolean);
-      if (chain.length > 0) aliases.set(alias, chain);
+      if (chain.length > 0) envMap.set(alias, chain);
     }
-    return aliases;
+    setEnvAliases(envMap);
+    return getMergedAliases();
   })(),
   /** Backward-compat: global fallback chain for any model not in modelAliases above. */
   modelFallbackChain: env('MODEL_FALLBACK_CHAIN')
