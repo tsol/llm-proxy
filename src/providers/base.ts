@@ -503,6 +503,78 @@ export class DeepSeekProvider extends OpenAICompatibleProvider {
   }
 }
 
+export class CerebrasProvider extends OpenAICompatibleProvider {
+  // Cerebras serves static catalog at /models via OpenAI-compatible API.
+  // The base class handles GET /models + fallback to staticModels().
+  // Cerebras /models returns context_length per model in its data payload.
+
+  protected staticModels(): OpenAIModel[] {
+    return [
+      {
+        id: this.config.defaultModel || 'gpt-oss-120b',
+        object: 'model',
+        created: 0,
+        owned_by: this.config.ownedBy,
+        context_length: 256_000,
+      },
+    ];
+  }
+}
+
+export class OpenRouterProvider extends OpenAICompatibleProvider {
+  // OpenRouter serves live models at /models (OpenAI-compatible).
+  // Per-model pricing is fetched from GET /models → data[].pricing (dollars-per-token).
+  // Context lengths are also returned by OpenRouter's API (context_length field).
+
+  async listModelsDetailed(): Promise<ModelListResult> {
+    const result = await super.listModelsDetailed();
+
+    // Parse per-model pricing from OpenRouter API response.
+    // OpenRouter returns dollars-per-token; convert to dollars-per-million.
+    const url = `${this.config.baseUrl.replace(/\/$/, '')}/models`;
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    if (this.config.apiKey) {
+      headers.Authorization = `Bearer ${this.config.apiKey}`;
+    }
+    try {
+      const { data } = await resilientGet<{
+        data?: Array<{
+          id: string;
+          pricing?: { prompt?: string; completion?: string };
+          context_length?: number;
+        }>;
+      }>(url, { headers, timeout: 15000 });
+      for (const m of data?.data ?? []) {
+        if (!m.id) continue;
+        if (m.pricing) {
+          const inputPrice = Number(m.pricing.prompt ?? 0);
+          const outputPrice = Number(m.pricing.completion ?? 0);
+          this.pricingOverrides.set(m.id, {
+            inputPerMillion: inputPrice > 0 ? inputPrice * 1_000_000 : 0,
+            outputPerMillion: outputPrice > 0 ? outputPrice * 1_000_000 : 0,
+          });
+        }
+      }
+    } catch {
+      // pricing stays at provider defaults
+    }
+
+    return result;
+  }
+
+  protected staticModels(): OpenAIModel[] {
+    return [
+      {
+        id: this.config.defaultModel || 'openai/gpt-4o',
+        object: 'model',
+        created: 0,
+        owned_by: this.config.ownedBy,
+        context_length: 128_000,
+      },
+    ];
+  }
+}
+
 export function createProvider(config: ProviderConfig): ProviderAdapter {
   switch (config.id) {
     case 'local':
@@ -519,6 +591,10 @@ export function createProvider(config: ProviderConfig): ProviderAdapter {
       return new DeepSeekProvider(config);
     case 'groq':
       return new GroqProvider(config);
+    case 'cerebras':
+      return new CerebrasProvider(config);
+    case 'openrouter':
+      return new OpenRouterProvider(config);
     default:
       throw new Error(`Unsupported provider: ${config.id}`);
   }

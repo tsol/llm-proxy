@@ -1,0 +1,83 @@
+{
+  "cerebras": {
+    "rateLimits": {
+      "tokensPerMinute": 30000,
+      "requestsPerMinute": 5,
+      "requestsPerDay": 2400,
+      "tokensPerDay": 1000000
+    },
+    "models": {
+      "gpt-oss-120b": {
+        "contextLength": 131000,
+        "maxTokens": 40000,
+        "type": "Production"
+      },
+      "gemma-4-31b": {
+        "contextLength": 131072,
+        "maxTokens": 40000,
+        "type": "Preview"
+      },
+      "zai-glm-4.7": {
+        "contextLength": 131072,
+        "maxTokens": 65000,
+        "type": "Preview"
+      }
+    }
+  },
+  "openrouter": {
+    "rateLimits": {
+      "requestsPerMinute": 200
+    },
+    "models": {}
+  },
+  "groq": {
+    "rateLimits": {
+      "tokensPerMinute": 50000,
+      "requestsPerMinute": 30
+    },
+    "models": {}
+  },
+  "google": {
+    "rateLimits": {
+      "requestsPerMinute": 15
+    },
+    "models": {}
+  },
+  "deepseek": {
+    "rateLimits": {
+      "requestsPerDay": 10000
+    },
+    "models": {
+      "deepseek-v4-flash": {
+        "contextLength": 1000000
+      },
+      "deepseek-v4-pro": {
+        "contextLength": 1000000
+      },
+      "deepseek-chat": {
+        "contextLength": 128000
+      },
+      "deepseek-reasoner": {
+        "contextLength": 128000
+      }
+    }
+  },
+  "cursor": {
+    "rateLimits": {
+      "requestsPerMinute": 30
+    },
+    "models": {
+      "composer-2.5": {
+        "contextLength": 200000
+      }
+    }
+  },
+  "gonka": {
+    "rateLimits": {},
+    "models": {}
+  },
+  "local": {
+    "rateLimits": {},
+    "models": {}
+  }
+}

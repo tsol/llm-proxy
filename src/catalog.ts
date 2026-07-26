@@ -20,7 +20,7 @@ export interface CatalogModel extends OpenAIModel {
 }
 
 interface CatalogEntry {
-  provider: ProviderId;
+  provider: string;
   upstreamId: string;
   safeId: string;
   model: CatalogModel;
@@ -36,8 +36,8 @@ let catalogEntries: CatalogEntry[] = [];
 let defaultUpstreamId = '';
 let lastRefreshMs = 0;
 let fullRefreshPromise: Promise<void> | null = null;
-const providerRefreshAt = new Map<ProviderId, number>();
-const providerRefreshPromises = new Map<ProviderId, Promise<void>>();
+const providerRefreshAt = new Map<string, number>();
+const providerRefreshPromises = new Map<string, Promise<void>>();
 
 export type ProviderCatalogState = 'live' | 'stale' | 'fallback' | 'error' | 'unknown';
 
@@ -48,7 +48,7 @@ interface ProviderStateRecord {
   lastError: string | null;
 }
 
-const providerStates = new Map<ProviderId, ProviderStateRecord>();
+const providerStates = new Map<string, ProviderStateRecord>();
 
 function defaultProviderState(): ProviderStateRecord {
   return {
@@ -60,7 +60,7 @@ function defaultProviderState(): ProviderStateRecord {
 }
 
 function noteProviderState(
-  providerId: ProviderId,
+  providerId: string,
   patch: Partial<ProviderStateRecord>,
 ): void {
   const prev = providerStates.get(providerId) ?? defaultProviderState();
@@ -68,7 +68,7 @@ function noteProviderState(
 }
 
 export interface ProviderState {
-  provider: ProviderId;
+  provider: string;
   state: ProviderCatalogState;
   model_count: number;
   last_refresh_at: string | null;
@@ -212,7 +212,7 @@ function rebuildCatalogFromEntries(entries: CatalogEntry[]): BuiltCatalog {
   return { byKey, entries };
 }
 
-function collectPeerUpstreamIds(excludeProvider?: ProviderId): Set<string> {
+function collectPeerUpstreamIds(excludeProvider?: string): Set<string> {
   const ids = new Set<string>();
   for (const entry of catalogEntries) {
     if (excludeProvider && entry.provider === excludeProvider) continue;
@@ -608,12 +608,12 @@ export async function resolveModelRoute(
   if (!entry) return null;
 
   return {
-    provider: entry.provider,
+    provider: entry.provider as ProviderId,
     upstreamModel: entry.upstreamId,
     displayModel: entry.safeId,
     capabilities:
       entry.model.capabilities ??
-      resolveModelCapabilities(entry.provider, entry.upstreamId, {
+      resolveModelCapabilities(entry.provider as ProviderId, entry.upstreamId, {
         modelType: entry.model.model_type,
       }),
   };

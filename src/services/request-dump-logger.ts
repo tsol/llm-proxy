@@ -1,4 +1,5 @@
 import fs from 'fs/promises';
+import { existsSync } from 'fs';
 import path from 'path';
 import { appConfig } from '../config';
 import type { ChatCompletionRequest, CompletionRequestContext, ProviderId } from '../types';
@@ -87,6 +88,49 @@ function serializeBody(value: unknown): string {
 
 export async function ensureReqLogDir(): Promise<void> {
   await fs.mkdir(appConfig.reqLogDir, { recursive: true });
+}
+
+/**
+ * Move all files from req/ into req-old/ at startup, archiving previous run's dumps.
+ * Clears req-old/ first to avoid stale accumulation.
+ */
+export async function rotateReqLogs(): Promise<void> {
+  const src = appConfig.reqLogDir;
+  const dst = appConfig.reqOldDir;
+
+  try {
+    // Ensure source directory exists (may be first run)
+    await fs.mkdir(src, { recursive: true });
+
+    const entries = await fs.readdir(src, { withFileTypes: true });
+    if (entries.length === 0) return;
+
+    // Clear old destination
+    if (existsSync(dst)) {
+      await fs.rm(dst, { recursive: true, force: true });
+    }
+    await fs.mkdir(dst, { recursive: true });
+
+    let moved = 0;
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      const srcPath = path.join(src, entry.name);
+      const dstPath = path.join(dst, entry.name);
+      try {
+        await fs.rename(srcPath, dstPath);
+        moved++;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[req-rotate] failed to move ${entry.name}: ${msg}`);
+      }
+    }
+    if (moved > 0) {
+      console.log(`[req-rotate] moved ${moved} files from req/ → req-old/`);
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[req-rotate] rotation failed: ${msg}`);
+  }
 }
 
 export async function logRequestDump(entry: RequestDumpEntry): Promise<void> {

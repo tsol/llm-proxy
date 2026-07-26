@@ -25,6 +25,9 @@ export function loadModelAllowPatterns(): Partial<Record<ProviderId, RegExp[]>> 
     'google',
     'cursor',
     'deepseek',
+    'groq',
+    'cerebras',
+    'openrouter',
   ];
   const global = parseRegexList(process.env.MODEL_ALLOW?.trim() ?? '', 'MODEL_ALLOW');
   const out: Partial<Record<ProviderId, RegExp[]>> = {};

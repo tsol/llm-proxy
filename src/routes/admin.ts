@@ -3,6 +3,7 @@ import { listCatalogModels, refreshCatalog, resolveModelRoute, getProviderStates
 import { getDefaultSnapshot, setDefault } from '../default-model';
 import { getProvider, providerIds } from '../providers';
 import { serializeCatalogModelDetail } from '../model-response';
+import { getLiveQuota } from '../services/rate-limit-tracker';
 
 export const adminRouter = Router();
 
@@ -23,8 +24,12 @@ adminRouter.get('/router/providers', (_req: Request, res: Response) => {
       const adapter = getProvider(id);
       return {
         id,
+        displayOrder: adapter.config.displayOrder ?? 99,
         defaultModel: adapter.config.defaultModel,
+        defaultContextLength: adapter.config.defaultContextLength,
         baseUrl: adapter.config.baseUrl,
+        rateLimits: adapter.config.rateLimits ?? {},
+        liveQuota: getLiveQuota(id) ?? undefined,
       };
     }),
   });

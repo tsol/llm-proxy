@@ -1,6 +1,11 @@
-import type { ProviderId, ProviderPricing } from './types';
+import type { ProviderId, ProviderConfig, ProviderPricing, ModelQuirkOverrides } from './types';
 import { appConfig } from './config';
 import { matchesModelAllow } from './model-filter';
+import {
+  getProvider,
+  getProviderEntry,
+  getProviderDisplayOrder,
+} from './providers/registry';
 
 export interface DisplayInput {
   provider: ProviderId;
@@ -10,44 +15,7 @@ export interface DisplayInput {
   modelType?: string;
 }
 
-const EXCLUDE_ID_PATTERNS = [
-  /embed/i,
-  /\btts\b/i,
-  /speech/i,
-  /transcribe/i,
-  /native-audio/i,
-  /\baudio(?!.*flash)/i,
-  /\bvideo\b/i,
-  /\bveo-/i,
-  /\bimagen-/i,
-  /image-generation/i,
-  /robotics/i,
-  /deep-research/i,
-  /computer-use/i,
-  /\baqa\b/i,
-  /-live-/i,
-  /\blive-preview/i,
-  /\brealtime\b/i,
-  /\blyria-/i,
-  /\bchirp\b/i,
-  /generate-preview/i,
-  /fast-generate/i,
-  /ultra-generate/i,
-];
-
-/** Drop version-suffixed Google duplicates when a canonical sibling exists. */
 const GOOGLE_DEDUP_SUFFIX = /-(001|002|latest)$/i;
-
-const GOOGLE_CONTEXT: Array<{ match: RegExp; ctx: number }> = [
-  { match: /flash-lite|flash_lite/i, ctx: 1_000_000 },
-  { match: /gemini-3\.5-flash/i, ctx: 1_000_000 },
-  { match: /gemini-.*-flash/i, ctx: 1_000_000 },
-  { match: /gemini-.*-pro/i, ctx: 1_000_000 },
-  { match: /gemini-flash/i, ctx: 1_000_000 },
-  { match: /gemini-pro/i, ctx: 1_000_000 },
-  { match: /antigravity/i, ctx: 1_000_000 },
-  { match: /gemma/i, ctx: 128_000 },
-];
 
 export function shortAlias(upstreamId: string): string {
   const bare = upstreamId.replace(/^models\//, '').trim();
@@ -55,12 +23,61 @@ export function shortAlias(upstreamId: string): string {
   return slash >= 0 ? bare.slice(slash + 1) : bare;
 }
 
+function getProviderDefaultContext(id: ProviderId): number | undefined {
+  const adapter = getProvider(id);
+  return adapter.config.defaultContextLength;
+}
+
+function getModelQuirkOverride(
+  config: ProviderConfig,
+  upstreamId: string,
+): ModelQuirkOverrides | undefined {
+  if (!config.modelQuirks) return undefined;
+  // Try exact match first, then prefix match
+  for (const [key, quirk] of Object.entries(config.modelQuirks)) {
+    if (upstreamId === key || upstreamId.toLowerCase().startsWith(key.toLowerCase())) {
+      return quirk;
+    }
+  }
+  return undefined;
+}
+
 export function shouldIncludeModel(input: DisplayInput): boolean {
+  // Skip embeddings
   if (input.modelType?.toLowerCase() === 'embedding') return false;
 
   const id = input.upstreamId.toLowerCase();
-  if (EXCLUDE_ID_PATTERNS.some((re) => re.test(id))) return false;
 
+  // Provider-specific quirks exclusion
+  const adapter = getProvider(input.provider);
+  const quirks = adapter.config.modelQuirks;
+  if (quirks) {
+    const override = getModelQuirkOverride(adapter.config, input.upstreamId);
+    if (override?.excludePattern?.test(id)) return false;
+  }
+
+  // If MODEL{n}_ALIAS configs exist, only show those in the root catalog
+  if (appConfig.modelAliases && appConfig.modelAliases.size > 0) {
+    // Check if this upstream model is referenced in any alias TRY chain
+    let included = false;
+    for (const [_alias, chain] of appConfig.modelAliases) {
+      for (const entry of chain) {
+        const normalizedEntry = entry.toLowerCase();
+        if (
+          id === normalizedEntry ||
+          id.endsWith(`/${normalizedEntry}`) ||
+          normalizedEntry.endsWith(`/${id}`)
+        ) {
+          included = true;
+          break;
+        }
+      }
+      if (included) break;
+    }
+    if (!included) return false;
+  }
+
+  // Allow-list filtering (MODEL_ALLOW env var)
   if (
     !matchesModelAllow(
       appConfig.modelAllow[input.provider],
@@ -88,34 +105,41 @@ export function isGoogleDuplicate(
   return allUpstreamIds.has(canonicalId);
 }
 
-/** Values above this are LM Studio max_context_length leaks, not allocated VRAM context. */
-const LOCAL_MAX_CONTEXT_LEAK_THRESHOLD = 200_000;
-
+/** Resolve context length using API data → model quirks → provider default → global fallbacks. */
 export function resolveContextLength(input: DisplayInput): number | undefined {
+  // 1. API-provided context length — valid unless it's a LM Studio leak
   if (input.contextLength && input.contextLength > 0) {
-    if (
-      input.provider === 'local' &&
-      input.contextLength > LOCAL_MAX_CONTEXT_LEAK_THRESHOLD
-    ) {
-      return undefined;
+    const entry = getProviderEntry(input.provider);
+    const leakThreshold = 200_000; // default for LM Studio
+    if (input.provider === 'local' && leakThreshold && input.contextLength > leakThreshold) {
+      // skip — this is a model-card max, not allocated VRAM
+    } else {
+      return input.contextLength;
     }
-    return input.contextLength;
   }
 
+  // 2. Model quirk overrides from provider config
+  const adapter = getProvider(input.provider);
+  const override = getModelQuirkOverride(adapter.config, input.upstreamId);
+  if (override?.contextLength && override.contextLength > 0) {
+    return override.contextLength;
+  }
+
+  // 3. Provider-level default context length
+  const providerDefault = getProviderDefaultContext(input.provider);
+  if (providerDefault && providerDefault > 0) return providerDefault;
+
+  // 4. Legacy hardcoded per-pattern rules (Google / DeepSeek remain for now)
   if (input.provider === 'google') {
     const bare = input.upstreamId.replace(/^models\//, '');
-    for (const rule of GOOGLE_CONTEXT) {
-      if (rule.match.test(bare)) return rule.ctx;
-    }
-  }
-
-  if (input.provider === 'deepseek') {
-    if (/deepseek-chat|deepseek-reasoner/.test(input.upstreamId)) return 128_000;
-    if (/deepseek-v4|deepseek/.test(input.upstreamId)) return 1_000_000;
-  }
-
-  if (input.provider === 'cursor') {
-    if (/composer/i.test(input.upstreamId)) return 200_000;
+    if (/flash-lite|flash_lite/i.test(bare)) return 1_000_000;
+    if (/gemini-3\.5-flash/i.test(bare)) return 1_000_000;
+    if (/gemini-.*-flash/i.test(bare)) return 1_000_000;
+    if (/gemini-.*-pro/i.test(bare)) return 1_000_000;
+    if (/gemini-flash/i.test(bare)) return 1_000_000;
+    if (/gemini-pro/i.test(bare)) return 1_000_000;
+    if (/antigravity/i.test(bare)) return 1_000_000;
+    if (/gemma/i.test(bare)) return 128_000;
   }
 
   return undefined;
@@ -129,16 +153,8 @@ export function buildSafeModelId(input: DisplayInput): string {
   return shortAlias(input.upstreamId);
 }
 
-export function displaySortKey(safeId: string, provider: ProviderId): string {
-  const order =
-    provider === 'local'
-      ? '0'
-      : provider === 'gonka'
-        ? '1'
-        : provider === 'google'
-          ? '2'
-          : provider === 'cursor'
-            ? '3'
-            : '4';
-  return `${order}:${safeId}`;
+/** Sort key using provider displayOrder from registry — no more hardcoded if-chains. */
+export function displaySortKey(safeId: string, provider: string): string {
+  const order = getProviderDisplayOrder(provider);
+  return `${String(order).padStart(2, '0')}:${safeId}`;
 }

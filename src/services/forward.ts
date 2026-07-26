@@ -28,6 +28,7 @@ import {
   truncateMiddle,
 } from '../services/request-logger';
 import { isGarbage, analyzeText } from './garbage-detector';
+import { trackUpstreamHeaders } from './rate-limit-tracker';
 
 const HOP_BY_HOP = new Set([
   'connection',
@@ -48,6 +49,7 @@ const OVERWHELMED_MESSAGE = "I am a bit overwhelmed. Let me take a deep breath a
 function forwardHeaders(
   incoming: IncomingHttpHeaders,
   apiKey: string,
+  extraHeaders?: Record<string, string>,
 ): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(incoming)) {
@@ -58,6 +60,11 @@ function forwardHeaders(
     out.authorization = `Bearer ${apiKey}`;
   }
   out['content-type'] = 'application/json';
+  if (extraHeaders) {
+    for (const [key, value] of Object.entries(extraHeaders)) {
+      out[key.toLowerCase()] = value;
+    }
+  }
   return out;
 }
 
@@ -383,30 +390,12 @@ interface FallbackRoute {
  * Resolve the configured rate-limit fallback model alias into a provider + upstream model.
  * Returns null if RATE_LIMIT_FALLBACK_MODEL is not set or can't be resolved.
  */
-async function resolveFallback(configKey: string, label: string): Promise<FallbackRoute | null> {
-  const modelAlias = configKey;
-  if (!modelAlias) return null;
-
-  const route = await resolveModelRoute(modelAlias);
-  if (!route) {
-    console.warn(
-      `[${label}] could not resolve "${modelAlias}" — check config`,
-    );
-    return null;
-  }
-
-  return { adapter: getProvider(route.provider), model: route.upstreamModel };
-}
-
-async function resolveRateLimitFallback(): Promise<FallbackRoute | null> {
-  return resolveFallback(appConfig.rateLimitFallbackModel, 'rate-limit-fallback');
-}
-
-async function resolveGeneralFallback(): Promise<FallbackRoute | null> {
-  return resolveFallback(appConfig.generalFallbackModel, 'general-fallback');
-}
-
-async function tryFallbackReroute(
+/**
+ * Try the configured fallback chain (MODEL_FALLBACK_CHAIN in .env).
+ * Each entry is "provider/model" — e.g. "gonka/Kimi-K2.6".
+ * Returns true if a fallback was tried (possibly succeeded, possibly failed).
+ */
+async function tryFallbackChain(
   label: string,
   originalAdapter: ProviderAdapter,
   originalModel: string,
@@ -414,26 +403,61 @@ async function tryFallbackReroute(
   incomingHeaders: IncomingHttpHeaders,
   res: Response,
 ): Promise<boolean> {
-  const fallback = await resolveGeneralFallback();
-  if (!fallback) return false;
+  // First, check if the current model has an alias-specific TRY chain
+  let chain: string[] | undefined;
+  const requestedModel = body.model as string | undefined;
+  if (requestedModel && appConfig.modelAliases) {
+    // Try exact match first, then check if we were called for a specific alias
+    chain = appConfig.modelAliases.get(requestedModel);
+  }
+  // Fall back to global MODEL_FALLBACK_CHAIN
+  if (!chain || !chain.length) {
+    chain = appConfig.modelFallbackChain;
+  }
+  if (!chain.length) return false;
 
-  // Don't fallback to self
-  if (fallback.adapter.id === originalAdapter.id && fallback.model === originalModel) {
-    return false;
+  for (let i = 0; i < chain.length; i++) {
+    const alias = chain[i];
+    const route = await resolveModelRoute(alias);
+    if (!route) {
+      console.warn(`[fallback] could not resolve "${alias}" in chain — skipping`);
+      continue;
+    }
+
+    // Don't fallback to self
+    if (route.provider === originalAdapter.id && route.upstreamModel === originalModel) {
+      continue;
+    }
+
+    console.log(
+      `[${new Date().toISOString().slice(11, 19)}] FALLBACK ${originalAdapter.id} | ${truncateMiddle(originalModel, 40)} | ${label} → chain[${i}]: ${route.provider}/${route.upstreamModel}`,
+    );
+    logProxyError({
+      provider: originalAdapter.id,
+      model: originalModel,
+      message: `${label}, falling back to ${route.provider}/${route.upstreamModel} (chain[${i}])`,
+    });
+
+    try {
+      await forwardChatCompletion(
+        getProvider(route.provider),
+        route.upstreamModel,
+        body,
+        incomingHeaders,
+        res,
+      );
+      return true; // succeeded
+    } catch {
+      // This fallback also failed — try next in chain
+      logProxyError({
+        provider: route.provider,
+        model: route.upstreamModel,
+        message: `fallback chain[${i}] also failed, trying next`,
+      });
+    }
   }
 
-  const logMsg = `${label}, falling back to ${fallback.adapter.id}/${fallback.model}`;
-  console.log(`[${new Date().toISOString().slice(11, 19)}] FALLBACK ${originalAdapter.id} | ${truncateMiddle(originalModel, 40)} | ${logMsg}`);
-  logProxyError({ provider: originalAdapter.id, model: originalModel, message: logMsg });
-
-  await forwardChatCompletion(
-    fallback.adapter,
-    fallback.model,
-    body,
-    incomingHeaders,
-    res,
-  );
-  return true;
+  return false; // all fallbacks exhausted
 }
 
 type ChatMessage = { role: string; content: string | unknown };
@@ -475,11 +499,6 @@ function applyPromptOverrides(
   return cloned;
 }
 
-/** Parameters that may be sent by clients but are unsupported by specific providers. */
-const UNSUPPORTED_BY_PROVIDER: Record<string, string[]> = {
-  groq: ['reasoning_effort'],
-};
-
 function sanitizeProviderParams(
   providerId: ProviderId,
   payload: ChatCompletionRequest,
@@ -487,8 +506,11 @@ function sanitizeProviderParams(
 ): ChatCompletionRequest {
   let cleaned = payload;
 
-  // Strip unsupported params
-  const strip = UNSUPPORTED_BY_PROVIDER[providerId];
+  // Strip unsupported params from provider quirks (e.g. groq: ['reasoning_effort'])
+  const knownUnsupported: Record<string, string[]> = {
+    groq: ['reasoning_effort'],
+  };
+  const strip = knownUnsupported[providerId];
   if (strip && strip.length > 0) {
     let changed = false;
     const patched = { ...cleaned };
@@ -501,7 +523,7 @@ function sanitizeProviderParams(
     if (changed) cleaned = patched;
   }
 
-  // Cap max_tokens to model's actual output limit (Groq)
+  // Cap max_tokens to model's actual output limit (Groq via adapter capability)
   if (providerId === 'groq' && typeof cleaned.max_tokens === 'number') {
     const groqAdapter = adapter as import('../providers/base').GroqProvider;
     if ('getModelMaxTokens' in groqAdapter) {
@@ -527,7 +549,7 @@ export async function forwardChatCompletion(
   const requestCtx = captureRequestContext(body.messages);
   const promptEstimate = estimateTokensFromMessages(body.messages);
   const url = adapter.chatCompletionsUrl();
-  const headers = forwardHeaders(incomingHeaders, adapter.config.apiKey);
+  const headers = forwardHeaders(incomingHeaders, adapter.config.apiKey, adapter.config.extraHeaders);
   const streaming = Boolean(body.stream);
 
   // Apply system prompt overrides
@@ -571,28 +593,65 @@ export async function forwardChatCompletion(
       const upstreamStatus = upstream.status;
       const upstreamFailed = upstreamStatus >= 400;
 
-      // Rate-limit fallback: 429 or 413 (TPM exceeded) → reroute
+      // Track live rate-limit headers from upstream
+      trackUpstreamHeaders(adapter.id, upstream.headers as Record<string, string>);
+
+      // Rate-limit fallback: 429 or 413 (TPM exceeded) → drain body, dump, reroute
       if (upstreamStatus === 429 || upstreamStatus === 413) {
-        const fallback = await resolveRateLimitFallback();
-        if (fallback) {
-          const label = upstreamStatus === 413 ? '413 (TPM exceeded)' : '429';
-          const logMsg = `rate limited (${label}), falling back to ${fallback.adapter.id}/${fallback.model}`;
-          console.log(`[${new Date().toISOString().slice(11, 19)}] RATE_LIMIT ${adapter.id} | ${truncateMiddle(model, 40)} | ${logMsg}`);
-          logProxyError({ provider: adapter.id, model, message: logMsg });
+        // Drain the error stream body fully before falling back
+        let errorBody = '';
+        await new Promise<void>((resolve) => {
+          upstream!.data.on('data', (chunk: Buffer) => {
+            errorBody += chunk.toString('utf8');
+          });
+          upstream!.data.on('end', resolve);
+          upstream!.data.on('error', resolve);
+          // Also resolve after a short timeout in case of stuck connection
+          setTimeout(resolve, 2000);
+        });
+        (upstream.data as NodeJS.ReadableStream & { destroy?: () => void }).destroy?.();
+        upstream = null;
 
-          // Drain and destroy the 429 stream
-          (upstream.data as NodeJS.ReadableStream & { destroy?: () => void }).destroy?.();
-          upstream = null;
+        // Dump full request + upstream error response before falling back
+        const parsedError = (() => {
+          try { return JSON.parse(errorBody); } catch { return errorBody; }
+        })();
+        const errorDetail = formatUpstreamError(upstreamStatus, parsedError);
+        await logRequestDump({
+          provider: adapter.id,
+          model,
+          upstreamUrl: url,
+          status: upstreamStatus,
+          stream: true,
+          tokensIn: 0,
+          tokensOut: 0,
+          dollars: 0,
+          requestBody: body,
+          responseBody: parsedError,
+          requestCtx,
+          error: `rate-limited:${upstreamStatus} | ${errorDetail}`,
+        }).catch(() => {});
 
-          await forwardChatCompletion(
-            fallback.adapter,
-            fallback.model,
-            body,
-            incomingHeaders,
-            res,
-          );
-          return;
+        // Try fallback chain for rate-limit
+        const label = upstreamStatus === 413 ? '413 (TPM exceeded)' : '429';
+        const rerouted = await tryFallbackChain(
+          label, adapter, model, body, incomingHeaders, res,
+        );
+        if (rerouted) return;
+        // No fallback — return rate-limit error to client as JSON
+        if (!res.headersSent) {
+          res.status(upstreamStatus).json(parsedError);
         }
+        await recordUsage(
+          adapter, model, null, promptEstimate, '', requestCtx,
+          {
+            requestBody: body, upstreamUrl: url, status: upstreamStatus,
+            stream: true,
+            responseBody: parsedError,
+            error: `rate-limited:${upstreamStatus} | ${errorDetail}`,
+          },
+        ).catch(() => {});
+        return;
       }
 
       res.status(upstreamStatus);
@@ -653,10 +712,27 @@ export async function forwardChatCompletion(
         preview: completionText, stream: true, detail: errorDetail,
       });
     } catch (err) {
-      // Try general fallback before returning 502
+      // Dump full request + failure info before trying fallback
       const message = describeForwardError(err);
       logProxyError({ provider: adapter.id, model, message });
-      const rerouted = await tryFallbackReroute(
+
+      await logRequestDump({
+        provider: adapter.id,
+        model,
+        upstreamUrl: url,
+        status: 502,
+        stream: true,
+        tokensIn: 0,
+        tokensOut: 0,
+        dollars: 0,
+        requestBody: body,
+        responseBody: { error: message },
+        requestCtx,
+        error: message,
+      }).catch(() => {});
+
+      // Try fallback chain before returning 502
+      const rerouted = await tryFallbackChain(
         message, adapter, model, body, incomingHeaders, res,
       );
       if (!rerouted) {
@@ -679,27 +755,77 @@ export async function forwardChatCompletion(
       validateStatus: () => true,
     });
 
-    // Rate-limit fallback: 429 or 413 (TPM exceeded) → reroute
+    // Rate-limit fallback: 429 or 413 (TPM exceeded) → try chain
     if (upstream.status === 429 || upstream.status === 413) {
-      const fallback = await resolveRateLimitFallback();
-      if (fallback) {
-        const label = upstream.status === 413 ? '413 (TPM exceeded)' : '429';
-        const logMsg = `rate limited (${label}), falling back to ${fallback.adapter.id}/${fallback.model}`;
-        console.log(`[${new Date().toISOString().slice(11, 19)}] RATE_LIMIT ${adapter.id} | ${truncateMiddle(model, 40)} | ${logMsg}`);
-        logProxyError({ provider: adapter.id, model, message: logMsg });
+      await logRequestDump({
+        provider: adapter.id,
+        model,
+        upstreamUrl: url,
+        status: upstream.status,
+        stream: false,
+        tokensIn: 0,
+        tokensOut: 0,
+        dollars: 0,
+        requestBody: body,
+        responseBody: upstream.data,
+        requestCtx,
+        error: `rate-limited:${upstream.status}`,
+      }).catch(() => {});
 
-        await forwardChatCompletion(
-          fallback.adapter,
-          fallback.model,
-          body,
-          incomingHeaders,
-          res,
-        );
-        return;
-      }
+      const label = upstream.status === 413 ? '413 (TPM exceeded)' : '429';
+      const rerouted = await tryFallbackChain(
+        label, adapter, model, body, incomingHeaders, res,
+      );
+      if (rerouted) return;
     }
 
     const upstreamFailed = upstream.status >= 400;
+
+    // Track live rate-limit headers from upstream
+    trackUpstreamHeaders(adapter.id, upstream.headers as Record<string, string>);
+
+    // OpenRouter 402: insufficient credits due to max_tokens too high.
+    // The error body contains "you can only afford N" — retry with cap.
+    if (upstream.status === 402 && typeof upstream.data === 'object' && upstream.data) {
+      const errData = upstream.data as Record<string, unknown>;
+      const rawMsg = String(errData.message ?? errData.error ?? '');
+      const affordMatch = rawMsg.match(/can only afford (\d+)/i);
+      if (affordMatch && typeof patchedPayload.max_tokens === 'number' && patchedPayload.max_tokens > 0) {
+        const affordable = Number(affordMatch[1]);
+        if (affordable > 0 && affordable < patchedPayload.max_tokens) {
+          console.log(
+            `[${new Date().toISOString().slice(11, 19)}] 402_CAP ${adapter.id} | ${truncateMiddle(model, 40)} | max_tokens ${patchedPayload.max_tokens} → ${affordable}`,
+          );
+          const cappedPayload = { ...patchedPayload, max_tokens: affordable };
+          const retryResp = await resilientPost(url, cappedPayload, {
+            headers, validateStatus: () => true,
+          });
+          const retryFailed = retryResp.status >= 400;
+          trackUpstreamHeaders(adapter.id, retryResp.headers as Record<string, string>);
+          const retryErrorDetail = retryFailed ? formatUpstreamError(retryResp.status, retryResp.data) : undefined;
+          const retryText = !retryFailed && retryResp.data && typeof retryResp.data === 'object'
+            ? String((retryResp.data as { choices?: Array<{ message?: { content?: string } }> }).choices?.[0]?.message?.content ?? '')
+            : '';
+          logResponse({
+            provider: adapter.id, model,
+            status: retryResp.status,
+            preview: retryText, stream: false,
+            detail: retryErrorDetail,
+          });
+          const usage = parseUsage(retryResp.data);
+          await recordUsage(adapter, model, usage, promptEstimate, retryText, requestCtx, {
+            requestBody: body, upstreamUrl: url, status: retryResp.status, stream: false,
+            responseBody: retryResp.data, error: retryErrorDetail,
+          }).catch((dumpErr) => {
+            logProxyError({ provider: adapter.id, model, message: describeForwardError(dumpErr) });
+          });
+          res.status(retryResp.status).json(retryResp.data);
+          return;
+        }
+      }
+      // Not a fixable 402 — fall through to normal error handling
+    }
+
     let errorDetail = upstreamFailed
       ? formatUpstreamError(upstream.status, upstream.data)
       : undefined;
@@ -785,10 +911,27 @@ export async function forwardChatCompletion(
 
     res.status(upstream.status).json(upstream.data);
   } catch (err) {
-    // Try general fallback before returning 502
+    // Dump full request + failure info before trying fallback
     const message = describeForwardError(err);
     logProxyError({ provider: adapter.id, model, message });
-    const rerouted = await tryFallbackReroute(
+
+    await logRequestDump({
+      provider: adapter.id,
+      model,
+      upstreamUrl: url,
+      status: 502,
+      stream: false,
+      tokensIn: 0,
+      tokensOut: 0,
+      dollars: 0,
+      requestBody: body,
+      responseBody: { error: message },
+      requestCtx,
+      error: message,
+    }).catch(() => {});
+
+    // Try fallback chain before returning 502
+    const rerouted = await tryFallbackChain(
       message, adapter, model, body, incomingHeaders, res,
     );
     if (!rerouted) {
@@ -828,7 +971,7 @@ async function forwardStreamWithGarbageProtection(
   let attempt = 0;
 
   while (attempt <= MAX_GARBAGE_RETRIES) {
- 
+
     attempt++;
     try {
       const result = await bufferedStreamRequest(url, payload, headers);

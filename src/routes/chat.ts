@@ -1,8 +1,8 @@
 import { Router, type Request, type Response } from 'express';
-import type { ChatCompletionRequest } from '../types';
+import type { ChatCompletionRequest, ProviderId } from '../types';
 import { resolveModelRoute, refreshProviderLive, supportedModelIds } from '../catalog';
 import { ensureLocalModelReady } from '../services/gpu-resources';
-import { getProvider } from '../providers';
+import { getProvider, allProviders, getProviderIds } from '../providers';
 import { forwardChatCompletion } from '../services/forward';
 import { forwardCursorChatCompletion } from '../services/cursor-forward';
 import { CursorProvider } from '../providers/cursor';
@@ -106,4 +106,57 @@ chatRouter.post('/chat/completions', async (req: Request, res: Response) => {
     req.headers,
     res,
   );
+});
+
+// ---- Per-provider router ---- //
+// Mounted at /v1/:provider (e.g. /v1/deepseek/chat/completions)
+// Bypasses catalog lookup — forces all requests through the named provider.
+
+export const perProviderRouter = Router({ mergeParams: true });
+
+const VALID_PROVIDER_IDS = new Set(getProviderIds());
+
+perProviderRouter.post('/chat/completions', async (req: Request, res: Response) => {
+  const provider = req.params.provider as ProviderId;
+  if (!VALID_PROVIDER_IDS.has(provider)) {
+    res.status(400).json({ error: { message: `Unknown provider: ${provider}`, type: 'invalid_request_error' } });
+    return;
+  }
+  const adapter = getProvider(provider);
+  const body = req.body as ChatCompletionRequest;
+
+  const model = adapter.resolveModel(body.model);
+
+  if (provider === 'cursor') {
+    await forwardCursorChatCompletion(adapter as CursorProvider, model, body, res);
+    return;
+  }
+
+  const requestCtx = captureRequestContext(body.messages);
+  logIncoming({ provider, model, stream: Boolean(body.stream), preview: requestCtx.userRequestPreview });
+
+  await forwardChatCompletion(adapter, model, body, req.headers, res);
+});
+
+perProviderRouter.get('/models', async (req: Request, res: Response) => {
+  const provider = req.params.provider as ProviderId;
+  if (!VALID_PROVIDER_IDS.has(provider)) {
+    res.status(400).json({ error: { message: `Unknown provider: ${provider}`, type: 'invalid_request_error' } });
+    return;
+  }
+  const adapter = getProvider(provider);
+  try {
+    const result = await adapter.listModelsDetailed();
+    const displayModels = result.models.map((m) => ({
+      id: m.id,
+      object: m.object,
+      created: m.created,
+      owned_by: m.owned_by,
+      ...(m.context_length ? { context_length: m.context_length } : {}),
+      ...(m.max_tokens ? { max_tokens: m.max_tokens } : {}),
+    }));
+    res.json({ object: 'list', data: displayModels });
+  } catch {
+    res.status(502).json({ error: { message: `Failed to fetch models for ${provider}`, type: 'proxy_error' } });
+  }
 });

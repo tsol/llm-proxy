@@ -7,7 +7,7 @@ import { chatRouter } from './routes/chat';
 import { modelsRouter } from './routes/models';
 import { adminRouter } from './routes/admin';
 import { gpuRouter } from './routes/gpu';
-import { ensureReqLogDir } from './services/request-dump-logger';
+import { ensureReqLogDir, rotateReqLogs } from './services/request-dump-logger';
 
 const app = express();
 
@@ -23,7 +23,13 @@ app.use('/v1', modelsRouter);
 app.use('/v1', adminRouter);
 app.use('/v1', gpuRouter);
 
-ensureReqLogDir()
+// Per-provider mount: /v1/deepseek/chat/completions, /v1/openrouter/models, etc.
+// Bypasses catalog lookup — forces all requests through the named provider.
+import { perProviderRouter } from './routes/chat';
+app.use('/v1/:provider(\\w+)', perProviderRouter);
+
+rotateReqLogs()
+  .then(() => ensureReqLogDir())
   .then(() => {
     // Prefer IPv4 — reduces flaky getaddrinfo / VPN DNS races on Linux.
     dns.setDefaultResultOrder('ipv4first');

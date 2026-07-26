@@ -11,6 +11,9 @@ export function serializeCatalogModel(m: CatalogModel): Record<string, unknown> 
     pricing: {
       input_per_million: m.pricing.inputPerMillion,
       output_per_million: m.pricing.outputPerMillion,
+      ...(m.pricing.cacheReadPerMillion != null
+        ? { cache_read_per_million: m.pricing.cacheReadPerMillion }
+        : {}),
     },
     is_default: m.is_default,
     ...(m.context_length ? { context_length: m.context_length } : {}),

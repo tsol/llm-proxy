@@ -1,8 +1,9 @@
 import os from 'os';
 import path from 'path';
 import dotenv from 'dotenv';
-import type { ProviderConfig, ProviderId, ProviderPricing } from './types';
+import type { ProviderConfig, ProviderId, ProviderPricing, ProviderRateLimits, ModelQuirkOverrides } from './types';
 import { loadModelAllowPatterns } from './model-filter';
+import { getMetadataRateLimits, getMetadataModelQuirks } from './providers/metadata';
 
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
@@ -15,6 +16,37 @@ function envNum(key: string, fallback: number): number {
   if (raw === undefined || raw === '') return fallback;
   const n = Number(raw);
   return Number.isFinite(n) ? n : fallback;
+}
+
+function mergeRateLimits(
+  metadata: ProviderRateLimits,
+  envPrefix: string,
+  hardcoded: ProviderRateLimits,
+): ProviderRateLimits {
+  const result: ProviderRateLimits = { ...metadata, ...hardcoded };
+  // Env vars override everything
+  const tpm = envNum(`${envPrefix}_TPM`, result.tokensPerMinute ?? 0);
+  const rpm = envNum(`${envPrefix}_RPM`, result.requestsPerMinute ?? 0);
+  const rph = envNum(`${envPrefix}_RPH`, result.requestsPerHour ?? 0);
+  const rpd = envNum(`${envPrefix}_RPD`, result.requestsPerDay ?? 0);
+  if (tpm > 0) result.tokensPerMinute = tpm;
+  if (rpm > 0) result.requestsPerMinute = rpm;
+  if (rph > 0) result.requestsPerHour = rph;
+  if (rpd > 0) result.requestsPerDay = rpd;
+  return result;
+}
+
+function envRateLimit(prefix: string, defaults: ProviderRateLimits = {}): ProviderRateLimits {
+  const out: ProviderRateLimits = {};
+  const tpm = envNum(`${prefix}_TPM`, defaults.tokensPerMinute ?? 0);
+  const rpm = envNum(`${prefix}_RPM`, defaults.requestsPerMinute ?? 0);
+  const rph = envNum(`${prefix}_RPH`, defaults.requestsPerHour ?? 0);
+  const rpd = envNum(`${prefix}_RPD`, defaults.requestsPerDay ?? 0);
+  if (tpm > 0) out.tokensPerMinute = tpm;
+  if (rpm > 0) out.requestsPerMinute = rpm;
+  if (rph > 0) out.requestsPerHour = rph;
+  if (rpd > 0) out.requestsPerDay = rpd;
+  return Object.keys(out).length > 0 ? out : {};
 }
 
 const repoRoot = path.resolve(__dirname, '..', '..');
@@ -34,16 +66,33 @@ export const appConfig = {
     ? path.resolve(repoRoot, env('COST_LOG_PATH'))
     : path.join(logsDir, 'costs.log'),
   reqLogDir: path.join(logsDir, 'req'),
+  reqOldDir: path.join(logsDir, 'req-old'),
   modelAllow: loadModelAllowPatterns(),
-  /** When a provider returns 429 (rate limited), retry with this model alias.
-   *  Example: "gonka/Kimi-K2.6".  Leave empty to disable rate-limit fallback. */
   rateLimitFallbackModel: env('RATE_LIMIT_FALLBACK_MODEL'),
-  /** General fallback model for any upstream failure (timeout, 5xx, network error).
-   *  Default: gonka/Kimi-K2.6.  Leave empty to disable. */
   generalFallbackModel: env('GENERAL_FALLBACK_MODEL', 'gonka/Kimi-K2.6'),
-  /** Prepended to the system message of every outgoing chat completion. */
+  /** Named model aliases with fallback chains.
+   *  MODEL1_ALIAS=gemma-4-12b   MODEL1_TRY=local/google/gemma-4-12b-qat,gonka/Kimi-K2.6
+   *  MODEL2_ALIAS=deepseek-v4    MODEL2_TRY=deepseek/deepseek-v4-flash,deepseek/deepseek-v4-pro
+   *  On failure, the proxy tries each MODEL{n}_TRY entry in order.
+   *  Per-provider endpoints (/deepseek/v1/...) have no fallback — only the root /v1 does. */
+  modelAliases: (() => {
+    const aliases = new Map<string, string[]>();
+    for (let i = 1; ; i++) {
+      const alias = env(`MODEL${i}_ALIAS`);
+      const tryChain = env(`MODEL${i}_TRY`);
+      if (!alias) break;
+      if (!tryChain) continue;
+      const chain = tryChain.split(',').map((s) => s.trim()).filter(Boolean);
+      if (chain.length > 0) aliases.set(alias, chain);
+    }
+    return aliases;
+  })(),
+  /** Backward-compat: global fallback chain for any model not in modelAliases above. */
+  modelFallbackChain: env('MODEL_FALLBACK_CHAIN')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
   systemPrompt: env('SYSTEM_PROMPT'),
-  /** Appended to the last user message of every outgoing chat completion. */
   systemPromptSuffix: env('SYSTEM_PROMPT_SUFFIX'),
   gpu: {
     lmStudioNativeUrl: env('LOCAL_NATIVE_URL', 'http://localhost:1234'),
@@ -51,7 +100,6 @@ export const appConfig = {
       'LM_STUDIO_CLI',
       path.join(os.homedir(), '.lmstudio', 'bin', 'lms'),
     ),
-    /** Optional: force this context when calling LM Studio /models/load. Omit to use Studio defaults. */
     lmLoadContextLength: process.env.LOCAL_DEFAULT_CONTEXT_LENGTH !== undefined
       ? envNum('LOCAL_DEFAULT_CONTEXT_LENGTH', 0)
       : undefined,
@@ -67,101 +115,160 @@ export const appConfig = {
   },
 };
 
-function providerConfig(
-  id: ProviderId,
+function buildPricing(
   prefix: string,
-  ownedBy: string,
-  extra?: Partial<Pick<ProviderConfig, 'cwd' | 'defaultContextLength'>>,
-  pricingDefaults?: Partial<ProviderPricing>,
-  defaults?: { baseUrl?: string; defaultModel?: string },
-): ProviderConfig {
+  defaults?: Partial<ProviderPricing>,
+): ProviderPricing {
   const pricing: ProviderPricing = {
-    inputPerMillion: envNum(
-      `${prefix}_INPUT_PRICE_PER_M`,
-      pricingDefaults?.inputPerMillion ?? 0,
-    ),
-    outputPerMillion: envNum(
-      `${prefix}_OUTPUT_PRICE_PER_M`,
-      pricingDefaults?.outputPerMillion ?? 0,
-    ),
+    inputPerMillion: envNum(`${prefix}_INPUT_PRICE_PER_M`, defaults?.inputPerMillion ?? 0),
+    outputPerMillion: envNum(`${prefix}_OUTPUT_PRICE_PER_M`, defaults?.outputPerMillion ?? 0),
   };
-  const cacheDefault = pricingDefaults?.cacheReadPerMillion;
-  if (
-    cacheDefault !== undefined ||
-    process.env[`${prefix}_CACHE_READ_PRICE_PER_M`] !== undefined
-  ) {
-    pricing.cacheReadPerMillion = envNum(
-      `${prefix}_CACHE_READ_PRICE_PER_M`,
-      cacheDefault ?? 0,
-    );
+  const cacheDefault = defaults?.cacheReadPerMillion;
+  if (cacheDefault !== undefined || process.env[`${prefix}_CACHE_READ_PRICE_PER_M`] !== undefined) {
+    pricing.cacheReadPerMillion = envNum(`${prefix}_CACHE_READ_PRICE_PER_M`, cacheDefault ?? 0);
   }
-
-  return {
-    id,
-    baseUrl: env(`${prefix}_BASE_URL`, defaults?.baseUrl ?? ''),
-    apiKey: env(`${prefix}_API_KEY`),
-    defaultModel: env(`${prefix}_DEFAULT_MODEL`, defaults?.defaultModel ?? ''),
-    pricing,
-    ownedBy,
-    ...extra,
-  };
+  return pricing;
 }
 
+// ---- Provider configurations (data-driven) ----
+
+// Load curated metadata from JSON (context lengths, rate limits per model & provider)
+const metaRateLimits = Object.fromEntries(
+  (['local', 'gonka', 'google', 'cursor', 'deepseek', 'groq', 'cerebras', 'openrouter'] as ProviderId[])
+    .map((id) => [id, getMetadataRateLimits(id)] as const),
+);
+const metaModelQuirks = Object.fromEntries(
+  (['local', 'gonka', 'google', 'cursor', 'deepseek', 'groq', 'cerebras', 'openrouter'] as ProviderId[])
+    .map((id) => [id, getMetadataModelQuirks(id)] as const),
+);
+
 export const providerConfigs: Record<ProviderId, ProviderConfig> = {
-  local: providerConfig('local', 'LOCAL', 'lm-studio'),
-  gonka: providerConfig('gonka', 'GONKA', 'gonka'),
-  google: providerConfig('google', 'GOOGLE', 'google'),
-  cursor: providerConfig('cursor', 'CURSOR', 'cursor', {
+  local: {
+    id: 'local',
+    displayOrder: 0,
+    baseUrl: env('LOCAL_BASE_URL', 'http://localhost:1234/v1'),
+    apiKey: env('LOCAL_API_KEY', 'lm-studio'),
+    defaultModel: env('LOCAL_DEFAULT_MODEL', 'google/gemma-4-12b-qat'),
+    pricing: buildPricing('LOCAL', { inputPerMillion: 0, outputPerMillion: 0 }),
+    ownedBy: 'lm-studio',
+    defaultContextLength: 128_000,
+    modelQuirks: {},
+  },
+
+  gonka: {
+    id: 'gonka',
+    displayOrder: 1,
+    baseUrl: env('GONKA_BASE_URL', 'https://proxy.gonka.gg/v1'),
+    apiKey: env('GONKA_API_KEY'),
+    defaultModel: env('GONKA_DEFAULT_MODEL', 'MiniMaxAI/MiniMax-M2.7'),
+    pricing: buildPricing('GONKA', { inputPerMillion: 0, outputPerMillion: 0 }),
+    ownedBy: 'gonka',
+    rateLimits: mergeRateLimits(metaRateLimits.gonka, 'GONKA', {}),
+    modelQuirks: { ...metaModelQuirks.gonka },
+  },
+
+  google: {
+    id: 'google',
+    displayOrder: 2,
+    baseUrl: env('GOOGLE_BASE_URL', 'https://generativelanguage.googleapis.com/v1beta/openai'),
+    apiKey: env('GOOGLE_API_KEY'),
+    defaultModel: env('GOOGLE_DEFAULT_MODEL', 'gemini-flash-latest'),
+    pricing: buildPricing('GOOGLE', { inputPerMillion: 0.30, outputPerMillion: 2.50 }),
+    ownedBy: 'google',
+    rateLimits: mergeRateLimits(metaRateLimits.google, 'GOOGLE', { requestsPerMinute: 15 }),
+    modelQuirks: { ...metaModelQuirks.google },
+  },
+
+  cursor: {
+    id: 'cursor',
+    displayOrder: 3,
+    baseUrl: env('CURSOR_BASE_URL', ''),
+    apiKey: env('CURSOR_API_KEY'),
+    defaultModel: env('CURSOR_DEFAULT_MODEL', 'composer-2.5@fast=false'),
+    pricing: buildPricing('CURSOR', { inputPerMillion: 0.50, outputPerMillion: 2.50, cacheReadPerMillion: 0.20 }),
+    ownedBy: 'cursor',
     cwd: env('CURSOR_CWD', repoRoot),
     defaultContextLength: envNum('CURSOR_DEFAULT_CONTEXT', 200_000),
-  }, {
-    inputPerMillion: 0.5,
-    outputPerMillion: 2.5,
-    cacheReadPerMillion: 0.2,
-  }, {
-    defaultModel: 'composer-2.5@fast=false',
-  }),
-  deepseek: providerConfig(
-    'deepseek',
-    'DEEPSEEK',
-    'deepseek',
-    undefined,
-    {
-      inputPerMillion: 0.14,
-      outputPerMillion: 0.28,
-      cacheReadPerMillion: 0.0028,
+    rateLimits: envRateLimit('CURSOR', { requestsPerMinute: 30 }),
+    modelQuirks: {
+      'composer': { contextLength: 200_000 },
     },
-    {
-      baseUrl: 'https://api.deepseek.com/v1',
-      defaultModel: 'deepseek-v4-flash',
+  },
+
+  deepseek: {
+    id: 'deepseek',
+    displayOrder: 4,
+    baseUrl: env('DEEPSEEK_BASE_URL', 'https://api.deepseek.com/v1'),
+    apiKey: env('DEEPSEEK_API_KEY'),
+    defaultModel: env('DEEPSEEK_DEFAULT_MODEL', 'deepseek-v4-flash'),
+    pricing: buildPricing('DEEPSEEK', { inputPerMillion: 0.14, outputPerMillion: 0.28, cacheReadPerMillion: 0.0028 }),
+    ownedBy: 'deepseek',
+    rateLimits: mergeRateLimits(metaRateLimits.deepseek, 'DEEPSEEK', {}),
+    modelQuirks: {
+      ...metaModelQuirks.deepseek,
+      'deepseek-chat': { contextLength: 128_000 },
+      'deepseek-reasoner': { contextLength: 128_000 },
+      'deepseek-v4-flash': { contextLength: 1_000_000 },
+      'deepseek-v4-pro': { contextLength: 1_000_000 },
+      'deepseek': { contextLength: 1_000_000 },
     },
-  ),
-  groq: providerConfig(
-    'groq',
-    'GROQ',
-    'groq',
-    undefined,
-    {
-      inputPerMillion: 0,
-      outputPerMillion: 0,
+  },
+
+  groq: {
+    id: 'groq',
+    displayOrder: 5,
+    baseUrl: env('GROQ_BASE_URL', 'https://api.groq.com/openai/v1'),
+    apiKey: env('GROQ_API_KEY'),
+    defaultModel: env('GROQ_DEFAULT_MODEL', 'llama-4-maverick-17b-instruct'),
+    pricing: buildPricing('GROQ', { inputPerMillion: 0, outputPerMillion: 0 }),
+    ownedBy: 'groq',
+    rateLimits: mergeRateLimits(metaRateLimits.groq, 'GROQ', { tokensPerMinute: 50_000, requestsPerMinute: 30 }),
+    modelQuirks: { ...metaModelQuirks.groq },
+  },
+
+  cerebras: {
+    id: 'cerebras',
+    displayOrder: 6,
+    baseUrl: env('CEREBRAS_BASE_URL', 'https://api.cerebras.ai/v1'),
+    apiKey: env('CEREBRAS_API_KEY'),
+    defaultModel: env('CEREBRAS_DEFAULT_MODEL', 'gpt-oss-120b'),
+    pricing: buildPricing('CEREBRAS', { inputPerMillion: 0.60, outputPerMillion: 0.90 }),
+    ownedBy: 'cerebras',
+    defaultContextLength: 131000,
+    rateLimits: mergeRateLimits(metaRateLimits.cerebras, 'CEREBRAS', {}),
+    modelQuirks: {
+      ...metaModelQuirks.cerebras,
+      'gpt-oss-120b': { contextLength: 131000 },
     },
-    {
-      baseUrl: 'https://api.groq.com/openai/v1',
-      defaultModel: 'llama-4-maverick-17b-instruct',
+  },
+
+  openrouter: {
+    id: 'openrouter',
+    displayOrder: 7,
+    baseUrl: env('OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1'),
+    apiKey: env('OPENROUTER_API_KEY'),
+    defaultModel: env('OPENROUTER_DEFAULT_MODEL', 'openai/gpt-4o'),
+    pricing: buildPricing('OPENROUTER', { inputPerMillion: 0, outputPerMillion: 0 }),
+    ownedBy: 'openrouter',
+    defaultContextLength: 128_000,
+    rateLimits: mergeRateLimits(metaRateLimits.openrouter, 'OPENROUTER', {}),
+    extraHeaders: {
+      'HTTP-Referer': env('OPENROUTER_HTTP_REFERER', 'http://localhost:5001'),
+      'X-Title': env('OPENROUTER_X_TITLE', 'LLM Proxy'),
     },
-  ),
+    modelQuirks: {
+      ...metaModelQuirks.openrouter,
+      'openai/gpt-4o': { contextLength: 128_000 },
+    },
+  },
 };
+
+// ---- Legacy normalizeTarget (used by switch-model.sh / admin routes) ----
+
+const VALID_TARGETS = new Set(Object.keys(providerConfigs));
 
 export function normalizeTarget(target: string): ProviderId {
   if (target === 'remote') return 'gonka';
-  if (
-    target === 'local' ||
-    target === 'gonka' ||
-    target === 'google' ||
-    target === 'cursor' /    target === 'deepseek' ||
-    target === 'groq'
-  ) {
-    return target;
-  }
+  if (VALID_TARGETS.has(target)) return target as ProviderId;
   throw new Error(`Unknown provider target: ${target}`);
 }

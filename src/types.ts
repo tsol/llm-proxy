@@ -1,4 +1,4 @@
-export type ProviderId = 'local' | 'gonka' | 'google' | 'cursor' | 'deepseek' | 'groq';
+export type ProviderId = 'local' | 'gonka' | 'google' | 'cursor' | 'deepseek' | 'groq' | 'cerebras' | 'openrouter';
 
 /** Legacy alias used by switch-model.sh / TODO doc */
 export type RouterTarget = ProviderId | 'remote';
@@ -73,10 +73,32 @@ export interface ProviderConfig {
   defaultModel: string;
   pricing: ProviderPricing;
   ownedBy: string;
+  /** Sort order in model catalogs (lower = first). */
+  displayOrder?: number;
   /** Cursor SDK local agent workspace (cursor provider only). */
   cwd?: string;
   /** Default context window when upstream omits it (cursor provider). */
   defaultContextLength?: number;
+  /** Extra HTTP headers appended to every upstream request (e.g., OpenRouter HTTP-Referer / X-Title). */
+  extraHeaders?: Record<string, string>;
+  /** Rate limits. */
+  rateLimits?: ProviderRateLimits;
+  /** Declarative per-model overrides. */
+  modelQuirks?: Record<string, ModelQuirkOverrides>;
+}
+
+export interface ProviderRateLimits {
+  tokensPerMinute?: number;
+  requestsPerMinute?: number;
+  requestsPerHour?: number;
+  requestsPerDay?: number;
+}
+
+export interface ModelQuirkOverrides {
+  contextLength?: number;
+  capabilities?: ModelCapabilities;
+  maxTokens?: number;
+  excludePattern?: RegExp;
 }
 
 export interface RouterSnapshot {
