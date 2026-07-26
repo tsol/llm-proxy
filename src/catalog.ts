@@ -607,14 +607,28 @@ export async function resolveModelRoute(
   const entry = requestedModel ? findEntry(requestedModel) : undefined;
   if (!entry) return null;
 
+  // If alias config exists, prefer the provider listed first in the TRY chain
+  let bestEntry = entry;
+  if (requestedModel && appConfig.modelAliases) {
+    const chain = appConfig.modelAliases.get(requestedModel);
+    if (chain && chain.length > 0) {
+      // Extract provider from first TRY entry (e.g. "deepseek/deepseek-v4-flash" → "deepseek")
+      const primaryProvider = chain[0].split('/')[0];
+      // Re-resolve through findEntry, preferring that provider
+      const prefixed = `${primaryProvider}/${requestedModel}`;
+      const preferred = findEntry(prefixed);
+      if (preferred) bestEntry = preferred;
+    }
+  }
+
   return {
-    provider: entry.provider as ProviderId,
-    upstreamModel: entry.upstreamId,
-    displayModel: entry.safeId,
+    provider: bestEntry.provider as ProviderId,
+    upstreamModel: bestEntry.upstreamId,
+    displayModel: bestEntry.safeId,
     capabilities:
-      entry.model.capabilities ??
-      resolveModelCapabilities(entry.provider as ProviderId, entry.upstreamId, {
-        modelType: entry.model.model_type,
+      bestEntry.model.capabilities ??
+      resolveModelCapabilities(bestEntry.provider as ProviderId, bestEntry.upstreamId, {
+        modelType: bestEntry.model.model_type,
       }),
   };
 }

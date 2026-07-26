@@ -56,20 +56,24 @@ export function shouldIncludeModel(input: DisplayInput): boolean {
     if (override?.excludePattern?.test(id)) return false;
   }
 
-  // If MODEL{n}_ALIAS configs exist, only show those in the root catalog
+  // If MODEL{n}_ALIAS configs exist, only show those in the root catalog.
+  // Each TRY entry is "provider/model" — match BOTH parts, not just model.
   if (appConfig.modelAliases && appConfig.modelAliases.size > 0) {
-    // Check if this upstream model is referenced in any alias TRY chain
     let included = false;
     for (const [_alias, chain] of appConfig.modelAliases) {
       for (const entry of chain) {
-        const normalizedEntry = entry.toLowerCase();
-        if (
-          id === normalizedEntry ||
-          id.endsWith(`/${normalizedEntry}`) ||
-          normalizedEntry.endsWith(`/${id}`)
-        ) {
-          included = true;
-          break;
+        const slashIdx = entry.indexOf('/');
+        const chainProvider = slashIdx > 0 ? entry.slice(0, slashIdx).toLowerCase() : '';
+        const chainModel = slashIdx > 0 ? entry.slice(slashIdx + 1).toLowerCase() : entry.toLowerCase();
+        if (input.provider === chainProvider) {
+          if (
+            id === chainModel ||
+            id.endsWith(`/${chainModel}`) ||
+            chainModel.endsWith(`/${id}`)
+          ) {
+            included = true;
+            break;
+          }
         }
       }
       if (included) break;

@@ -23,10 +23,10 @@ app.use('/v1', modelsRouter);
 app.use('/v1', adminRouter);
 app.use('/v1', gpuRouter);
 
-// Per-provider mount: /v1/deepseek/chat/completions, /v1/openrouter/models, etc.
+// Per-provider mount: /deepseek/v1/chat/completions, /cerebras/v1/models, etc.
 // Bypasses catalog lookup — forces all requests through the named provider.
 import { perProviderRouter } from './routes/chat';
-app.use('/v1/:provider(\\w+)', perProviderRouter);
+app.use('/:provider(\\w+)/v1', perProviderRouter);
 
 rotateReqLogs()
   .then(() => ensureReqLogDir())
