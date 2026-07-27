@@ -424,8 +424,8 @@ async function tryFallbackChain(
       continue;
     }
 
-    // Don't fallback to self
-    if (route.provider === originalAdapter.id && route.upstreamModel === originalModel) {
+    // Skip the provider we're falling back FROM (prevents gonka loops)
+    if (route.provider === originalAdapter.id) {
       continue;
     }
 
