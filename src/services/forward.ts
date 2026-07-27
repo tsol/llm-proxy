@@ -41,9 +41,6 @@ const HOP_BY_HOP = new Set([
   'content-length',
 ]);
 
-const GARBAGE_RETRY_DELAY_MS = 15_000;
-const MAX_GARBAGE_RETRIES = 2;
-
 const OVERWHELMED_MESSAGE = "I am a bit overwhelmed. Let me take a deep breath and continue.";
 
 function forwardHeaders(
@@ -262,13 +259,10 @@ async function recordUsage(
   });
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 /**
  * Send a graceful "overwhelmed" non-streaming JSON response.
- * Used as a fallback when all garbage-retry attempts have been exhausted.
+ * Used as a fallback when the fallback chain is exhausted and the
+ * original model returned garbage.
  */
 function sendOverwhelmedResponse(res: Response, model: string): void {
   res.status(200).json({
@@ -381,19 +375,17 @@ function flushBufferedChunks(
   res.end();
 }
 
-interface FallbackRoute {
-  adapter: ProviderAdapter;
-  model: string;
-}
-
 /**
- * Resolve the configured rate-limit fallback model alias into a provider + upstream model.
- * Returns null if RATE_LIMIT_FALLBACK_MODEL is not set or can't be resolved.
- */
-/**
- * Try the configured fallback chain (MODEL_FALLBACK_CHAIN in .env).
- * Each entry is "provider/model" — e.g. "gonka/Kimi-K2.6".
- * Returns true if a fallback was tried (possibly succeeded, possibly failed).
+ * Try the configured fallback chain.
+ *
+ * For aliased models (e.g. "kimi" → gonka/Kimi → gonka/MiniMax → deepseek/v4):
+ *   the alias's chain is used. Each entry is tried in order.
+ *
+ * For direct models (e.g. "gonka/Kimi-K2.6" used directly, no alias):
+ *   chain is empty → no fallback → returns false → caller sends error.
+ *
+ * Any failure reason (network error, rate-limit, garbage) follows the same
+ * path through this function.
  */
 async function tryFallbackChain(
   label: string,
@@ -403,11 +395,10 @@ async function tryFallbackChain(
   incomingHeaders: IncomingHttpHeaders,
   res: Response,
 ): Promise<boolean> {
-  // First, check if the current model has an alias-specific TRY chain
+  // Find the alias chain for the requested model
   let chain: string[] | undefined;
   const requestedModel = body.model as string | undefined;
   if (requestedModel && appConfig.modelAliases) {
-    // Try exact match first, then check if we were called for a specific alias
     chain = appConfig.modelAliases.get(requestedModel);
   }
   // Fall back to global MODEL_FALLBACK_CHAIN
@@ -580,7 +571,7 @@ export async function forwardChatCompletion(
 
   // === Streaming path ===
   if (body.stream) {
-    // Gonka garbage-protection: buffer, detect, retry
+    // Gonka streaming: buffer, detect garbage, fallback on garbage (same as any error)
     if (adapter.id === 'gonka') {
       await forwardStreamWithGarbageProtection(
         adapter, model, patchedPayload, headers, url, body, requestCtx, promptEstimate, res, incomingHeaders,
@@ -850,62 +841,24 @@ export async function forwardChatCompletion(
           )
         : '';
 
-    // Gonka non-streaming garbage protection
-    if (adapter.id === 'gonka' && !upstreamFailed && completionText) {
-      let attempt = 0;
-      while (isGarbage(completionText) && attempt < MAX_GARBAGE_RETRIES) {
-        attempt++;
-        const metrics = analyzeText(completionText);
-        logProxyError({
-          provider: adapter.id, model,
-          message: `garbage detected (cjks=${metrics.maxCJK}, artifacts=${metrics.artifactWords}, ratio=${metrics.garbageRatio.toFixed(3)}), retry ${attempt}/${MAX_GARBAGE_RETRIES}`,
-        });
-        await sleep(GARBAGE_RETRY_DELAY_MS);
-
-        // Re-do the non-streaming request
-        try {
-          const retryResp = await resilientPost(url, patchedPayload, {
-            headers, validateStatus: () => true,
-          });
-          const retryFailed = retryResp.status >= 400;
-          errorDetail = retryFailed
-            ? formatUpstreamError(retryResp.status, retryResp.data)
-            : undefined;
-          completionText =
-            !retryFailed &&
-            typeof retryResp.data === 'object' &&
-            retryResp.data &&
-            'choices' in retryResp.data
-              ? String(
-                  (retryResp.data as { choices?: Array<{ message?: { content?: string } }> })
-                    .choices?.[0]?.message?.content ?? '',
-                )
-              : '';
-        } catch (retryErr) {
-          logProxyError({
-            provider: adapter.id, model,
-            message: `garbage retry failed: ${describeForwardError(retryErr)}`,
-          });
-          // Fall through to overwhelmed response
-          completionText = '';
-          break;
-        }
+    // Garbage detected in non-streaming output — treat as upstream error, try fallback
+    if (!upstreamFailed && completionText && isGarbage(completionText)) {
+      const metrics = analyzeText(completionText);
+      logProxyError({
+        provider: adapter.id, model,
+        message: `garbage detected (cjks=${metrics.maxCJK}, artifacts=${metrics.artifactWords}, ratio=${metrics.garbageRatio.toFixed(3)}), trying fallback chain`,
+      });
+      await recordUsage(adapter, model, null, promptEstimate, '', requestCtx, {
+        requestBody: body, upstreamUrl: url, status: 200, stream: false,
+        responseBody: completionText, error: 'garbage-detected',
+      }).catch(() => {});
+      const rerouted = await tryFallbackChain(
+        'garbage-detected', adapter, model, body, incomingHeaders, res,
+      );
+      if (!rerouted) {
+        sendOverwhelmedResponse(res, model);
       }
-
-      // If still garbage after all retries, send overwhelmed
-      if (completionText && isGarbage(completionText)) {
-        logProxyError({
-          provider: adapter.id, model,
-          message: `garbage persist after ${MAX_GARBAGE_RETRIES} retries, returning overwhelmed`,
-        });
-        const rerouted = await tryFallbackChain(
-          'garbage-persist', adapter, model, body, incomingHeaders, res,
-        );
-        if (!rerouted) {
-          sendOverwhelmedResponse(res, model);
-        }
-        return;
-      }
+      return;
     }
 
     logResponse({
@@ -962,9 +915,11 @@ export async function forwardChatCompletion(
 }
 
 /**
- * Gonka-specific streaming with garbage detection and retry.
- * Buffers the complete stream, checks for garbage, retries if needed,
- * and then flushes the clean chunks to the client.
+ * Gonka streaming with garbage detection.
+ *
+ * Buffers the complete stream, checks for garbage. If clean — flushes to client.
+ * If garbage (or network error) — tries fallback chain. No retry loop —
+ * garbage is treated exactly like a backend error.
  */
 async function forwardStreamWithGarbageProtection(
   adapter: ProviderAdapter,
@@ -984,46 +939,26 @@ async function forwardStreamWithGarbageProtection(
   let upstreamStatus = 502;
   let upstreamHeaders: Record<string, string> = {};
   let errorDetail: string | undefined;
-  let attempt = 0;
 
-  while (attempt <= MAX_GARBAGE_RETRIES) {
+  try {
+    const result = await bufferedStreamRequest(url, payload, headers);
+    completionText = result.completionText;
+    streamUsage = result.streamUsage;
+    chunks = result.chunks;
+    upstreamStatus = result.status;
+    upstreamHeaders = result.upstreamHeaders;
 
-    attempt++;
-    try {
-      const result = await bufferedStreamRequest(url, payload, headers);
-      completionText = result.completionText;
-      streamUsage = result.streamUsage;
-      chunks = result.chunks;
-      upstreamStatus = result.status;
-      upstreamHeaders = result.upstreamHeaders;
-
-      if (upstreamStatus >= 400) {
-        errorDetail = formatUpstreamError(upstreamStatus, result.rawErrorBody);
-        break; // Don't retry upstream errors
-      }
-
-      if (!isGarbage(completionText)) {
-        errorDetail = undefined;
-        break; // Clean output — send it
-      }
-
-      // Garbage detected
-      const metrics = analyzeText(completionText);
-      const garbageLog = `garbage detected in stream (cjks=${metrics.maxCJK}, artifacts=${metrics.artifactWords}, ratio=${metrics.garbageRatio.toFixed(3)}), attempt ${attempt}/${MAX_GARBAGE_RETRIES + 1}`;
-      console.log(`[${new Date().toISOString().slice(11,19)}] GARBAGE gonka | ${truncateMiddle(model, 40)} | ${garbageLog}`);
-      logProxyError({ provider: adapter.id, model, message: garbageLog });
-
-      if (attempt <= MAX_GARBAGE_RETRIES) {
-        await sleep(GARBAGE_RETRY_DELAY_MS);
-      }
-    } catch (err) {
-      const message = describeForwardError(err);
-      logProxyError({ provider: adapter.id, model, message });
-      if (attempt <= MAX_GARBAGE_RETRIES) {
-        await sleep(GARBAGE_RETRY_DELAY_MS);
-        continue;
-      }
-      // Exhausted retries after network error
+    if (upstreamStatus >= 400) {
+      errorDetail = formatUpstreamError(upstreamStatus, result.rawErrorBody);
+    }
+  } catch (err) {
+    const message = describeForwardError(err);
+    logProxyError({ provider: adapter.id, model, message });
+    // Treat network error same as garbage — try fallback
+    const rerouted = await tryFallbackChain(
+      message, adapter, model, body, incomingHeaders, res,
+    );
+    if (!rerouted) {
       await recordUsage(adapter, model, null, promptEstimate, '', requestCtx, {
         requestBody: body, upstreamUrl: url, status: 502, stream: true,
         responseBody: { error: message }, error: message,
@@ -1031,47 +966,60 @@ async function forwardStreamWithGarbageProtection(
       if (!res.headersSent) {
         res.status(502).json({ error: { message, type: 'proxy_error' } });
       }
-      return;
-    }
-  }
-
-  // After retry loop: check if we got garbage that persisted
-  if (completionText && isGarbage(completionText) && upstreamStatus < 400) {
-    logProxyError({
-      provider: adapter.id, model,
-      message: `garbage persist in stream after ${MAX_GARBAGE_RETRIES + 1} attempts, returning overwhelmed`,
-    });
-    await recordUsage(adapter, model, null, promptEstimate, '', requestCtx, {
-      requestBody: body, upstreamUrl: url, status: 200, stream: true,
-      responseBody: OVERWHELMED_MESSAGE, error: 'garbage-persist:overwhelmed',
-    }).catch(() => {});
-    const rerouted = await tryFallbackChain(
-      'garbage-persist', adapter, model, body, incomingHeaders, res,
-    );
-    if (!rerouted) {
-      sendOverwhelmedResponse(res, model);
     }
     return;
   }
 
-  // Flush the buffered clean chunks to the client
-  flushBufferedChunks(res, chunks, upstreamStatus, upstreamHeaders);
+  // Upstream error — try fallback
+  if (upstreamStatus >= 400) {
+    const rerouted = await tryFallbackChain(
+      `upstream-${upstreamStatus}`, adapter, model, body, incomingHeaders, res,
+    );
+    if (!rerouted) {
+      await recordUsage(adapter, model, null, promptEstimate, '', requestCtx, {
+        requestBody: body, upstreamUrl: url, status: upstreamStatus, stream: true,
+        responseBody: errorDetail ?? '', error: errorDetail,
+      }).catch(() => {});
+      flushBufferedChunks(res, chunks, upstreamStatus, upstreamHeaders);
+    }
+    return;
+  }
 
-  await recordUsage(
-    adapter, model,
-    upstreamStatus >= 400 ? null : streamUsage,
-    promptEstimate,
-    errorDetail ? '' : completionText,
-    requestCtx,
-    {
-      requestBody: body, upstreamUrl: url, status: upstreamStatus, stream: true,
-      responseBody: errorDetail ? errorDetail : completionText,
-      error: errorDetail,
-    },
+  // Clean output — flush to client
+  if (!isGarbage(completionText)) {
+    flushBufferedChunks(res, chunks, upstreamStatus, upstreamHeaders);
+
+    await recordUsage(
+      adapter, model, streamUsage, promptEstimate, completionText,
+      requestCtx,
+      {
+        requestBody: body, upstreamUrl: url, status: upstreamStatus, stream: true,
+        responseBody: completionText,
+      },
+    );
+
+    logResponse({
+      provider: adapter.id, model, status: upstreamStatus,
+      preview: completionText, stream: true,
+    });
+    return;
+  }
+
+  // Garbage detected — log, try fallback chain (no retry to same model)
+  const metrics = analyzeText(completionText);
+  const garbageLog = `garbage detected in stream (cjks=${metrics.maxCJK}, artifacts=${metrics.artifactWords}, ratio=${metrics.garbageRatio.toFixed(3)}), trying fallback chain`;
+  console.log(`[${new Date().toISOString().slice(11, 19)}] GARBAGE gonka | ${truncateMiddle(model, 40)} | ${garbageLog}`);
+  logProxyError({ provider: adapter.id, model, message: garbageLog });
+
+  await recordUsage(adapter, model, null, promptEstimate, '', requestCtx, {
+    requestBody: body, upstreamUrl: url, status: 200, stream: true,
+    responseBody: completionText, error: 'garbage-detected',
+  }).catch(() => {});
+
+  const rerouted = await tryFallbackChain(
+    'garbage-detected', adapter, model, body, incomingHeaders, res,
   );
-
-  logResponse({
-    provider: adapter.id, model, status: upstreamStatus,
-    preview: completionText, stream: true, detail: errorDetail,
-  });
+  if (!rerouted) {
+    sendOverwhelmedResponse(res, model);
+  }
 }
