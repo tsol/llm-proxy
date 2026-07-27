@@ -416,7 +416,17 @@ async function tryFallbackChain(
   }
   if (!chain.length) return false;
 
-  for (let i = 0; i < chain.length; i++) {
+  // Find current model's index in chain, start from next
+  let startIndex = 0;
+  for (let si = 0; si < chain.length; si++) {
+    const sr = await resolveModelRoute(chain[si]);
+    if (sr && sr.provider === originalAdapter.id && sr.upstreamModel === originalModel) {
+      startIndex = si + 1;
+      break;
+    }
+  }
+
+  for (let i = startIndex; i < chain.length; i++) {
     const alias = chain[i];
     const route = await resolveModelRoute(alias);
     if (!route) {
@@ -424,7 +434,7 @@ async function tryFallbackChain(
       continue;
     }
 
-    // Don't fallback to self
+    // Don't fallback to self (handled by startIndex, kept as safety)
     if (route.provider === originalAdapter.id && route.upstreamModel === originalModel) {
       continue;
     }
