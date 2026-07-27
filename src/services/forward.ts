@@ -573,7 +573,7 @@ export async function forwardChatCompletion(
     // Gonka garbage-protection: buffer, detect, retry
     if (adapter.id === 'gonka') {
       await forwardStreamWithGarbageProtection(
-        adapter, model, patchedPayload, headers, url, body, requestCtx, promptEstimate, res,
+        adapter, model, patchedPayload, headers, url, body, requestCtx, promptEstimate, res, incomingHeaders,
       );
       return;
     }
@@ -888,7 +888,12 @@ export async function forwardChatCompletion(
           provider: adapter.id, model,
           message: `garbage persist after ${MAX_GARBAGE_RETRIES} retries, returning overwhelmed`,
         });
-        sendOverwhelmedResponse(res, model);
+        const rerouted = await tryFallbackChain(
+          'garbage-persist', adapter, model, body, incomingHeaders, res,
+        );
+        if (!rerouted) {
+          sendOverwhelmedResponse(res, model);
+        }
         return;
       }
     }
@@ -961,6 +966,7 @@ async function forwardStreamWithGarbageProtection(
   requestCtx: CompletionRequestContext,
   promptEstimate: number,
   res: Response,
+  incomingHeaders: IncomingHttpHeaders,
 ): Promise<void> {
   let completionText = '';
   let streamUsage: UsageBreakdown | null = null;
@@ -1029,7 +1035,12 @@ async function forwardStreamWithGarbageProtection(
       requestBody: body, upstreamUrl: url, status: 200, stream: true,
       responseBody: OVERWHELMED_MESSAGE, error: 'garbage-persist:overwhelmed',
     }).catch(() => {});
-    sendOverwhelmedResponse(res, model);
+    const rerouted = await tryFallbackChain(
+      'garbage-persist', adapter, model, body, incomingHeaders, res,
+    );
+    if (!rerouted) {
+      sendOverwhelmedResponse(res, model);
+    }
     return;
   }
 
