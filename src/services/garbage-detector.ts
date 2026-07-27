@@ -3,7 +3,9 @@
  * Chinese-character storms and random tokenization artifacts.
  *
  * Heuristics:
- *  1) Burst of 4+ consecutive CJK characters (without surrounding CJK context)
+ *  1) Burst of 10+ consecutive CJK characters WITHOUT Japanese kana nearby
+ *     (hiragana/katakana) — this distinguishes Chinese garbage from legitimate
+ *     Japanese text output.
  *  2) High ratio of tokenizer artifacts (underscore fragments like _BUF, _GRP)
  *  3) Overall gibberish ratio is too high
  */
@@ -15,8 +17,89 @@ const CJK_RANGES: Array<[number, number]> = [
   [0x2f800, 0x2fa1f],
 ];
 
+// Japanese-only syllabaries — not present in Chinese text
+const KANA_RANGES: Array<[number, number]> = [
+  [0x3040, 0x309f], // Hiragana
+  [0x30a0, 0x30ff], // Katakana
+];
+
+function inRanges(cp: number, ranges: Array<[number, number]>): boolean {
+  return ranges.some(([lo, hi]) => cp >= lo && cp <= hi);
+}
+
 function isCJK(cp: number): boolean {
-  return CJK_RANGES.some(([lo, hi]) => cp >= lo && cp <= hi);
+  return inRanges(cp, CJK_RANGES);
+}
+
+function isKana(cp: number): boolean {
+  return inRanges(cp, KANA_RANGES);
+}
+
+/**
+ * Check whether a block of consecutive CJK characters is likely Chinese garbage
+ * rather than legitimate Japanese text. A Japanese text will virtually always
+ * contain hiragana or katakana nearby (particles, okurigana, conjugations, etc.).
+ *
+ * @param text    Full text
+ * @param start   Start index of the CJK block (inclusive)
+ * @param end     End index of the CJK block (exclusive)
+ * @param window  How many characters before/after the block to scan for kana
+ * @returns true if this CJK block has NO kana in the surrounding window (Chinese garbage)
+ */
+function isChineseOnlyCJKBlock(
+  text: string,
+  start: number,
+  end: number,
+  window: number = 50,
+): boolean {
+  const scanStart = Math.max(0, start - window);
+  const scanEnd = Math.min(text.length, end + window);
+
+  for (let i = scanStart; i < scanEnd; i++) {
+    // Skip characters inside the CJK block itself (they are CJK by definition)
+    if (i >= start && i < end) continue;
+
+    const cp = text.codePointAt(i);
+    if (cp !== undefined && isKana(cp)) {
+      return false; // Found Japanese kana nearby — this is Japanese text
+    }
+  }
+
+  // No kana found anywhere near the CJK block — treat as Chinese garbage
+  return true;
+}
+
+export interface CJKRun {
+  start: number;
+  end: number;
+  length: number;
+}
+
+/**
+ * Find all runs of consecutive CJK characters and their positions.
+ */
+export function findCJKRuns(text: string): CJKRun[] {
+  const runs: CJKRun[] = [];
+  let runStart = -1;
+
+  for (let i = 0; i < text.length; i++) {
+    const cp = text.codePointAt(i);
+    const cjk = cp !== undefined && isCJK(cp);
+
+    if (cjk && runStart === -1) {
+      runStart = i;
+    } else if (!cjk && runStart !== -1) {
+      runs.push({ start: runStart, end: i, length: i - runStart });
+      runStart = -1;
+    }
+  }
+
+  // Close trailing run
+  if (runStart !== -1) {
+    runs.push({ start: runStart, end: text.length, length: text.length - runStart });
+  }
+
+  return runs;
 }
 
 export function maxConsecutiveCJK(text: string): number {
@@ -32,6 +115,26 @@ export function maxConsecutiveCJK(text: string): number {
     }
   }
   return maxRun;
+}
+
+/**
+ * Check if the text contains Chinese-only CJK bursts (10+ consecutive CJK
+ * characters with no Japanese kana in the surrounding context).
+ *
+ * Japanese text that uses many kanji in a row will still have hiragana/katakana
+ * nearby (e.g. particles, verb endings), so this won't false-positive on
+ * legitimate Japanese output.
+ */
+export function hasChineseGarbageCJK(text: string, minRun: number = 10): boolean {
+  const runs = findCJKRuns(text);
+
+  for (const run of runs) {
+    if (run.length >= minRun && isChineseOnlyCJKBlock(text, run.start, run.end)) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 // Tokenizer artifact: short_alpha_short_alpha pattern
@@ -123,8 +226,9 @@ export function isGarbage(text: string): boolean {
 
   const metrics = analyzeText(text);
 
-  // Heuristic 1: burst of 4+ consecutive CJK characters
-  if (metrics.maxCJK >= 4) return true;
+  // Heuristic 1: burst of 10+ consecutive CJK characters with NO Japanese
+  // kana nearby — this is Chinese garbage, not legitimate Japanese text
+  if (hasChineseGarbageCJK(text, 10)) return true;
 
   // Heuristic 2: high ratio of tokenizer artifacts
   if (metrics.artifactWords >= 10 && metrics.totalWords > 0) {
