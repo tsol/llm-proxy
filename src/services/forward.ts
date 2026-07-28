@@ -463,6 +463,32 @@ async function tryFallbackChain(
 
 type ChatMessage = { role: string; content: string | unknown };
 
+/**
+ * Strip empty tool_calls arrays from assistant messages.
+ * Some upstream APIs (Gonka) reject messages with tool_calls: [].
+ */
+function sanitizeEmptyToolCalls(
+  messages: ChatMessage[] | undefined,
+): ChatMessage[] | undefined {
+  if (!messages || messages.length === 0) return messages;
+
+  let changed = false;
+  const cleaned = messages.map((m) => {
+    if (
+      m.role === 'assistant' &&
+      Array.isArray((m as Record<string, unknown>).tool_calls) &&
+      ((m as Record<string, unknown>).tool_calls as unknown[]).length === 0
+    ) {
+      changed = true;
+      const { tool_calls: _, ...rest } = m as Record<string, unknown>;
+      return rest as ChatMessage;
+    }
+    return m;
+  });
+
+  return changed ? cleaned : messages;
+}
+
 function applyPromptOverrides(
   messages: ChatMessage[] | undefined,
 ): ChatMessage[] | undefined {
@@ -554,7 +580,11 @@ export async function forwardChatCompletion(
   const streaming = Boolean(body.stream);
 
   // Apply system prompt overrides
-  const messages = applyPromptOverrides(body.messages);
+  let messages = applyPromptOverrides(body.messages);
+
+  // Strip empty tool_calls:[] that some upstreams (Gonka) reject
+  messages = sanitizeEmptyToolCalls(messages);
+
   let patchedPayload: ChatCompletionRequest = messages !== body.messages
     ? { ...payload, messages }
     : payload;
