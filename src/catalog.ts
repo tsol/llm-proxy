@@ -553,7 +553,17 @@ export async function listCatalogModels(opts?: {
       const first = chain[0];
       const slashIdx = first.indexOf('/');
       const provider = slashIdx > 0 ? first.slice(0, slashIdx) : '';
-      const upstreamModel = slashIdx > 0 ? first.slice(slashIdx + 1) : first;
+      const shortModel = slashIdx > 0 ? first.slice(slashIdx + 1) : first;
+
+      // Resolve short model name to full upstream ID from catalog
+      const realEntry = catalogEntries.find(
+        (e) =>
+          e.provider === provider &&
+          (norm(e.upstreamId) === norm(shortModel) ||
+           norm(shortAlias(e.upstreamId)) === norm(shortModel) ||
+           norm(e.upstreamId).endsWith(`/${norm(shortModel)}`)),
+      );
+      const upstreamModel = realEntry?.upstreamId ?? shortModel;
 
       try {
         const adapter = getProvider(provider as ProviderId);
@@ -621,7 +631,18 @@ function findEntry(requested: string): CatalogEntry | undefined {
       const first = chain[0];
       const slashIdx = first.indexOf('/');
       const provider = slashIdx > 0 ? first.slice(0, slashIdx) : '';
-      const upstreamModel = slashIdx > 0 ? first.slice(slashIdx + 1) : first;
+      const shortModel = slashIdx > 0 ? first.slice(slashIdx + 1) : first;
+
+      // Resolve short model name to full upstream ID from catalog
+      const realEntry = catalogEntries.find(
+        (e) =>
+          e.provider === provider &&
+          (norm(e.upstreamId) === norm(shortModel) ||
+           norm(shortAlias(e.upstreamId)) === norm(shortModel) ||
+           norm(e.upstreamId).endsWith(`/${norm(shortModel)}`)),
+      );
+      const upstreamModel = realEntry?.upstreamId ?? shortModel;
+
       const adapter = getProvider(provider as ProviderId);
       const pricing = adapter.getPricing(upstreamModel);
       return {

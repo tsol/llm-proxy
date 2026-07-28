@@ -75,9 +75,12 @@ chatRouter.post('/chat/completions', async (req: Request, res: Response) => {
   if (route.provider === 'local') {
     try {
       await ensureLocalModelReady({ model: route.upstreamModel });
+      await refreshProviderLive('local');
     } catch (err) {
       const message =
         err instanceof Error ? err.message : 'local model GPU prep failed';
+      // Don't return 503 here — let the forward fail naturally.
+      // The fallback chain in forward.ts will then try the next alias entry.
       logProxyError({
         provider: route.provider,
         endpointPrefix: 'root',
@@ -85,16 +88,7 @@ chatRouter.post('/chat/completions', async (req: Request, res: Response) => {
         effectiveModel: route.upstreamModel,
         message,
       });
-      res.status(503).json({
-        error: {
-          message,
-          type: 'proxy_error',
-          code: 'local_model_unavailable',
-        },
-      });
-      return;
     }
-    await refreshProviderLive('local');
   }
 
   if (route.provider === 'cursor') {
