@@ -174,9 +174,18 @@ async function runNonStreaming(
   body: ChatCompletionRequest,
   requestCtx: CompletionRequestContext,
   promptEstimate: number,
+  endpointPrefix: string,
 ): Promise<void> {
+  const requestedModelName = String(body.model ?? '');
   const id = chunkId();
-  logOutgoing({ provider: adapter.id, url: 'cursor-sdk', model, stream: false });
+  logOutgoing({
+    provider: adapter.id,
+    url: 'cursor-sdk',
+    stream: false,
+    endpointPrefix,
+    requestedModel: requestedModelName,
+    effectiveModel: model,
+  });
 
   try {
     const result = await Agent.prompt(prompt, agentOptions(adapter, model));
@@ -186,11 +195,13 @@ async function runNonStreaming(
 
     logResponse({
       provider: adapter.id,
-      model,
       status: result.status === 'error' ? 502 : 200,
       preview: content,
       stream: false,
       detail: result.status === 'error' ? 'cursor run failed' : undefined,
+      endpointPrefix,
+      requestedModel: requestedModelName,
+      effectiveModel: model,
     });
 
     await recordCursorUsage(adapter, model, billing.usage, billing.cacheReadTokens, requestCtx, {
@@ -216,7 +227,13 @@ async function runNonStreaming(
         : err instanceof Error
           ? err.message
           : 'Cursor SDK request failed';
-    logProxyError({ provider: adapter.id, model, message });
+    logProxyError({
+      provider: adapter.id,
+      endpointPrefix,
+      requestedModel: requestedModelName,
+      effectiveModel: model,
+      message,
+    });
     await recordCursorUsage(
       adapter,
       model,
@@ -243,9 +260,18 @@ async function runStreaming(
   body: ChatCompletionRequest,
   requestCtx: CompletionRequestContext,
   promptEstimate: number,
+  endpointPrefix: string,
 ): Promise<void> {
+  const requestedModelName = String(body.model ?? '');
   const id = chunkId();
-  logOutgoing({ provider: adapter.id, url: 'cursor-sdk', model, stream: true });
+  logOutgoing({
+    provider: adapter.id,
+    url: 'cursor-sdk',
+    stream: true,
+    endpointPrefix,
+    requestedModel: requestedModelName,
+    effectiveModel: model,
+  });
 
   let completionText = '';
   const agent = await Agent.create(agentOptions(adapter, model));
@@ -286,10 +312,12 @@ async function runStreaming(
     const billing = sdkUsageToBilling(result.usage, promptEstimate, completionText);
     logResponse({
       provider: adapter.id,
-      model,
       status: 200,
       preview: completionText,
       stream: true,
+      endpointPrefix,
+      requestedModel: requestedModelName,
+      effectiveModel: model,
     });
     await recordCursorUsage(adapter, model, billing.usage, billing.cacheReadTokens, requestCtx, {
       requestBody: body,
@@ -304,7 +332,13 @@ async function runStreaming(
         : err instanceof Error
           ? err.message
           : 'Cursor SDK request failed';
-    logProxyError({ provider: adapter.id, model, message });
+    logProxyError({
+      provider: adapter.id,
+      endpointPrefix,
+      requestedModel: requestedModelName,
+      effectiveModel: model,
+      message,
+    });
     await recordCursorUsage(
       adapter,
       model,
@@ -335,6 +369,7 @@ export async function forwardCursorChatCompletion(
   activeModel: string,
   body: ChatCompletionRequest,
   res: Response,
+  endpointPrefix: string,
 ): Promise<void> {
   if (!adapter.config.apiKey) {
     res.status(503).json({
@@ -352,7 +387,7 @@ export async function forwardCursorChatCompletion(
   const promptEstimate = estimateTokensFromMessages(body.messages);
 
   if (body.stream) {
-    await runStreaming(adapter, model, prompt, res, body, requestCtx, promptEstimate);
+    await runStreaming(adapter, model, prompt, res, body, requestCtx, promptEstimate, endpointPrefix);
     return;
   }
 
@@ -364,5 +399,6 @@ export async function forwardCursorChatCompletion(
     body,
     requestCtx,
     promptEstimate,
+    endpointPrefix,
   );
 }

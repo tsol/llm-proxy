@@ -24,7 +24,9 @@ chatRouter.post('/chat/completions', async (req: Request, res: Response) => {
     const supported = await supportedModelIds();
     logProxyError({
       provider: '?',
-      model: String(body.model ?? ''),
+      endpointPrefix: 'root',
+      requestedModel: String(body.model ?? ''),
+      effectiveModel: String(body.model ?? ''),
       message: `unsupported model`,
     });
     res.status(400).json({
@@ -43,7 +45,9 @@ chatRouter.post('/chat/completions', async (req: Request, res: Response) => {
     const message = formatCapabilitiesError(route.displayModel, blocked);
     logProxyError({
       provider: route.provider,
-      model: route.displayModel,
+      endpointPrefix: 'root',
+      requestedModel: String(body.model ?? ''),
+      effectiveModel: route.displayModel,
       message,
     });
     res.status(400).json({
@@ -64,6 +68,8 @@ chatRouter.post('/chat/completions', async (req: Request, res: Response) => {
     model: route.upstreamModel,
     stream: Boolean(body.stream),
     preview: requestCtx.userRequestPreview,
+    endpointPrefix: 'root',
+    requestedModel: String(body.model ?? ''),
   });
 
   if (route.provider === 'local') {
@@ -74,7 +80,9 @@ chatRouter.post('/chat/completions', async (req: Request, res: Response) => {
         err instanceof Error ? err.message : 'local model GPU prep failed';
       logProxyError({
         provider: route.provider,
-        model: route.upstreamModel,
+        endpointPrefix: 'root',
+        requestedModel: String(body.model ?? ''),
+        effectiveModel: route.upstreamModel,
         message,
       });
       res.status(503).json({
@@ -95,6 +103,7 @@ chatRouter.post('/chat/completions', async (req: Request, res: Response) => {
       route.upstreamModel,
       body,
       res,
+      'root',
     );
     return;
   }
@@ -105,6 +114,7 @@ chatRouter.post('/chat/completions', async (req: Request, res: Response) => {
     body,
     req.headers,
     res,
+    'root',
   );
 });
 
@@ -128,14 +138,21 @@ perProviderRouter.post('/chat/completions', async (req: Request, res: Response) 
   const model = adapter.resolveModel(body.model);
 
   if (provider === 'cursor') {
-    await forwardCursorChatCompletion(adapter as CursorProvider, model, body, res);
+    await forwardCursorChatCompletion(adapter as CursorProvider, model, body, res, provider);
     return;
   }
 
   const requestCtx = captureRequestContext(body.messages);
-  logIncoming({ provider, model, stream: Boolean(body.stream), preview: requestCtx.userRequestPreview });
+  logIncoming({
+    provider,
+    model,
+    stream: Boolean(body.stream),
+    preview: requestCtx.userRequestPreview,
+    endpointPrefix: provider,
+    requestedModel: String(body.model ?? ''),
+  });
 
-  await forwardChatCompletion(adapter, model, body, req.headers, res);
+  await forwardChatCompletion(adapter, model, body, req.headers, res, provider);
 });
 
 perProviderRouter.get('/models', async (req: Request, res: Response) => {

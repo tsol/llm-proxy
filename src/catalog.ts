@@ -541,6 +541,39 @@ export async function listCatalogModels(opts?: {
   }
   ensureCatalogFresh();
   const activeDefault = getDefaultModelId();
+
+  // When aliases are configured, root /v1/models returns ONLY aliases.
+  // Raw upstream models are served via per-provider endpoints (e.g. /gonka/v1/models).
+  if (appConfig.modelAliases && appConfig.modelAliases.size > 0) {
+    const models: CatalogModel[] = [];
+    for (const [alias, chain] of appConfig.modelAliases) {
+      if (chain.length === 0) continue;
+
+      // Build a virtual model from the first chain element
+      const first = chain[0];
+      const slashIdx = first.indexOf('/');
+      const provider = slashIdx > 0 ? first.slice(0, slashIdx) : '';
+      const upstreamModel = slashIdx > 0 ? first.slice(slashIdx + 1) : first;
+
+      try {
+        const adapter = getProvider(provider as ProviderId);
+        const pricing = adapter.getPricing(upstreamModel);
+
+        models.push(makeCatalogModel(alias, alias, {
+          provider: provider as ProviderId,
+          upstreamId: upstreamModel,
+          pricing,
+          isDefault: alias === activeDefault,
+          created: 0,
+        }));
+      } catch {
+        // Skip if provider unknown
+      }
+    }
+    return models;
+  }
+
+  // No aliases configured: return raw upstream catalog as before
   return catalogEntries.map((e) => ({
     ...e.model,
     is_default: e.upstreamId === activeDefault,
@@ -579,6 +612,33 @@ function findEntry(requested: string): CatalogEntry | undefined {
   }
 
   const lower = norm(raw);
+
+  // Look up alias from config (before catalog entries, so aliases take precedence)
+  if (appConfig.modelAliases) {
+    const chain = appConfig.modelAliases.get(raw) ?? appConfig.modelAliases.get(lower);
+    if (chain && chain.length > 0) {
+      // Build a virtual entry from the first chain element
+      const first = chain[0];
+      const slashIdx = first.indexOf('/');
+      const provider = slashIdx > 0 ? first.slice(0, slashIdx) : '';
+      const upstreamModel = slashIdx > 0 ? first.slice(slashIdx + 1) : first;
+      const adapter = getProvider(provider as ProviderId);
+      const pricing = adapter.getPricing(upstreamModel);
+      return {
+        provider,
+        upstreamId: upstreamModel,
+        safeId: raw,
+        model: makeCatalogModel(raw, raw, {
+          provider: provider as ProviderId,
+          upstreamId: upstreamModel,
+          pricing,
+          isDefault: false,
+          created: 0,
+        }),
+      };
+    }
+  }
+
   const exact = catalogEntries.find(
     (e) =>
       norm(e.safeId) === lower ||
