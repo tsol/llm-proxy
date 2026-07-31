@@ -736,7 +736,9 @@ export async function forwardChatCompletion(
           responseBody: parsedError,
           requestCtx,
           error: `rate-limited:${upstreamStatus} | ${errorDetail}`,
-        }).catch(() => {});
+        }).catch((err) => {
+          console.error('[request-dump] logRequestDump failed:', (err as Error)?.message ?? String(err));
+        });
 
         // Try fallback chain for rate-limit
         const label = upstreamStatus === 413 ? '413 (TPM exceeded)' : '429';
@@ -761,7 +763,9 @@ export async function forwardChatCompletion(
           stream: true,
           responseBody: parsedError,
           error: `rate-limited:${upstreamStatus} | ${errorDetail}`,
-        }).catch(() => {});
+        }).catch((err) => {
+          console.error('[request-dump] recordUsage failed:', (err as Error)?.message ?? String(err));
+        });
         return;
       }
 
@@ -802,7 +806,9 @@ export async function forwardChatCompletion(
           responseBody: parsedError,
           requestCtx,
           error: `upstream-${upstreamStatus} | ${errorDetail}`,
-        }).catch(() => {});
+        }).catch((err) => {
+          console.error('[request-dump] logRequestDump failed:', (err as Error)?.message ?? String(err));
+        });
 
         const rerouted = await tryFallbackChain(
           `upstream-${upstreamStatus}`,
@@ -825,7 +831,9 @@ export async function forwardChatCompletion(
           stream: true,
           responseBody: parsedError,
           error: `upstream-${upstreamStatus} | ${errorDetail}`,
-        }).catch(() => {});
+        }).catch((err) => {
+          console.error('[request-dump] recordUsage failed:', (err as Error)?.message ?? String(err));
+        });
         return;
       }
 
@@ -929,7 +937,9 @@ export async function forwardChatCompletion(
         responseBody: { error: message },
         requestCtx,
         error: message,
-      }).catch(() => {});
+      }).catch((err) => {
+        console.error('[request-dump] logRequestDump failed:', (err as Error)?.message ?? String(err));
+      });
 
       // Try fallback chain before returning 502
       const rerouted = await tryFallbackChain(
@@ -949,7 +959,9 @@ export async function forwardChatCompletion(
           stream: true,
           responseBody: { error: message },
           error: message,
-        }).catch(() => {});
+        }).catch((err) => {
+          console.error('[request-dump] recordUsage failed:', (err as Error)?.message ?? String(err));
+        });
         if (!res.headersSent) {
           res.status(502).json({ error: { message, type: 'proxy_error' } });
         }
@@ -980,7 +992,9 @@ export async function forwardChatCompletion(
         responseBody: upstream.data,
         requestCtx,
         error: `rate-limited:${upstream.status}`,
-      }).catch(() => {});
+      }).catch((err) => {
+        console.error('[request-dump] logRequestDump failed:', (err as Error)?.message ?? String(err));
+      });
 
       const label = upstream.status === 413 ? '413 (TPM exceeded)' : '429';
       const rerouted = await tryFallbackChain(
@@ -1010,7 +1024,9 @@ export async function forwardChatCompletion(
         responseBody: upstream.data,
         requestCtx,
         error: `upstream-${upstream.status}`,
-      }).catch(() => {});
+      }).catch((err) => {
+        console.error('[request-dump] logRequestDump failed:', (err as Error)?.message ?? String(err));
+      });
 
       const rerouted = await tryFallbackChain(
         `upstream-${upstream.status}`,
@@ -1156,7 +1172,9 @@ export async function forwardChatCompletion(
         stream: false,
         responseBody: completionText,
         error: 'garbage-detected',
-      }).catch(() => {});
+      }).catch((err) => {
+        console.error('[request-dump] recordUsage failed:', (err as Error)?.message ?? String(err));
+      });
       const rerouted = await tryFallbackChain(
         'garbage-detected',
         adapter,
@@ -1236,7 +1254,9 @@ export async function forwardChatCompletion(
       responseBody: { error: message },
       requestCtx,
       error: message,
-    }).catch(() => {});
+    }).catch((err) => {
+      console.error('[request-dump] logRequestDump failed:', (err as Error)?.message ?? String(err));
+    });
 
     // Try fallback chain before returning 502
     const rerouted = await tryFallbackChain(
@@ -1256,7 +1276,9 @@ export async function forwardChatCompletion(
         stream: false,
         responseBody: { error: message },
         error: message,
-      }).catch(() => {});
+      }).catch((err) => {
+        console.error('[request-dump] recordUsage failed:', (err as Error)?.message ?? String(err));
+      });
       if (!res.headersSent) {
         res.status(502).json({ error: { message, type: 'proxy_error' } });
       }
@@ -1331,7 +1353,9 @@ async function forwardStreamWithGarbageProtection(
         stream: true,
         responseBody: { error: message },
         error: message,
-      }).catch(() => {});
+      }).catch((err) => {
+        console.error('[request-dump] recordUsage failed:', (err as Error)?.message ?? String(err));
+      });
       if (!res.headersSent) {
         res.status(502).json({ error: { message, type: 'proxy_error' } });
       }
@@ -1358,7 +1382,9 @@ async function forwardStreamWithGarbageProtection(
         stream: true,
         responseBody: errorDetail ?? '',
         error: errorDetail,
-      }).catch(() => {});
+      }).catch((err) => {
+        console.error('[request-dump] recordUsage failed:', (err as Error)?.message ?? String(err));
+      });
       flushBufferedChunks(res, chunks, upstreamStatus, upstreamHeaders);
     }
     return;
@@ -1415,7 +1441,9 @@ async function forwardStreamWithGarbageProtection(
     stream: true,
     responseBody: completionText,
     error: 'garbage-detected',
-  }).catch(() => {});
+  }).catch((err) => {
+    console.error('[request-dump] recordUsage failed:', (err as Error)?.message ?? String(err));
+  });
 
   const rerouted = await tryFallbackChain(
     'garbage-detected',

@@ -1,3 +1,4 @@
+import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import dotenv from 'dotenv';
@@ -6,7 +7,18 @@ import { loadModelAllowPatterns } from './model-filter';
 import { getMetadataRateLimits, getMetadataModelQuirks } from './providers/metadata';
 import { setEnvAliases, getMergedAliases } from './services/alias-store';
 
-dotenv.config({ path: path.resolve(__dirname, '..', '..', '..', '..', '.env-proxy') });
+// Load .env BEFORE any config values are computed.
+// Default: ../.env (relative to dist/, i.e. workspace/code/proxy/.env)
+// Override: set PROXY_ENV_FILE env var before launching node.
+const envPath = path.resolve(__dirname, '..', process.env.PROXY_ENV_FILE ?? '.env');
+if (!fs.existsSync(envPath)) {
+  console.error(`❌ .env file not found: ${envPath}`);
+  console.error(`   Set PROXY_ENV_FILE env var to specify a custom path.`);
+  console.error(`   Example: PROXY_ENV_FILE=~/hermes/.env-proxy node dist/index.js`);
+  process.exit(1);
+}
+dotenv.config({ path: envPath });
+console.log(`📄 Loaded config: ${envPath}`);
 
 function env(key: string, fallback = ''): string {
   return process.env[key]?.trim() ?? fallback;

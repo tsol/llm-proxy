@@ -247,7 +247,9 @@ async function runNonStreaming(
         responseBody: { error: message },
         error: message,
       },
-    ).catch(() => {});
+    ).catch((err) => {
+      console.error('[request-dump] recordCursorUsage failed (non-streaming):', (err as Error)?.message ?? String(err));
+    });
     res.status(502).json({ error: { message, type: 'proxy_error' } });
   }
 }
@@ -352,7 +354,9 @@ async function runStreaming(
         responseBody: { error: message },
         error: message,
       },
-    ).catch(() => {});
+    ).catch((err) => {
+      console.error('[request-dump] recordCursorUsage failed (streaming):', (err as Error)?.message ?? String(err));
+    });
 
     if (!res.headersSent) {
       res.status(502).json({ error: { message, type: 'proxy_error' } });

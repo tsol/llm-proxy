@@ -47,6 +47,18 @@ npm install
 npx tsx src/index.ts
 ```
 
+**Custom config path** (`PROXY_ENV_FILE` env var, set before launch):
+
+```bash
+# Point to a config file outside the project root
+PROXY_ENV_FILE="$HOME/hermes/.env-proxy" npx tsx src/index.ts
+
+# Or with the built JS
+PROXY_ENV_FILE="$HOME/hermes/.env-proxy" node dist/index.js
+
+# Without PROXY_ENV_FILE, defaults to ../.env (i.e. workspace/code/proxy/.env)
+```
+
 ```bash
 # List available aliases
 curl http://localhost:5001/v1/models | jq .
@@ -123,6 +135,25 @@ Locked aliases (from `.env`) show `"locked": true` — cannot be modified via AP
 Per-provider paths have **no fallback** — they return upstream errors directly.
 
 ## Configuration
+
+### Config file location
+
+The proxy reads its `.env` config **at module-load time** (before any config values are computed).
+
+1. **Default** — `../.env` relative to `dist/` (i.e. `workspace/code/proxy/.env`)
+2. **Overridde** — set `PROXY_ENV_FILE` env var to point anywhere:
+
+   ```bash
+   PROXY_ENV_FILE="$HOME/hermes/.env-proxy" node dist/index.js
+   ```
+
+   If the file doesn't exist, the proxy exits immediately with an error.
+
+3. **In `hermes/run.sh`** — `PROXY_ENV_FILE` is set to `$SCRIPT_DIR/.env-proxy` and passed through when starting the proxy daemon:
+
+   ```bash
+   PROXY_ENV_FILE="$PROXY_ENV_FILE" nohup node dist/index.js &
+   ```
 
 All env vars are documented in `.env.example`. Key groups:
 

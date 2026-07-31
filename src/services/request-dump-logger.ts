@@ -134,12 +134,14 @@ export async function rotateReqLogs(): Promise<void> {
 }
 
 export async function logRequestDump(entry: RequestDumpEntry): Promise<void> {
+  let filePath = '';
+  let filename = '';
   try {
     await ensureReqLogDir();
 
     const loggedAt = new Date();
-    const filename = buildDumpFilename(loggedAt, entry.requestCtx.userRequestText);
-    const filePath = path.join(appConfig.reqLogDir, filename);
+    filename = buildDumpFilename(loggedAt, entry.requestCtx.userRequestText);
+    filePath = path.join(appConfig.reqLogDir, filename);
 
     const headerLines = [
       `logged_at: ${mysqlTimestamp(loggedAt)}`,
@@ -168,6 +170,6 @@ export async function logRequestDump(entry: RequestDumpEntry): Promise<void> {
     await fs.writeFile(filePath, content, 'utf8');
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error(`[request-dump] failed to write dump: ${message}`);
+    console.error(`[request-dump] write failed: ${message}`, { filePath, filename });
   }
 }
