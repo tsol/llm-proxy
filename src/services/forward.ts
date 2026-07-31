@@ -765,6 +765,70 @@ export async function forwardChatCompletion(
         return;
       }
 
+      // Upstream 5xx — drain body, dump, try fallback chain
+      if (upstreamStatus >= 500) {
+        let errorBody = '';
+        await new Promise<void>((resolve) => {
+          upstream!.data.on('data', (chunk: Buffer) => {
+            errorBody += chunk.toString('utf8');
+          });
+          upstream!.data.on('end', resolve);
+          upstream!.data.on('error', resolve);
+          setTimeout(resolve, 2000);
+        });
+        (
+          upstream.data as NodeJS.ReadableStream & { destroy?: () => void }
+        ).destroy?.();
+        upstream = null;
+
+        const parsedError = (() => {
+          try {
+            return JSON.parse(errorBody);
+          } catch {
+            return errorBody;
+          }
+        })();
+        const errorDetail = formatUpstreamError(upstreamStatus, parsedError);
+        await logRequestDump({
+          provider: adapter.id,
+          model,
+          upstreamUrl: url,
+          status: upstreamStatus,
+          stream: true,
+          tokensIn: 0,
+          tokensOut: 0,
+          dollars: 0,
+          requestBody: body,
+          responseBody: parsedError,
+          requestCtx,
+          error: `upstream-${upstreamStatus} | ${errorDetail}`,
+        }).catch(() => {});
+
+        const rerouted = await tryFallbackChain(
+          `upstream-${upstreamStatus}`,
+          adapter,
+          model,
+          body,
+          incomingHeaders,
+          res,
+          endpointPrefix,
+        );
+        if (rerouted) return;
+        // No fallback — return upstream error to client as JSON
+        if (!res.headersSent) {
+          res.status(upstreamStatus).json(parsedError);
+        }
+        await recordUsage(adapter, model, null, promptEstimate, '', requestCtx, {
+          requestBody: body,
+          upstreamUrl: url,
+          status: upstreamStatus,
+          stream: true,
+          responseBody: parsedError,
+          error: `upstream-${upstreamStatus} | ${errorDetail}`,
+        }).catch(() => {});
+        return;
+      }
+
       res.status(upstreamStatus);
       res.setHeader('X-Accel-Buffering', 'no');
       res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -921,6 +985,35 @@ export async function forwardChatCompletion(
       const label = upstream.status === 413 ? '413 (TPM exceeded)' : '429';
       const rerouted = await tryFallbackChain(
         label,
+        adapter,
+        model,
+        body,
+        incomingHeaders,
+        res,
+        endpointPrefix,
+      );
+      if (rerouted) return;
+    }
+
+    // Upstream 5xx — try fallback chain before passing through to client
+    if (upstream.status >= 500) {
+      await logRequestDump({
+        provider: adapter.id,
+        model,
+        upstreamUrl: url,
+        status: upstream.status,
+        stream: false,
+        tokensIn: 0,
+        tokensOut: 0,
+        dollars: 0,
+        requestBody: body,
+        responseBody: upstream.data,
+        requestCtx,
+        error: `upstream-${upstream.status}`,
+      }).catch(() => {});
+
+      const rerouted = await tryFallbackChain(
+        `upstream-${upstream.status}`,
         adapter,
         model,
         body,
