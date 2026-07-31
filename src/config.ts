@@ -6,7 +6,7 @@ import { loadModelAllowPatterns } from './model-filter';
 import { getMetadataRateLimits, getMetadataModelQuirks } from './providers/metadata';
 import { setEnvAliases, getMergedAliases } from './services/alias-store';
 
-dotenv.config({ path: path.resolve(__dirname, '../.env') });
+dotenv.config({ path: path.resolve(__dirname, '..', '..', '..', '..', '.env-proxy') });
 
 function env(key: string, fallback = ''): string {
   return process.env[key]?.trim() ?? fallback;
@@ -50,7 +50,7 @@ function envRateLimit(prefix: string, defaults: ProviderRateLimits = {}): Provid
   return Object.keys(out).length > 0 ? out : {};
 }
 
-const repoRoot = path.resolve(__dirname, '..', '..');
+const repoRoot = path.resolve(__dirname, '..', '..', '..', '..');
 const logsDir = path.resolve(repoRoot, env('LOGS_DIR', 'logs'));
 
 export const appConfig = {

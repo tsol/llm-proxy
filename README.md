@@ -133,10 +133,97 @@ All env vars are documented in `.env.example`. Key groups:
 - **Model metadata** (context lengths, quirks): `src/providers/model-metadata.json`
 - **System prompt injection**: `SYSTEM_PROMPT`, `SYSTEM_PROMPT_SUFFIX`
 
+### Aliases — How They Work
+
+Each alias has a **name** (what you ask for in `/v1/chat/completions`) and a **fallback chain** — an ordered list of `provider/model` entries. When a provider fails (rate limit, garbage, timeout, 5xx), the proxy silently tries the next entry.
+
+**Resolution rules for `provider/model`:**
+- Provider part (`gonka`, `deepseek`, `groq`, etc.) matches one of the 8 supported providers
+- Model part is resolved **by suffix** — proxy matches it against the upstream catalog
+- Examples:
+  - `gonka/Kimi-K2.6` → matches upstream `moonshotai/Kimi-K2.6` (suffix match)
+  - `gonka/MiniMaxAI/MiniMax-M2.7` → matches upstream `MiniMaxAI/MiniMax-M2.7` (exact)
+  - `deepseek/deepseek-v4-flash` → matches upstream `deepseek/deepseek-v4-flash` (exact)
+  - `groq/llama-4-maverick-17b-instruct` → matches upstream `groq/llama-4-maverick-17b-instruct` (exact)
+
+All six forms are equivalent and will find the same model:
+```
+gonka/Kimi-K2.6                  # provider/model (short name)
+gonka/moonshotai/Kimi-K2.6       # provider/model (full path)
+Kimi-K2.6                        # model only (no provider)
+models/Kimi-K2.6                 # model only (google-style prefix)
+moonshotai/Kimi-K2.6             # upstream ID raw
+anything/Kimi-K2.6               # any prefix, suffix match
+```
+
 ### Alias Sources (merged, env wins)
 
-1. **`.env` (locked)** — `MODEL{n}_ALIAS` + `MODEL{n}_TRY`. Cannot be changed at runtime.
+1. **`.env` / `.env-proxy` (locked)** — `MODEL{n}_ALIAS` + `MODEL{n}_TRY`. Cannot be changed at runtime.
+   ```bash
+   MODEL1_ALIAS=gemma-4-12b
+   MODEL1_TRY=local/google/gemma-4-12b-qat,gonka/Kimi-K2.6
+   MODEL2_ALIAS=kimi
+   MODEL2_TRY=gonka/Kimi-K2.6,gonka/MiniMaxAI/MiniMax-M2.7,deepseek/deepseek-v4-flash
+   ```
+   The `TRY` value is a comma-separated fallback chain — proxy runs left to right.
+
 2. **`store/aliases.json` (user-managed)** — persisted, editable via `/v1/aliases` API.
+   ```json
+   {
+     "version": 1,
+     "aliases": {
+       "kimi": [
+         "gonka/Kimi-K2.6",
+         "gonka/MiniMaxAI/MiniMax-M2.7",
+         "deepseek/deepseek-v4-flash"
+       ],
+       "my-fast": [
+         "groq/llama-4-maverick-17b-instruct",
+         "cerebras/gpt-oss-120b"
+       ]
+     }
+   }
+   ```
+
+**Alias API examples:**
+```bash
+# Create a new alias (persisted to store/aliases.json)
+curl -s -X POST http://localhost:5001/v1/aliases \
+  -H "Content-Type: application/json" \
+  -d '{
+    "alias": "my-fast",
+    "chain": ["groq/llama-4-maverick-17b-instruct", "cerebras/gpt-oss-120b"]
+  }'
+
+# List all aliases (shows locked status + chain)
+curl -s http://localhost:5001/v1/aliases | jq .
+
+# Update an existing alias
+curl -s -X PUT http://localhost:5001/v1/aliases/my-fast \
+  -H "Content-Type: application/json" \
+  -d '{
+    "chain": ["gonka/Kimi-K2.6", "deepseek/deepseek-v4-flash"]
+  }'
+
+# Delete a user alias (locked .env aliases cannot be deleted)
+curl -s -X DELETE http://localhost:5001/v1/aliases/my-fast
+```
+
+**Chat with an alias (fallback chain runs automatically):**
+```bash
+# Request model "kimi" → proxy resolves alias → tries gonka/Kimi-K2.6 first
+curl -s http://localhost:5001/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "kimi",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "max_tokens": 100
+  }'
+
+# If gonka fails → auto-retry with next in chain (gonka/MiniMaxAI/MiniMax-M2.7)
+# If that also fails → deepseek/deepseek-v4-flash
+# All exhausted → 502 error
+```
 
 ## In Hermes
 
