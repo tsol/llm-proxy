@@ -1425,7 +1425,7 @@ async function forwardStreamWithGarbageProtection(
 
   // Garbage detected — log, try fallback chain (no retry to same model)
   const metrics = analyzeText(completionText);
-  const garbageLog = `garbage detected in stream (cjks=${metrics.maxCJK}, artifacts=${metrics.artifactWords}, ratio=${metrics.garbageRatio.toFixed(3)}), trying fallback chain`;
+  const garbageLog = `garbage detected in stream (cjks=${metrics.maxCJK}, digits=${metrics.maxDigits}, artifacts=${metrics.artifactWords}, ratio=${metrics.garbageRatio.toFixed(3)}), trying fallback chain`;
   logProxyError({
     provider: adapter.id,
     endpointPrefix,

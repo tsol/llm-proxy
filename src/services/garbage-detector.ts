@@ -8,6 +8,7 @@
  *     Japanese text output.
  *  2) High ratio of tokenizer artifacts (underscore fragments like _BUF, _GRP)
  *  3) Overall gibberish ratio is too high
+ *  4) Numeric storm — 100+ consecutive decimal digits (Gonka's random number avalanches)
  */
 
 const CJK_RANGES: Array<[number, number]> = [
@@ -117,6 +118,26 @@ export function maxConsecutiveCJK(text: string): number {
   return maxRun;
 }
 
+function isDigit(cp: number): boolean {
+  // ASCII digits 0-9 (0x30-0x39)
+  return cp >= 0x30 && cp <= 0x39;
+}
+
+export function maxConsecutiveDigits(text: string): number {
+  let maxRun = 0;
+  let current = 0;
+  for (const ch of text) {
+    const cp = ch.codePointAt(0);
+    if (cp !== undefined && isDigit(cp)) {
+      current++;
+      if (current > maxRun) maxRun = current;
+    } else {
+      current = 0;
+    }
+  }
+  return maxRun;
+}
+
 /**
  * Check if the text contains Chinese-only CJK bursts (10+ consecutive CJK
  * characters with no Japanese kana in the surrounding context).
@@ -185,11 +206,13 @@ function tokenize(text: string): string[] {
     .filter(Boolean);
 }
 
-interface GarbageMetrics {
+export interface GarbageMetrics {
   totalWords: number;
   knownWords: number;
   artifactWords: number;
   maxCJK: number;
+  /** Max consecutive ASCII decimal digits (0-9) */
+  maxDigits: number;
   /** Ratio of unknown/nonsense words (0-1) */
   garbageRatio: number;
 }
@@ -211,12 +234,14 @@ export function analyzeText(text: string): GarbageMetrics {
   const unknown = total - known;
   const garbageRatio = total > 0 ? (unknown + artifacts) / total : 0;
   const maxCJK = maxConsecutiveCJK(text);
+  const maxDigits = maxConsecutiveDigits(text);
 
   return {
     totalWords: total,
     knownWords: known,
     artifactWords: artifacts,
     maxCJK,
+    maxDigits,
     garbageRatio,
   };
 }
@@ -245,6 +270,11 @@ export function isGarbage(text: string): boolean {
   if (metrics.totalWords >= 50 && metrics.garbageRatio > 0.7 && metrics.artifactWords >= 5) {
     return true;
   }
+
+  // Heuristic 5: numeric storm — 100+ consecutive decimal digits.
+  // Gonka occasionally produces avalanches of random digits with no
+  // meaningful text content.
+  if (metrics.maxDigits >= 100) return true;
 
   return false;
 }
