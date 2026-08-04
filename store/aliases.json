@@ -2,9 +2,16 @@
   "version": 1,
   "aliases": {
     "kimi": [
+      "gonka-dahl/moonshotai/Kimi-K2.6",
+      "gonka-dahl/MiniMaxAI/MiniMax-M2.7",
+      "hyperfusion/MiniMaxAI/MiniMax-M2.7",
       "gonka/Kimi-K2.6",
       "gonka/MiniMaxAI/MiniMax-M2.7",
+      "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
       "deepseek/deepseek-v4-flash"
+    ],
+    "ofree": [
+      "openrouter/openrouter/free"
     ]
   }
 }

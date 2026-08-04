@@ -583,6 +583,17 @@ export function createProvider(config: ProviderConfig): ProviderAdapter {
       const { GonkaProvider } = require('./gonka') as typeof import('./gonka');
       return new GonkaProvider(config);
     }
+    case 'gonka-dahl': {
+      // Same GonkaProvider class — different instance (Dahl proxy on Gonka network).
+      const { GonkaProvider } = require('./gonka') as typeof import('./gonka');
+      return new GonkaProvider(config);
+    }
+    case 'hyperfusion': {
+      // Hyperfusion is OpenAI-compatible (no Gonka /api/* endpoints — GonkaProvider
+      // tolerates this via Promise.allSettled and falls back to live GET /v1/models).
+      const { GonkaProvider } = require('./gonka') as typeof import('./gonka');
+      return new GonkaProvider(config);
+    }
     case 'google':
       return new GoogleProvider(config);
     case 'cursor':

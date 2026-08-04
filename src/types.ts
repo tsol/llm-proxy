@@ -1,4 +1,4 @@
-export type ProviderId = 'local' | 'gonka' | 'google' | 'cursor' | 'deepseek' | 'groq' | 'cerebras' | 'openrouter';
+export type ProviderId = 'local' | 'gonka' | 'gonka-dahl' | 'hyperfusion' | 'google' | 'cursor' | 'deepseek' | 'groq' | 'cerebras' | 'openrouter';
 
 /** Legacy alias used by switch-model.sh / TODO doc */
 export type RouterTarget = ProviderId | 'remote';
@@ -99,6 +99,14 @@ export interface ModelQuirkOverrides {
   capabilities?: ModelCapabilities;
   maxTokens?: number;
   excludePattern?: RegExp;
+  /** Max in-flight (concurrent) upstream requests for this model.
+   *  Undefined = unlimited. When set, requests over the limit are
+   *  queued FIFO (see services/concurrency-queue.ts). */
+  concurrent?: number;
+  /** When true, this model joins the preferred group pool. Requests for any
+   *  model in the group wait up to RETRY_QUEUE_WAIT_TIMEOUT for the FIRST
+   *  available slot across ALL group members, then fall through the chain. */
+  inPreferredGroup?: boolean;
 }
 
 export interface RouterSnapshot {
@@ -160,3 +168,53 @@ export interface ProviderAdapter {
   getPricing(model: string): ProviderPricing;
   chatCompletionsUrl(): string;
 }
+
+// ─────────────────────────────────────────────────────────────
+// Dashboard WebSocket events
+// ─────────────────────────────────────────────────────────────
+
+export type DashboardEventType =
+  | 'request:start'
+  | 'request:forward'
+  | 'request:response'
+  | 'request:fallback'
+  | 'request:error'
+  | 'request:complete'
+  | 'stream:chunk'
+  | 'rate_limit:hit'
+  | 'cost:logged';
+
+export interface DashboardEvent {
+  type: DashboardEventType;
+  timestamp: string; // ISO 8601
+  requestId: string; // uuid, сквозной через весь lifecycle
+  // Контекст запроса
+  endpointPrefix?: string; // '/v1', '/deepseek/v1' и т.д.
+  requestedModel?: string;
+  effectiveModel?: string;
+  fallbackFrom?: string;
+  // Провайдер
+  provider?: ProviderId;
+  // Тело
+  userMessagePreview?: string;
+  // Ответ
+  status?: number;
+  completionPreview?: string;
+  stream?: boolean;
+  // Токены / стоимость
+  tokensIn?: number;
+  tokensOut?: number;
+  dollars?: number;
+  // Fallback
+  fallbackReason?: string;
+  fallbackChain?: string[];
+  fallbackAttempt?: number;
+  // Ошибка
+  errorCode?: string;
+  errorDetail?: string;
+  // Дополнительно
+  metadata?: Record<string, unknown>;
+}
+
+/** Alias for DashboardEvent — used by logger emitter interface. */
+export type LogEvent = DashboardEvent;

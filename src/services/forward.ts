@@ -29,6 +29,22 @@ import {
 } from '../services/request-logger';
 import { isGarbage, analyzeText } from './garbage-detector';
 import { trackUpstreamHeaders } from './rate-limit-tracker';
+import { logRateLimit } from './rate-limit-logger';
+import {
+  acquireSlot,
+  acquirePreferredGroupSlot,
+  buildPreferredGroupSpec,
+  isPreferredGroupMember,
+  resolveConcurrentLimit,
+  isTooManyConcurrentRequests,
+  type PreferredGroupSpec,
+} from './concurrency-queue';
+import { allProviders } from '../providers';
+import {
+  messageInputModalities,
+  unsupportedInputModalities,
+  resolveModelCapabilities,
+} from '../model-capabilities';
 
 const HOP_BY_HOP = new Set([
   'connection',
@@ -43,6 +59,14 @@ const HOP_BY_HOP = new Set([
 
 const OVERWHELMED_MESSAGE =
   'I am a bit overwhelmed. Let me take a deep breath and continue.';
+
+/**
+ * Thrown by 429 handlers when the upstream rejects with
+ * "too many concurrent requests" and there are still deferrals left
+ * (RETRY_LOOP_COUNTER). The concurrency-queue loop in
+ * forwardChatCompletion catches it and re-queues.
+ */
+class QueueRetry429 extends Error {}
 
 function forwardHeaders(
   incoming: IncomingHttpHeaders,
@@ -409,6 +433,7 @@ async function tryFallbackChain(
   incomingHeaders: IncomingHttpHeaders,
   res: Response,
   endpointPrefix: string,
+  skipGroupMembers: string[] = [],
 ): Promise<boolean> {
   // Find the alias chain for the requested model
   let chain: string[] | undefined;
@@ -446,6 +471,14 @@ async function tryFallbackChain(
       continue;
     }
 
+    // Skip models that already failed inside the preferred group pool.
+    if (route && skipGroupMembers.includes(`${route.provider}:${route.upstreamModel}`)) {
+      console.log(
+        `[fallback] skipping ${route.provider}/${route.upstreamModel} (member already exhausted in group)`,
+      );
+      continue;
+    }
+
     // Don't fallback to self (handled by startIndex, kept as safety)
     if (
       route.provider === originalAdapter.id &&
@@ -455,6 +488,20 @@ async function tryFallbackChain(
     }
 
     const requestedModelName = String(body.model ?? '');
+
+    // Skip this chain entry if the payload is incompatible with the model
+    // (e.g. images in history but target model is text-only).
+    if (!isModelCompatible(body, route.provider, route.upstreamModel)) {
+      logProxyError({
+        provider: route.provider,
+        endpointPrefix,
+        requestedModel: requestedModelName,
+        effectiveModel: route.upstreamModel,
+        message: `skipping fallback chain[${i}] - incompatible with model capabilities`,
+      });
+      continue;
+    }
+
     console.log(
       `[fallback] ${requestedModelName} | ${originalAdapter.id}/${originalModel} → ${route.provider}/${route.upstreamModel} | reason: ${label}`,
     );
@@ -605,6 +652,109 @@ function sanitizeProviderParams(
   return cleaned;
 }
 
+/** Models whose reasoning_content must be preserved for round-trip. */
+function isMoonshotReasoningModel(providerId: string, model: string): boolean {
+  if (providerId !== 'gonka' && providerId !== 'gonka-dahl' && providerId !== 'hyperfusion') return false;
+  const lower = model.toLowerCase();
+  return (
+    lower.includes('moonshotai/kimi') ||
+    /^kimi-?k?2?\.?6$/i.test(lower)
+  );
+}
+
+/**
+ * Isolate a per-attempt copy of the request, adapted for a specific target
+ * model. The original `body` is NEVER mutated — each fallback step starts
+ * from the pristine client payload.
+ *
+ * Adaptations:
+ *  - strip `reasoning_content` from assistant messages for any model that is
+ *    NOT Moonshot/Kimi (DeepSeek/MiniMax reject foreign reasoning_content);
+ *  - leave `reasoning_content` in place for Moonshot Kimi (needs round-trip);
+ *  - apply existing prompt overrides + empty-tool_calls sanitization.
+ */
+function adaptForModel(
+  body: ChatCompletionRequest,
+  providerId: ProviderId,
+  model: string,
+): ChatCompletionRequest {
+  let messages = applyPromptOverrides(body.messages);
+  messages = sanitizeEmptyToolCalls(messages);
+
+  if (!isMoonshotReasoningModel(providerId, model)) {
+    let stripped = 0;
+    const cleaned = (messages ?? []).map((m) => {
+      if (
+        m.role === 'assistant' &&
+        Object.prototype.hasOwnProperty.call(m, 'reasoning_content')
+      ) {
+        stripped++;
+        const { reasoning_content: _, ...rest } = m as Record<string, unknown>;
+        return rest as ChatMessage;
+      }
+      return m;
+    });
+    if (stripped > 0) {
+      console.log(
+        `[sanitize] stripped reasoning_content from ${stripped} assistant message(s) for ${providerId}/${model}`,
+      );
+      messages = cleaned;
+    }
+  }
+
+  let adapted: ChatCompletionRequest =
+    messages !== body.messages ? { ...body, messages } : { ...body };
+
+  adapted = sanitizeProviderParams(providerId, adapted, getProvider(providerId as ProviderId));
+  return adapted;
+}
+
+/**
+ * Check whether a fallback candidate can accept the client payload.
+ * If not (e.g. vision content in history but the target model is text-only),
+ * we skip this chain entry instead of failing the whole request.
+ */
+function isModelCompatible(
+  body: ChatCompletionRequest,
+  providerId: string,
+  model: string,
+): boolean {
+  const requested = messageInputModalities(body.messages);
+  if (requested.size === 0) return true;
+
+  const capabilities = resolveModelCapabilities(
+    providerId as ProviderId,
+    model,
+  );
+  const blocked = unsupportedInputModalities(capabilities, requested);
+  if (blocked.length > 0) {
+    console.log(
+      `[fallback] skipping ${providerId}/${model}: incompatible input modalities: ${blocked.join(', ')}`,
+    );
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Throw QueueRetry429 when a re-queue attempt is still available and the
+ * current model has a CONCURRENT limit + the upstream 429 body is the
+ * "too many concurrent requests" variant. The outer queue loop catches this
+ * and re-queues (up to RETRY_LOOP_COUNTER tries). When attempts are
+ * exhausted, no throw happens and the normal 429 fallback/passthrough runs.
+ */
+function throwIfTooManyConcurrent(
+  adapter: ProviderAdapter,
+  model: string,
+  rawBody: unknown,
+  canRetry: boolean,
+): void {
+  const limit = resolveConcurrentLimit(adapter, model);
+  if (canRetry && limit !== undefined && isTooManyConcurrentRequests(rawBody)) {
+    throw new QueueRetry429();
+  }
+}
+
 export async function forwardChatCompletion(
   adapter: ProviderAdapter,
   activeModel: string,
@@ -616,7 +766,171 @@ export async function forwardChatCompletion(
   fallbackFrom?: string,
 ): Promise<void> {
   const model = activeModel.trim() || adapter.resolveModel(body.model);
-  const payload = withStreamUsage({ ...body, model });
+  const limit = resolveConcurrentLimit(adapter, model);
+  const queueKey = `${adapter.id}:${model}`;
+  const inGroup = isPreferredGroupMember(adapter.id, model, adapter.config.modelQuirks?.[model]);
+  const groupSpec: PreferredGroupSpec | null = inGroup ? buildPreferredGroupSpec(allProviders()) : null;
+  const groupExhausted = new Set<string>();
+  let attemptsLeft = appConfig.retryLoopCounter;
+
+  while (true) {
+    const waitMs = appConfig.retryQueueWaitTimeout * 1000;
+
+    // Preferred-group pool: take the first free slot among ALL group members.
+    if (groupSpec) {
+      const gAcquired = await acquirePreferredGroupSlot(
+        groupSpec,
+        waitMs,
+        () => res.writableEnded || res.destroyed,
+      );
+      if (gAcquired.ok) {
+        const grpAdapter = getProvider(gAcquired.provider as ProviderId);
+        const { release } = gAcquired.handle;
+        try {
+          await forwardChatCompletionOnce(
+            grpAdapter,
+            gAcquired.model,
+            body,
+            incomingHeaders,
+            res,
+            endpointPrefix,
+            fallbackFrom,
+            attemptsLeft > 0,
+          );
+          return;
+        } catch (err) {
+          if (err instanceof QueueRetry429 && attemptsLeft > 0) {
+            attemptsLeft--;
+            console.log(
+              `[queue] ${queueKey} upstream 429 "too many concurrent requests", re-queuing (${attemptsLeft} left)`,
+            );
+            continue;
+          }
+          throw err;
+        } finally {
+          release();
+        }
+      }
+      // Group pool timed out → exit pool, skip exhausted members in chain.
+      if (gAcquired.reason === 'timeout') {
+        console.log(
+          `[queue] ${queueKey} preferred-group pool timeout after ${waitMs}ms, exiting pool`,
+        );
+        for (const member of groupSpec.members) groupExhausted.add(member.key);
+        const rerouted = await tryFallbackChain(
+          'preferred-group-timeout',
+          adapter,
+          model,
+          body,
+          incomingHeaders,
+          res,
+          endpointPrefix,
+          [...groupExhausted],
+        );
+        if (!rerouted && !res.headersSent) {
+          res.status(429).json({
+            error: {
+              message: 'rate limit exceeded: preferred group pool timed out',
+              type: 'rate_limit_error',
+            },
+          });
+        }
+        return;
+      }
+      if (gAcquired.reason === 'client-closed') return;
+    }
+
+    const acquired = await acquireSlot(
+      queueKey,
+      limit ?? 0,
+      waitMs,
+      () => res.writableEnded || res.destroyed,
+    );
+
+    if (!acquired.ok) {
+      if (acquired.reason === 'client-closed') return;
+      // Queue slot was busy past RETRY_QUEUE_WAIT_TIMEOUT → fall back or pass 429.
+      // No re-queue here: RETRY_LOOP_COUNTER is only spent on a real upstream
+      // "too many concurrent requests" re-queue (see QueueRetry429 below).
+      const label = 'queue-timeout';
+      if (appConfig.doNotFallbackOn429) {
+        console.log(
+          `[queue] ${queueKey} queue timeout, DO_NOT_FALLBACK_ON_429: passing through`,
+        );
+        if (!res.headersSent) {
+          res.status(429).json({
+            error: {
+              message: 'rate limit exceeded: queued request timed out',
+              type: 'rate_limit_error',
+            },
+          });
+        }
+        return;
+      }
+      const rerouted = await tryFallbackChain(
+        label,
+        adapter,
+        model,
+        body,
+        incomingHeaders,
+        res,
+        endpointPrefix,
+        [...groupExhausted],
+      );
+      if (!rerouted) {
+        if (!res.headersSent) {
+          res.status(429).json({
+            error: {
+              message: 'rate limit exceeded: queued request timed out',
+              type: 'rate_limit_error',
+            },
+          });
+        }
+      }
+      return;
+    }
+
+    const { release } = acquired.handle;
+    try {
+      await forwardChatCompletionOnce(
+        adapter,
+        model,
+        body,
+        incomingHeaders,
+        res,
+        endpointPrefix,
+        fallbackFrom,
+        attemptsLeft > 0,
+      );
+      return;
+    } catch (err) {
+      if (err instanceof QueueRetry429 && attemptsLeft > 0) {
+        attemptsLeft--;
+        console.log(
+          `[queue] ${queueKey} upstream 429 "too many concurrent requests", re-queuing (${attemptsLeft} left)`,
+        );
+        continue;
+      }
+      throw err;
+    } finally {
+      release();
+    }
+  }
+}
+
+async function forwardChatCompletionOnce(
+  adapter: ProviderAdapter,
+  activeModel: string,
+  body: ChatCompletionRequest,
+  incomingHeaders: IncomingHttpHeaders,
+  res: Response,
+  endpointPrefix: string,
+  /** Model that was originally failing (set when called from tryFallbackChain) */
+  fallbackFrom?: string,
+  /** Whether a QueueRetry429 re-queue is still available (RETRY_LOOP_COUNTER). */
+  canRetry = true,
+): Promise<void> {
+  const model = activeModel.trim() || adapter.resolveModel(body.model);
   const requestCtx = captureRequestContext(body.messages);
   const promptEstimate = estimateTokensFromMessages(body.messages);
   const url = adapter.chatCompletionsUrl();
@@ -627,17 +941,15 @@ export async function forwardChatCompletion(
   );
   const streaming = Boolean(body.stream);
 
-  // Apply system prompt overrides
-  let messages = applyPromptOverrides(body.messages);
-
-  // Strip empty tool_calls:[] that some upstreams (Gonka) reject
-  messages = sanitizeEmptyToolCalls(messages);
-
-  let patchedPayload: ChatCompletionRequest =
-    messages !== body.messages ? { ...payload, messages } : payload;
-
-  // Strip parameters unsupported by specific providers
-  patchedPayload = sanitizeProviderParams(adapter.id, patchedPayload, adapter);
+  // Isolate a per-attempt copy of the request adapted for this model.
+  // The original `body` is never mutated — every fallback step starts
+  // from the pristine client payload (covers reasoning_content stripping,
+  // prompt overrides, empty tool_calls, and provider param quirks).
+  const adaptedBody = adaptForModel(body, adapter.id, model);
+  const patchedPayload: ChatCompletionRequest = withStreamUsage({
+    ...adaptedBody,
+    model,
+  });
 
   const requestedModelName = String(body.model ?? '');
 
@@ -653,7 +965,7 @@ export async function forwardChatCompletion(
   // === Streaming path ===
   if (body.stream) {
     // Gonka streaming: buffer, detect garbage, fallback on garbage (same as any error)
-    if (adapter.id === 'gonka') {
+    if (adapter.id === 'gonka' || adapter.id === 'gonka-dahl' || adapter.id === 'hyperfusion') {
       await forwardStreamWithGarbageProtection(
         adapter,
         model,
@@ -667,6 +979,7 @@ export async function forwardChatCompletion(
         incomingHeaders,
         endpointPrefix,
         fallbackFrom,
+        canRetry,
       );
       return;
     }
@@ -709,6 +1022,7 @@ export async function forwardChatCompletion(
           // Also resolve after a short timeout in case of stuck connection
           setTimeout(resolve, 2000);
         });
+        const upstreamRlHeaders = (upstream?.headers ?? {}) as Record<string, string>;
         (
           upstream.data as NodeJS.ReadableStream & { destroy?: () => void }
         ).destroy?.();
@@ -723,6 +1037,7 @@ export async function forwardChatCompletion(
           }
         })();
         const errorDetail = formatUpstreamError(upstreamStatus, parsedError);
+
         await logRequestDump({
           provider: adapter.id,
           model,
@@ -739,6 +1054,47 @@ export async function forwardChatCompletion(
         }).catch((err) => {
           console.error('[request-dump] logRequestDump failed:', (err as Error)?.message ?? String(err));
         });
+
+        // Diagnostic: capture raw rate-limit headers/body for later analysis.
+        logRateLimit({
+          provider: adapter.id,
+          model,
+          upstreamUrl: url,
+          status: upstreamStatus,
+          headers: upstreamRlHeaders,
+          rawBody: errorBody,
+        });
+
+        // "too many concurrent requests" with retries left → re-queue
+        throwIfTooManyConcurrent(adapter, model, parsedError, canRetry);
+
+        // If configured, don't fallback on 429 — pass it through to the client
+        // so Hermes can honor Retry-After and back off without failing the task.
+        if (appConfig.doNotFallbackOn429 && upstreamStatus === 429) {
+          console.log(
+            `[429] DO_NOT_FALLBACK_ON_429: passing ${adapter.id}/${model} 429 through to client`,
+          );
+          if (!res.headersSent) {
+            res.status(429);
+            for (const [key, value] of Object.entries(upstreamRlHeaders)) {
+              if (value && !HOP_BY_HOP.has(key.toLowerCase())) {
+                res.setHeader(key, value as string);
+              }
+            }
+            res.json(parsedError);
+          }
+          await recordUsage(adapter, model, null, promptEstimate, '', requestCtx, {
+            requestBody: body,
+            upstreamUrl: url,
+            status: 429,
+            stream: true,
+            responseBody: parsedError,
+            error: `rate-limited:429 | ${errorDetail}`,
+          }).catch((err) => {
+            console.error('[request-dump] recordUsage failed:', (err as Error)?.message ?? String(err));
+          });
+          return;
+        }
 
         // Try fallback chain for rate-limit
         const label = upstreamStatus === 413 ? '413 (TPM exceeded)' : '429';
@@ -914,6 +1270,8 @@ export async function forwardChatCompletion(
         fallbackFrom,
       });
     } catch (err) {
+      // Re-queue signal must propagate to the queue loop, not fallback.
+      if (err instanceof QueueRetry429) throw err;
       // Dump full request + failure info before trying fallback
       const message = describeForwardError(err);
       logProxyError({
@@ -995,6 +1353,50 @@ export async function forwardChatCompletion(
       }).catch((err) => {
         console.error('[request-dump] logRequestDump failed:', (err as Error)?.message ?? String(err));
       });
+
+      // Diagnostic: capture raw rate-limit headers/body for later analysis.
+      logRateLimit({
+        provider: adapter.id,
+        model,
+        upstreamUrl: url,
+        status: upstream.status,
+        headers: upstream.headers as Record<string, string>,
+        rawBody:
+          typeof upstream.data === 'string'
+            ? upstream.data
+            : JSON.stringify(upstream.data),
+      });
+
+      // "too many concurrent requests" with retries left → re-queue
+      throwIfTooManyConcurrent(adapter, model, upstream.data, canRetry);
+
+      // If configured, don't fallback on 429 — pass it through to the client
+      // so Hermes can honor Retry-After and back off without failing the task.
+      if (appConfig.doNotFallbackOn429 && upstream.status === 429) {
+        console.log(
+          `[429] DO_NOT_FALLBACK_ON_429: passing ${adapter.id}/${model} 429 through to client`,
+        );
+        if (!res.headersSent) {
+          res.status(429);
+          for (const [key, value] of Object.entries(upstream.headers)) {
+            if (value && !HOP_BY_HOP.has(key.toLowerCase())) {
+              res.setHeader(key, value as string);
+            }
+          }
+          res.json(upstream.data);
+        }
+        await recordUsage(adapter, model, null, promptEstimate, '', requestCtx, {
+          requestBody: body,
+          upstreamUrl: url,
+          status: 429,
+          stream: false,
+          responseBody: upstream.data,
+          error: 'rate-limited:429',
+        }).catch((err) => {
+          console.error('[request-dump] recordUsage failed:', (err as Error)?.message ?? String(err));
+        });
+        return;
+      }
 
       const label = upstream.status === 413 ? '413 (TPM exceeded)' : '429';
       const rerouted = await tryFallbackChain(
@@ -1231,6 +1633,8 @@ export async function forwardChatCompletion(
 
     res.status(upstream.status).json(upstream.data);
   } catch (err) {
+    // Re-queue signal must propagate to the queue loop, not fallback.
+    if (err instanceof QueueRetry429) throw err;
     // Dump full request + failure info before trying fallback
     const message = describeForwardError(err);
     logProxyError({
@@ -1306,6 +1710,8 @@ async function forwardStreamWithGarbageProtection(
   incomingHeaders: IncomingHttpHeaders,
   endpointPrefix: string,
   fallbackFrom?: string,
+  /** Whether a QueueRetry429 re-queue is still available (RETRY_LOOP_COUNTER). */
+  canRetry = true,
 ): Promise<void> {
   const requestedModelName = String(body.model ?? '');
   let completionText = '';
@@ -1363,8 +1769,38 @@ async function forwardStreamWithGarbageProtection(
     return;
   }
 
-  // Upstream error — try fallback
+  // Upstream error — try fallback (or pass 429 through when configured)
   if (upstreamStatus >= 400) {
+    // "too many concurrent requests" with retries left → re-queue
+    if (upstreamStatus === 429) {
+      throwIfTooManyConcurrent(adapter, model, errorDetail ?? '', canRetry);
+    }
+    if (upstreamStatus === 429 && appConfig.doNotFallbackOn429) {
+      console.log(
+        `[429] DO_NOT_FALLBACK_ON_429: passing ${adapter.id}/${model} 429 through to client`,
+      );
+      logRateLimit({
+        provider: adapter.id,
+        model,
+        upstreamUrl: url,
+        status: 429,
+        headers: upstreamHeaders,
+        rawBody: errorDetail ?? '',
+      });
+      await recordUsage(adapter, model, null, promptEstimate, '', requestCtx, {
+        requestBody: body,
+        upstreamUrl: url,
+        status: 429,
+        stream: true,
+        responseBody: errorDetail ?? '',
+        error: 'rate-limited:429',
+      }).catch((err) => {
+        console.error('[request-dump] recordUsage failed:', (err as Error)?.message ?? String(err));
+      });
+      flushBufferedChunks(res, chunks, 429, upstreamHeaders);
+      return;
+    }
+
     const rerouted = await tryFallbackChain(
       `upstream-${upstreamStatus}`,
       adapter,

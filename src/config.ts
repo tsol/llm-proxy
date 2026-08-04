@@ -107,6 +107,17 @@ export const appConfig = {
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean),
+  /** When true, a 429 from upstream is passed through to the client
+   *  (with Retry-After headers) instead of trying the fallback chain.
+   *  The client (Hermes) handles the backoff itself. */
+  doNotFallbackOn429: env('DO_NOT_FALLBACK_ON_429') === 'true',
+  /** How long a request waits in the concurrent-request queue (per model
+   *  with a CONCURRENT limit) before giving up and falling back / 429. */
+  retryQueueWaitTimeout: envNum('RETRY_QUEUE_WAIT_TIMEOUT', 45),
+  /** How many times a request may re-queue after a queue timeout or a
+   *  "too many concurrent requests" 429 before giving up. After the
+   *  last attempt it proceeds to the normal fallback/429 path. */
+  retryLoopCounter: envNum('RETRY_LOOP_COUNTER', 1),
   systemPrompt: env('SYSTEM_PROMPT'),
   systemPromptSuffix: env('SYSTEM_PROMPT_SUFFIX'),
   gpu: {
@@ -119,14 +130,22 @@ export const appConfig = {
       ? envNum('LOCAL_DEFAULT_CONTEXT_LENGTH', 0)
       : undefined,
     comfyApiUrl: env('COMFY_API_URL', 'http://127.0.0.1:8188'),
-    comfyRunScript: path.resolve(
-      repoRoot,
-      env('COMFY_RUN_SCRIPT', 'ComfyUI/run.sh'),
-    ),
-    comfyPidFile: path.resolve(
-      repoRoot,
-      env('COMFY_PID_FILE', 'ComfyUI/comfyui.pid'),
-    ),
+    comfyRunScript: (() => {
+      const raw = env('COMFY_RUN_SCRIPT', '');
+      if (raw) return path.resolve(repoRoot, raw);
+      return path.join(os.homedir(), 'hermes', 'ComfyUI', 'run.sh');
+    })(),
+    comfyPidFile: (() => {
+      const raw = env('COMFY_PID_FILE', '');
+      if (raw) return path.resolve(repoRoot, raw);
+      return path.join(os.homedir(), 'hermes', 'ComfyUI', 'comfyui.pid');
+    })(),
+  },
+  android: {
+    adbPath: env('ANDROID_ADB_PATH', 'adb'),
+    tcpipPort: envNum('ANDROID_TCPIP_PORT', 5555),
+    targetVid: env('ANDROID_DEVICE_VID', ''),
+    targetPid: env('ANDROID_DEVICE_PID', ''),
   },
 };
 
@@ -149,11 +168,11 @@ function buildPricing(
 
 // Load curated metadata from JSON (context lengths, rate limits per model & provider)
 const metaRateLimits = Object.fromEntries(
-  (['local', 'gonka', 'google', 'cursor', 'deepseek', 'groq', 'cerebras', 'openrouter'] as ProviderId[])
+  (['local', 'gonka', 'gonka-dahl', 'hyperfusion', 'google', 'cursor', 'deepseek', 'groq', 'cerebras', 'openrouter'] as ProviderId[])
     .map((id) => [id, getMetadataRateLimits(id)] as const),
 );
 const metaModelQuirks = Object.fromEntries(
-  (['local', 'gonka', 'google', 'cursor', 'deepseek', 'groq', 'cerebras', 'openrouter'] as ProviderId[])
+  (['local', 'gonka', 'gonka-dahl', 'hyperfusion', 'google', 'cursor', 'deepseek', 'groq', 'cerebras', 'openrouter'] as ProviderId[])
     .map((id) => [id, getMetadataModelQuirks(id)] as const),
 );
 
@@ -180,6 +199,30 @@ export const providerConfigs: Record<ProviderId, ProviderConfig> = {
     ownedBy: 'gonka',
     rateLimits: mergeRateLimits(metaRateLimits.gonka, 'GONKA', {}),
     modelQuirks: { ...metaModelQuirks.gonka },
+  },
+
+  'gonka-dahl': {
+    id: 'gonka-dahl',
+    displayOrder: 1,
+    baseUrl: env('GONKA_DAHL_BASE_URL', 'https://inference.dahl.global/v1'),
+    apiKey: env('GONKA_DAHL_API_KEY'),
+    defaultModel: env('GONKA_DAHL_DEFAULT_MODEL', 'MiniMaxAI/MiniMax-M2.7'),
+    pricing: buildPricing('GONKA_DAHL', { inputPerMillion: 0, outputPerMillion: 0 }),
+    ownedBy: 'gonka-dahl',
+    rateLimits: mergeRateLimits(metaRateLimits['gonka-dahl'], 'GONKA_DAHL', {}),
+    modelQuirks: { ...metaModelQuirks['gonka-dahl'] },
+  },
+
+  hyperfusion: {
+    id: 'hyperfusion',
+    displayOrder: 1,
+    baseUrl: env('HYPERFUSION_BASE_URL', 'https://api.hyperfusion.io/v1'),
+    apiKey: env('HYPERFUSION_API_KEY'),
+    defaultModel: env('HYPERFUSION_DEFAULT_MODEL', 'MiniMaxAI/MiniMax-M2.7'),
+    pricing: buildPricing('HYPERFUSION', { inputPerMillion: 0, outputPerMillion: 0 }),
+    ownedBy: 'hyperfusion',
+    rateLimits: mergeRateLimits(metaRateLimits.hyperfusion, 'HYPERFUSION', {}),
+    modelQuirks: { ...metaModelQuirks.hyperfusion },
   },
 
   google: {

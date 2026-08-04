@@ -8,6 +8,8 @@ import { modelsRouter } from './routes/models';
 import { adminRouter } from './routes/admin';
 import { aliasesRouter } from './routes/aliases';
 import { gpuRouter } from './routes/gpu';
+import { androidRouter } from './routes/android';
+import { configureAndroidBridge } from './services/android-bridge';
 import { ensureReqLogDir, rotateReqLogs } from './services/request-dump-logger';
 
 const app = express();
@@ -24,6 +26,15 @@ app.use('/v1', modelsRouter);
 app.use('/v1', adminRouter);
 app.use('/v1', aliasesRouter);
 app.use('/v1', gpuRouter);
+app.use('/v1', androidRouter);
+
+// Configure Android bridge from env
+configureAndroidBridge({
+  adbPath: appConfig.android.adbPath,
+  tcpipPort: appConfig.android.tcpipPort,
+  targetVid: appConfig.android.targetVid,
+  targetPid: appConfig.android.targetPid,
+});
 
 // Per-provider mount: /deepseek/v1/chat/completions, /cerebras/v1/models, etc.
 // Bypasses catalog lookup — forces all requests through the named provider.

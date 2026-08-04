@@ -2,18 +2,116 @@ import axios from 'axios';
 import { execFile } from 'child_process';
 import fs from 'fs/promises';
 import { promisify } from 'util';
-import { appConfig } from '../config';
-import { providerConfigs } from '../config';
+import { appConfig, providerConfigs } from '../config';
 
 const execFileAsync = promisify(execFile);
 
 const LM_SERVER_POLL_MS = 500;
 const LM_SERVER_START_TIMEOUT_MS = 90_000;
 const COMFY_API_WARMUP_MS = 2_000;
+const COMFY_START_TIMEOUT_MS = 30_000;
+const COMFY_STOP_TIMEOUT_MS = 15_000;
+const GRACEFUL_WAIT_TIMEOUT_MS = 120_000;
+const GRACEFUL_WAIT_POLL_MS = 2_000;
 
 function ts(): string {
   return new Date().toISOString();
 }
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ============================================================
+// Transition State Machine
+// ============================================================
+
+export type TransitionPhase =
+  | 'idle'
+  | 'stopping_comfy'
+  | 'starting_comfy'
+  | 'stopping_lmstudio'
+  | 'starting_lmstudio'
+  | 'unloading_lmstudio'
+  | 'loading_lmstudio'
+  | 'switching_to_llm'
+  | 'switching_to_images'
+  | 'waiting_for_comfy_queue'
+  | 'waiting_for_lmstudio_idle';
+
+export interface Transition {
+  phase: TransitionPhase;
+  started_at: string;
+  detail: string;
+}
+
+let currentTransition: Transition | null = null;
+
+function setTransition(phase: TransitionPhase, detail: string): void {
+  currentTransition = {
+    phase,
+    started_at: new Date().toISOString(),
+    detail,
+  };
+  console.log(`[${ts()}] gpu transition: ${phase} — ${detail}`);
+}
+
+function clearTransition(): void {
+  currentTransition = null;
+}
+
+function getTransition(): Transition | null {
+  return currentTransition;
+}
+
+function updateTransitionDetail(detail: string): void {
+  if (currentTransition) {
+    currentTransition.detail = detail;
+  }
+}
+
+// ============================================================
+// Types
+// ============================================================
+
+export interface LmStudioInstance {
+  instance_id: string;
+  model_key: string;
+  display_name?: string;
+  context_length?: number;
+}
+
+export interface LmStudioStatus {
+  server: 'up' | 'down';
+  loaded: LmStudioInstance[];
+  loaded_count: number;
+  error?: string;
+}
+
+export interface ComfyStatus {
+  running: boolean;
+  pid: number | null;
+  api_reachable: boolean;
+  queue_running: number;
+  queue_pending: number;
+  vram?: {
+    total_mb?: number;
+    free_mb?: number;
+    used_mb?: number;
+  };
+  error?: string;
+}
+
+export interface GpuStatus {
+  lmstudio: LmStudioStatus;
+  comfy: ComfyStatus;
+  conflict: boolean;
+  transition: Transition | null;
+}
+
+// ============================================================
+// Helpers
+// ============================================================
 
 function normModelKey(value: string): string {
   return value.trim().toLowerCase().replace(/\\/g, '/');
@@ -41,42 +139,6 @@ export function isModelLoaded(
   return status.loaded.some((instance) =>
     modelKeysMatch(requested, instance.model_key),
   );
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-export interface LmStudioInstance {
-  instance_id: string;
-  model_key: string;
-  display_name?: string;
-  context_length?: number;
-}
-
-export interface LmStudioStatus {
-  server: 'up' | 'down';
-  loaded: LmStudioInstance[];
-  loaded_count: number;
-  error?: string;
-}
-
-export interface ComfyStatus {
-  running: boolean;
-  pid: number | null;
-  api_reachable: boolean;
-  vram?: {
-    total_mb?: number;
-    free_mb?: number;
-    used_mb?: number;
-  };
-  error?: string;
-}
-
-export interface GpuStatus {
-  lmstudio: LmStudioStatus;
-  comfy: ComfyStatus;
-  conflict: boolean;
 }
 
 function lmHeaders(): Record<string, string> {
@@ -112,6 +174,10 @@ async function isProcessAlive(pid: number): Promise<boolean> {
     return false;
   }
 }
+
+// ============================================================
+// Status queries
+// ============================================================
 
 export async function getLmStudioStatus(): Promise<LmStudioStatus> {
   try {
@@ -157,6 +223,24 @@ export async function getLmStudioStatus(): Promise<LmStudioStatus> {
   }
 }
 
+async function getComfyQueueInfo(): Promise<{ running: number; pending: number }> {
+  try {
+    const { data } = await axios.get<{
+      queue_running?: unknown[];
+      queue_pending?: unknown[];
+    }>(
+      `${appConfig.gpu.comfyApiUrl.replace(/\/$/, '')}/queue`,
+      { timeout: 5_000 },
+    );
+    return {
+      running: Array.isArray(data.queue_running) ? data.queue_running.length : 0,
+      pending: Array.isArray(data.queue_pending) ? data.queue_pending.length : 0,
+    };
+  } catch {
+    return { running: 0, pending: 0 };
+  }
+}
+
 export async function getComfyStatus(): Promise<ComfyStatus> {
   const pid = await readComfyPid();
   const running = pid !== null && (await isProcessAlive(pid));
@@ -164,6 +248,8 @@ export async function getComfyStatus(): Promise<ComfyStatus> {
   let apiReachable = false;
   let vram: ComfyStatus['vram'];
   let error: string | undefined;
+  let queueRunning = 0;
+  let queuePending = 0;
 
   try {
     const { data } = await axios.get<{
@@ -192,6 +278,10 @@ export async function getComfyStatus(): Promise<ComfyStatus> {
         used_mb: totalMb - freeMb,
       };
     }
+
+    const queue = await getComfyQueueInfo();
+    queueRunning = queue.running;
+    queuePending = queue.pending;
   } catch (err) {
     if (!running) {
       error = err instanceof Error ? err.message : 'ComfyUI API unreachable';
@@ -202,6 +292,8 @@ export async function getComfyStatus(): Promise<ComfyStatus> {
     running: running || apiReachable,
     pid: running ? pid : null,
     api_reachable: apiReachable,
+    queue_running: queueRunning,
+    queue_pending: queuePending,
     vram,
     error,
   };
@@ -217,12 +309,18 @@ export async function getGpuStatus(): Promise<GpuStatus> {
     lmstudio,
     comfy,
     conflict: lmstudio.loaded_count > 0 && comfy.running,
+    transition: getTransition(),
   };
 }
 
-export async function unloadLmStudio(instanceId?: string): Promise<{
-  unloaded: string[];
-}> {
+// ============================================================
+// LM Studio operations
+// ============================================================
+
+export async function unloadLmStudio(
+  instanceId?: string,
+  force = false,
+): Promise<{ unloaded: string[] }> {
   const status = await getLmStudioStatus();
   if (status.server === 'down') {
     throw new Error(status.error ?? 'LM Studio server is down');
@@ -256,11 +354,9 @@ async function runLmStudioCli(args: string[]): Promise<string> {
   return (stdout || stderr || '').trim();
 }
 
-export async function startLmStudioServer(): Promise<void> {
+async function startLmStudioServer(): Promise<void> {
   const status = await getLmStudioStatus();
-  if (status.server === 'up') {
-    return;
-  }
+  if (status.server === 'up') return;
 
   console.log(`[${ts()}] gpu: starting LM Studio server via ${appConfig.gpu.lmStudioCli}`);
   await runLmStudioCli(['server', 'start']);
@@ -272,85 +368,11 @@ export async function waitForLmStudioServer(
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const status = await getLmStudioStatus();
-    if (status.server === 'up') {
-      return status;
-    }
+    if (status.server === 'up') return status;
     await sleep(LM_SERVER_POLL_MS);
   }
 
   throw new Error('LM Studio server did not become reachable');
-}
-
-export interface EnsureLocalModelResult {
-  skipped: boolean;
-  actions: string[];
-  status: GpuStatus;
-}
-
-export async function ensureLocalModelReady(opts: {
-  model: string;
-  context_length?: number;
-}): Promise<EnsureLocalModelResult> {
-  const model = opts.model.trim();
-  if (!model) {
-    throw new Error('No local model specified');
-  }
-
-  const actions: string[] = [];
-  let lm = await getLmStudioStatus();
-
-  if (lm.server === 'up' && isModelLoaded(model, lm)) {
-    const status = await getGpuStatus();
-    return { skipped: true, actions: ['already_ready'], status };
-  }
-
-  console.log(
-    `[${ts()}] gpu: preparing local model "${model}" (server=${lm.server}, loaded=${lm.loaded_count})`,
-  );
-
-  const comfyBefore = await getComfyStatus();
-  if (comfyBefore.running) {
-    await stopComfy();
-    actions.push('stopped_comfy');
-    await sleep(COMFY_API_WARMUP_MS);
-  }
-
-  if (lm.server === 'down') {
-    await startLmStudioServer();
-    actions.push('started_lmstudio_server');
-    lm = await waitForLmStudioServer();
-  }
-
-  if (!isModelLoaded(model, lm)) {
-    if (lm.loaded_count > 0) {
-      const unloaded = await unloadLmStudio();
-      if (unloaded.unloaded.length > 0) {
-        actions.push(`unloaded_lmstudio:${unloaded.unloaded.join(',')}`);
-      }
-    }
-
-    const loaded = await loadLmStudio({
-      model,
-      ...(opts.context_length !== undefined
-        ? { context_length: opts.context_length }
-        : {}),
-    });
-    actions.push(`loaded_lmstudio:${loaded.model}`);
-    lm = await getLmStudioStatus();
-    if (!isModelLoaded(model, lm)) {
-      throw new Error(`LM Studio load finished but "${model}" is not loaded`);
-    }
-  }
-
-  const comfyAfterLoad = await getComfyStatus();
-  if (!comfyAfterLoad.running) {
-    await startComfy();
-    actions.push(comfyBefore.running ? 'restarted_comfy' : 'started_comfy');
-  }
-
-  const status = await getGpuStatus();
-  console.log(`[${ts()}] gpu: local prep done (${actions.join(', ') || 'no-op'})`);
-  return { skipped: false, actions, status };
 }
 
 export async function loadLmStudio(opts?: {
@@ -381,6 +403,10 @@ export async function loadLmStudio(opts?: {
   return { instance_id: data.instance_id, model };
 }
 
+// ============================================================
+// ComfyUI operations
+// ============================================================
+
 async function runComfyScript(action: 'start' | 'stop' | 'status'): Promise<string> {
   const { stdout, stderr } = await execFileAsync(
     'bash',
@@ -390,19 +416,250 @@ async function runComfyScript(action: 'start' | 'stop' | 'status'): Promise<stri
   return (stdout || stderr || '').trim();
 }
 
-export async function startComfy(): Promise<{ message: string }> {
-  const message = await runComfyScript('start');
-  return { message };
+async function waitForComfyApi(
+  timeoutMs = COMFY_START_TIMEOUT_MS,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await axios.get(
+        `${appConfig.gpu.comfyApiUrl.replace(/\/$/, '')}/system_stats`,
+        { timeout: 3_000 },
+      );
+      return true;
+    } catch {
+      // Still waiting
+    }
+    await sleep(COMFY_API_WARMUP_MS);
+  }
+  return false;
 }
 
-export async function stopComfy(): Promise<{ message: string }> {
-  const message = await runComfyScript('stop');
-  return { message };
+async function waitForComfyProcessStop(
+  pid: number,
+  timeoutMs = COMFY_STOP_TIMEOUT_MS,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!(await isProcessAlive(pid))) return true;
+    await sleep(500);
+  }
+  return false;
 }
+
+async function waitForComfyQueueIdle(
+  timeoutMs = GRACEFUL_WAIT_TIMEOUT_MS,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  let attempt = 0;
+  while (Date.now() < deadline) {
+    attempt++;
+    const queue = await getComfyQueueInfo();
+    updateTransitionDetail(
+      `Waiting for ComfyUI queue to drain (running=${queue.running}, pending=${queue.pending}, attempt=${attempt})`,
+    );
+    if (queue.running === 0 && queue.pending === 0) return true;
+    await sleep(GRACEFUL_WAIT_POLL_MS);
+  }
+  return false;
+}
+
+export async function startComfy(): Promise<{
+  message: string;
+  api_reachable: boolean;
+  queue_running: number;
+  queue_pending: number;
+}> {
+  setTransition('starting_comfy', 'Running ComfyUI start script...');
+
+  const statusBefore = await getComfyStatus();
+  if (statusBefore.running && statusBefore.api_reachable) {
+    clearTransition();
+    return {
+      message: 'ComfyUI already running',
+      api_reachable: true,
+      queue_running: statusBefore.queue_running,
+      queue_pending: statusBefore.queue_pending,
+    };
+  }
+
+  const rawMessage = await runComfyScript('start');
+
+  updateTransitionDetail('Waiting for ComfyUI API to become reachable...');
+  const apiReachable = await waitForComfyApi();
+
+  const statusAfter = await getComfyStatus();
+  clearTransition();
+
+  return {
+    message: rawMessage,
+    api_reachable: apiReachable,
+    queue_running: statusAfter.queue_running,
+    queue_pending: statusAfter.queue_pending,
+  };
+}
+
+export async function stopComfy(force = false): Promise<{
+  message: string;
+  stopped: boolean;
+  was_queued: boolean;
+  queue_running: number;
+  queue_pending: number;
+}> {
+  const statusBefore = await getComfyStatus();
+
+  if (!statusBefore.running && !statusBefore.api_reachable) {
+    return {
+      message: 'ComfyUI not running',
+      stopped: false,
+      was_queued: false,
+      queue_running: 0,
+      queue_pending: 0,
+    };
+  }
+
+  const hasQueue = statusBefore.queue_running > 0 || statusBefore.queue_pending > 0;
+
+  if (hasQueue && !force) {
+    // Graceful: wait for queue to drain
+    setTransition(
+      'waiting_for_comfy_queue',
+      `ComfyUI has ${statusBefore.queue_running} running + ${statusBefore.queue_pending} pending jobs. Waiting...`,
+    );
+    const drained = await waitForComfyQueueIdle();
+    if (!drained) {
+      clearTransition();
+      throw new Error(
+        `ComfyUI queue did not drain within ${GRACEFUL_WAIT_TIMEOUT_MS / 1000}s (running=${statusBefore.queue_running}, pending=${statusBefore.queue_pending}). Use force=true to interrupt.`,
+      );
+    }
+  }
+
+  if (hasQueue && force) {
+    // Force: interrupt first
+    setTransition('stopping_comfy', 'Force stop: interrupting active jobs...');
+    try {
+      await axios.post(
+        `${appConfig.gpu.comfyApiUrl.replace(/\/$/, '')}/interrupt`,
+        {},
+        { timeout: 10_000 },
+      );
+    } catch {
+      // Interrupt may fail if API is already down — proceed with stop
+    }
+  }
+
+  setTransition('stopping_comfy', 'Running ComfyUI stop script...');
+  const rawMessage = await runComfyScript('stop');
+
+  // Wait for process to actually die
+  const pid = statusBefore.pid;
+  if (pid) {
+    updateTransitionDetail('Waiting for ComfyUI process to terminate...');
+    const stopped = await waitForComfyProcessStop(pid);
+    if (!stopped) {
+      // Force kill
+      try {
+        process.kill(pid, 9);
+      } catch {
+        // Already dead
+      }
+    }
+  }
+
+  clearTransition();
+
+  return {
+    message: rawMessage,
+    stopped: true,
+    was_queued: hasQueue,
+    queue_running: statusBefore.queue_running,
+    queue_pending: statusBefore.queue_pending,
+  };
+}
+
+// ============================================================
+// ensureLocalModelReady
+// ============================================================
+
+export interface EnsureLocalModelResult {
+  skipped: boolean;
+  actions: string[];
+  status: GpuStatus;
+}
+
+export async function ensureLocalModelReady(opts: {
+  model: string;
+  context_length?: number;
+}): Promise<EnsureLocalModelResult> {
+  const model = opts.model.trim();
+  if (!model) {
+    throw new Error('No local model specified');
+  }
+
+  const actions: string[] = [];
+  let lm = await getLmStudioStatus();
+
+  if (lm.server === 'up' && isModelLoaded(model, lm)) {
+    const status = await getGpuStatus();
+    return { skipped: true, actions: ['already_ready'], status };
+  }
+
+  console.log(
+    `[${ts()}] gpu: preparing local model "${model}" (server=${lm.server}, loaded=${lm.loaded_count})`,
+  );
+
+  setTransition('starting_lmstudio', `Ensuring LM Studio is running and model "${model}" is loaded...`);
+
+  if (lm.server === 'down') {
+    await startLmStudioServer();
+    actions.push('started_lmstudio_server');
+    lm = await waitForLmStudioServer();
+    updateTransitionDetail('LM Studio server is up, checking model...');
+  }
+
+  if (!isModelLoaded(model, lm)) {
+    if (lm.loaded_count > 0) {
+      setTransition('unloading_lmstudio', `Unloading ${lm.loaded_count} existing model(s) before loading new one...`);
+      const unloaded = await unloadLmStudio();
+      if (unloaded.unloaded.length > 0) {
+        actions.push(`unloaded_lmstudio:${unloaded.unloaded.join(',')}`);
+      }
+    }
+
+    setTransition('loading_lmstudio', `Loading model "${model}"...`);
+    const loaded = await loadLmStudio({
+      model,
+      ...(opts.context_length !== undefined
+        ? { context_length: opts.context_length }
+        : {}),
+    });
+    actions.push(`loaded_lmstudio:${loaded.model}`);
+
+    lm = await getLmStudioStatus();
+    if (!isModelLoaded(model, lm)) {
+      clearTransition();
+      throw new Error(`LM Studio load finished but "${model}" is not loaded`);
+    }
+  }
+
+  clearTransition();
+
+  const status = await getGpuStatus();
+  console.log(`[${ts()}] gpu: local prep done (${actions.join(', ') || 'no-op'})`);
+  return { skipped: false, actions, status };
+}
+
+// ============================================================
+// GPU Mode switching
+// ============================================================
 
 export type GpuMode = 'llm' | 'images';
 
-export async function setGpuMode(mode: GpuMode): Promise<{
+export async function setGpuMode(
+  mode: GpuMode,
+  force = false,
+): Promise<{
   mode: GpuMode;
   actions: string[];
   status: GpuStatus;
@@ -410,14 +667,20 @@ export async function setGpuMode(mode: GpuMode): Promise<{
   const actions: string[] = [];
 
   if (mode === 'llm') {
+    // Stop ComfyUI → load LLM
+    setTransition('switching_to_llm', 'Stopping ComfyUI...');
+
     const comfyBefore = await getComfyStatus();
     if (comfyBefore.running) {
-      await stopComfy();
-      actions.push('stopped_comfy');
+      const stopResult = await stopComfy(force);
+      actions.push(`stopped_comfy${stopResult.was_queued ? '_after_queue_drain' : ''}`);
+    } else {
+      actions.push('comfy_already_stopped');
     }
 
-    const lm = await getLmStudioStatus();
+    let lm = await getLmStudioStatus();
     if (lm.server === 'up' && lm.loaded_count === 0) {
+      setTransition('loading_lmstudio', 'Loading default model...');
       try {
         const loaded = await loadLmStudio();
         actions.push(`loaded_lmstudio:${loaded.model}`);
@@ -428,25 +691,58 @@ export async function setGpuMode(mode: GpuMode): Promise<{
       }
     } else if (lm.loaded_count > 0) {
       actions.push('lmstudio_already_loaded');
-    } else {
-      actions.push('lmstudio_server_down');
+    } else if (lm.server === 'down') {
+      // LM Studio server is down — wait for watchdog to start it
+      updateTransitionDetail('LM Studio server is down — waiting for watchdog to start it...');
+      const deadline = Date.now() + 90_000;
+      while (Date.now() < deadline) {
+        await sleep(2_000);
+        lm = await getLmStudioStatus();
+        if (lm.server === 'up') break;
+        updateTransitionDetail(`Waiting for LM Studio (${Math.round((deadline - Date.now()) / 1000)}s remaining)...`);
+      }
+      if (lm.server === 'up' && lm.loaded_count === 0) {
+        setTransition('loading_lmstudio', 'Loading default model...');
+        try {
+          const loaded = await loadLmStudio();
+          actions.push(`loaded_lmstudio:${loaded.model}`);
+        } catch (err) {
+          actions.push(
+            `load_lmstudio_skipped:${err instanceof Error ? err.message : 'failed'}`,
+          );
+        }
+      } else if (lm.loaded_count > 0) {
+        actions.push('lmstudio_already_loaded');
+      } else {
+        actions.push('lmstudio_server_down');
+      }
     }
   } else {
-    const unloaded = await unloadLmStudio();
-    if (unloaded.unloaded.length > 0) {
-      actions.push(`unloaded_lmstudio:${unloaded.unloaded.join(',')}`);
+    // Unload LLM → start ComfyUI
+    setTransition('switching_to_images', 'Unloading LM Studio models...');
+
+    const lmBefore = await getLmStudioStatus();
+    if (lmBefore.loaded_count > 0) {
+      setTransition('unloading_lmstudio', `Unloading ${lmBefore.loaded_count} model(s)...`);
+      const unloaded = await unloadLmStudio(undefined, force);
+      if (unloaded.unloaded.length > 0) {
+        actions.push(`unloaded_lmstudio:${unloaded.unloaded.join(',')}`);
+      }
     } else {
       actions.push('lmstudio_already_empty');
     }
 
+    setTransition('starting_comfy', 'Starting ComfyUI...');
     const comfyBefore = await getComfyStatus();
     if (!comfyBefore.running) {
-      await startComfy();
-      actions.push('started_comfy');
+      const startResult = await startComfy();
+      actions.push(`started_comfy${startResult.api_reachable ? '' : '_api_unreachable'}`);
     } else {
       actions.push('comfy_already_running');
     }
   }
+
+  clearTransition();
 
   return {
     mode,

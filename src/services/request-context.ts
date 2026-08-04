@@ -62,3 +62,17 @@ export function captureRequestContext(
 export function messageContentToTextExport(content: unknown): string {
   return messageContentToText(content);
 }
+
+import { AsyncLocalStorage } from 'async_hooks';
+
+const requestIdStorage = new AsyncLocalStorage<string>();
+
+/** Run a request callback with a request id bound to its async context. */
+export function runWithRequestId<T>(id: string, fn: () => T): T {
+  return requestIdStorage.run(id, fn);
+}
+
+/** Get the current async-context request id (or undefined outside a request). */
+export function getRequestId(): string | undefined {
+  return requestIdStorage.getStore();
+}

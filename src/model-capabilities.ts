@@ -64,7 +64,7 @@ export function resolveModelCapabilities(
   //    We handle this in config.ts by not having a quirks field — instead use hints + heuristics
 
   // 3. Heuristic-based resolution
-  if (provider === 'deepseek' || provider === 'cursor' || provider === 'gonka' || provider === 'groq' || provider === 'cerebras') {
+  if (provider === 'deepseek' || provider === 'cursor' || provider === 'gonka' || provider === 'gonka-dahl' || provider === 'hyperfusion' || provider === 'groq' || provider === 'cerebras') {
     return TEXT_ONLY;
   }
 

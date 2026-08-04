@@ -74,7 +74,39 @@
   },
   "gonka": {
     "rateLimits": {},
-    "models": {}
+    "models": {
+      "moonshotai/Kimi-K2.6": {
+        "concurrent": 1,
+        "inPreferredGroup": true
+      },
+      "MiniMaxAI/MiniMax-M2.7": {
+        "concurrent": 1,
+        "inPreferredGroup": true
+      }
+    }
+  },
+  "gonka-dahl": {
+    "rateLimits": {},
+    "models": {
+      "moonshotai/Kimi-K2.6": {
+        "concurrent": 1,
+        "inPreferredGroup": true
+      },
+      "MiniMaxAI/MiniMax-M2.7": {
+        "concurrent": 1,
+        "inPreferredGroup": true
+      }
+    }
+  },
+  "hyperfusion": {
+    "rateLimits": {},
+    "models": {
+      "MiniMaxAI/MiniMax-M2.7": {
+        "contextLength": 196608,
+        "concurrent": 1,
+        "inPreferredGroup": true
+      }
+    }
   },
   "local": {
     "rateLimits": {},

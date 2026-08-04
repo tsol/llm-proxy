@@ -30,7 +30,8 @@ gpuRouter.get('/gpu/status', async (_req: Request, res: Response) => {
 gpuRouter.post('/gpu/lmstudio/unload', async (req: Request, res: Response) => {
   try {
     const instanceId = String(req.body?.instance_id ?? '').trim() || undefined;
-    const result = await unloadLmStudio(instanceId);
+    const force = req.body?.force === true;
+    const result = await unloadLmStudio(instanceId, force);
     const status = await getGpuStatus();
     res.json({ ok: true, ...result, status });
   } catch (err) {
@@ -78,9 +79,10 @@ gpuRouter.post('/gpu/comfy/start', async (_req: Request, res: Response) => {
   }
 });
 
-gpuRouter.post('/gpu/comfy/stop', async (_req: Request, res: Response) => {
+gpuRouter.post('/gpu/comfy/stop', async (req: Request, res: Response) => {
   try {
-    const result = await stopComfy();
+    const force = req.body?.force === true;
+    const result = await stopComfy(force);
     const status = await getGpuStatus();
     res.json({ ok: true, ...result, status });
   } catch (err) {
@@ -129,7 +131,8 @@ gpuRouter.post('/gpu/mode', async (req: Request, res: Response) => {
   }
 
   try {
-    const result = await setGpuMode(mode);
+    const force = req.body?.force === true;
+    const result = await setGpuMode(mode, force);
     res.json({ ok: true, ...result });
   } catch (err) {
     res.status(502).json({

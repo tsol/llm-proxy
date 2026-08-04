@@ -9,6 +9,8 @@ interface ModelMeta {
   contextLength?: number;
   maxTokens?: number;
   type?: string;
+  concurrent?: number;
+  inPreferredGroup?: boolean;
 }
 
 interface ProviderMeta {
@@ -46,6 +48,8 @@ export function getMetadataModelQuirks(providerId: string): Record<string, Model
     quirks[key] = {
       ...(meta.contextLength ? { contextLength: meta.contextLength } : {}),
       ...(meta.maxTokens ? { maxTokens: meta.maxTokens } : {}),
+      ...(meta.concurrent !== undefined ? { concurrent: meta.concurrent } : {}),
+      ...(meta.inPreferredGroup !== undefined ? { inPreferredGroup: meta.inPreferredGroup } : {}),
     };
   }
   return quirks;
