@@ -4,6 +4,7 @@ import type { Response } from 'express';
 import type {
   ChatCompletionRequest,
   CompletionRequestContext,
+  ModelQuirkOverrides,
   ProviderAdapter,
   ProviderId,
   TokenUsage,
@@ -37,6 +38,10 @@ import {
   isPreferredGroupMember,
   resolveConcurrentLimit,
   isTooManyConcurrentRequests,
+  recordModelResponse,
+  recordRequestStart,
+  recordRequestEnd,
+  updateGroupConfig,
   type PreferredGroupSpec,
 } from './concurrency-queue';
 import { allProviders } from '../providers';
@@ -677,6 +682,7 @@ function adaptForModel(
   body: ChatCompletionRequest,
   providerId: ProviderId,
   model: string,
+  modelQuirks?: Record<string, ModelQuirkOverrides>,
 ): ChatCompletionRequest {
   let messages = applyPromptOverrides(body.messages);
   messages = sanitizeEmptyToolCalls(messages);
@@ -706,6 +712,14 @@ function adaptForModel(
     messages !== body.messages ? { ...body, messages } : { ...body };
 
   adapted = sanitizeProviderParams(providerId, adapted, getProvider(providerId as ProviderId));
+
+  // Apply per-model reasoning_effort override from model-metadata.json
+  // (e.g. MiniMax inlines <think> in content — lower effort saves output tokens)
+  const quirk = modelQuirks?.[model];
+  if (quirk?.reasoningEffort) {
+    adapted = { ...adapted, reasoning_effort: quirk.reasoningEffort };
+  }
+
   return adapted;
 }
 
@@ -770,8 +784,20 @@ export async function forwardChatCompletion(
   const queueKey = `${adapter.id}:${model}`;
   const inGroup = isPreferredGroupMember(adapter.id, model, adapter.config.modelQuirks?.[model]);
   const groupSpec: PreferredGroupSpec | null = inGroup ? buildPreferredGroupSpec(allProviders()) : null;
+  if (groupSpec) {
+    updateGroupConfig(groupSpec.members.map(m => ({ provider: m.provider, model: m.model, limit: m.limit })));
+  }
   const groupExhausted = new Set<string>();
   let attemptsLeft = appConfig.retryLoopCounter;
+
+  // Preview for queue dashboard: last user message, ~60 chars
+  const userMsg = (body.messages ?? [])
+    .filter((m: any) => m.role === 'user')
+    .pop();
+  const queuePreview: string =
+    typeof userMsg?.content === 'string'
+      ? userMsg.content.replace(/\s+/g, ' ').trim().slice(0, 60)
+      : '';
 
   while (true) {
     const waitMs = appConfig.retryQueueWaitTimeout * 1000;
@@ -782,6 +808,7 @@ export async function forwardChatCompletion(
         groupSpec,
         waitMs,
         () => res.writableEnded || res.destroyed,
+        queuePreview,
       );
       if (gAcquired.ok) {
         const grpAdapter = getProvider(gAcquired.provider as ProviderId);
@@ -845,6 +872,7 @@ export async function forwardChatCompletion(
       limit ?? 0,
       waitMs,
       () => res.writableEnded || res.destroyed,
+      queuePreview,
     );
 
     if (!acquired.ok) {
@@ -941,11 +969,17 @@ async function forwardChatCompletionOnce(
   );
   const streaming = Boolean(body.stream);
 
+  // Track live request for dashboard
+  const reqId = recordRequestStart(
+    `${adapter.id}:${model}`, adapter.id, model,
+    requestCtx.userRequestPreview,
+  );
+
   // Isolate a per-attempt copy of the request adapted for this model.
   // The original `body` is never mutated — every fallback step starts
   // from the pristine client payload (covers reasoning_content stripping,
   // prompt overrides, empty tool_calls, and provider param quirks).
-  const adaptedBody = adaptForModel(body, adapter.id, model);
+  const adaptedBody = adaptForModel(body, adapter.id, model, adapter.config.modelQuirks);
   const patchedPayload: ChatCompletionRequest = withStreamUsage({
     ...adaptedBody,
     model,
@@ -980,6 +1014,7 @@ async function forwardChatCompletionOnce(
         endpointPrefix,
         fallbackFrom,
         canRetry,
+        reqId,
       );
       return;
     }
@@ -1037,6 +1072,8 @@ async function forwardChatCompletionOnce(
           }
         })();
         const errorDetail = formatUpstreamError(upstreamStatus, parsedError);
+
+        recordRequestEnd(reqId, upstreamStatus, errorDetail);
 
         await logRequestDump({
           provider: adapter.id,
@@ -1149,6 +1186,7 @@ async function forwardChatCompletionOnce(
           }
         })();
         const errorDetail = formatUpstreamError(upstreamStatus, parsedError);
+        recordRequestEnd(reqId, upstreamStatus, errorDetail);
         await logRequestDump({
           provider: adapter.id,
           model,
@@ -1269,6 +1307,8 @@ async function forwardChatCompletionOnce(
         effectiveModel: model,
         fallbackFrom,
       });
+      recordModelResponse(`${adapter.id}:${model}`, finalStatus);
+      recordRequestEnd(reqId, finalStatus, completionText);
     } catch (err) {
       // Re-queue signal must propagate to the queue loop, not fallback.
       if (err instanceof QueueRetry429) throw err;
@@ -1281,6 +1321,8 @@ async function forwardChatCompletionOnce(
         effectiveModel: model,
         message,
       });
+
+      recordRequestEnd(reqId, 502, message);
 
       await logRequestDump({
         provider: adapter.id,
@@ -1337,6 +1379,7 @@ async function forwardChatCompletionOnce(
 
     // Rate-limit fallback: 429 or 413 (TPM exceeded) → try chain
     if (upstream.status === 429 || upstream.status === 413) {
+      recordRequestEnd(reqId, upstream.status, 'rate-limited');
       await logRequestDump({
         provider: adapter.id,
         model,
@@ -1413,6 +1456,7 @@ async function forwardChatCompletionOnce(
 
     // Upstream 5xx — try fallback chain before passing through to client
     if (upstream.status >= 500) {
+      recordRequestEnd(reqId, upstream.status, `upstream-${upstream.status}`);
       await logRequestDump({
         provider: adapter.id,
         model,
@@ -1508,6 +1552,8 @@ async function forwardChatCompletionOnce(
             effectiveModel: model,
             fallbackFrom,
           });
+          recordModelResponse(`${adapter.id}:${model}`, retryResp.status);
+          recordRequestEnd(reqId, retryResp.status, retryText);
           const usage = parseUsage(retryResp.data);
           await recordUsage(
             adapter,
@@ -1559,6 +1605,7 @@ async function forwardChatCompletionOnce(
 
     // Garbage detected in non-streaming output — treat as upstream error, try fallback
     if (!upstreamFailed && completionText && isGarbage(completionText)) {
+      recordRequestEnd(reqId, 200, 'garbage-detected');
       const metrics = analyzeText(completionText);
       logProxyError({
         provider: adapter.id,
@@ -1604,6 +1651,9 @@ async function forwardChatCompletionOnce(
       fallbackFrom,
     });
 
+    recordModelResponse(`${adapter.id}:${model}`, upstream.status);
+    recordRequestEnd(reqId, upstream.status, completionText);
+
     const usage = parseUsage(upstream.data);
 
     await recordUsage(
@@ -1644,6 +1694,8 @@ async function forwardChatCompletionOnce(
       effectiveModel: model,
       message,
     });
+
+    recordRequestEnd(reqId, 502, message);
 
     await logRequestDump({
       provider: adapter.id,
@@ -1712,6 +1764,7 @@ async function forwardStreamWithGarbageProtection(
   fallbackFrom?: string,
   /** Whether a QueueRetry429 re-queue is still available (RETRY_LOOP_COUNTER). */
   canRetry = true,
+  reqId = '',
 ): Promise<void> {
   const requestedModelName = String(body.model ?? '');
   let completionText = '';
@@ -1856,10 +1909,13 @@ async function forwardStreamWithGarbageProtection(
       effectiveModel: model,
       fallbackFrom,
     });
+    recordModelResponse(`${adapter.id}:${model}`, upstreamStatus);
+    recordRequestEnd(reqId, upstreamStatus, completionText);
     return;
   }
 
   // Garbage detected — log, try fallback chain (no retry to same model)
+  recordRequestEnd(reqId, 200, 'garbage-detected');
   const metrics = analyzeText(completionText);
   const garbageLog = `garbage detected in stream (cjks=${metrics.maxCJK}, digits=${metrics.maxDigits}, artifacts=${metrics.artifactWords}, ratio=${metrics.garbageRatio.toFixed(3)}), trying fallback chain`;
   logProxyError({

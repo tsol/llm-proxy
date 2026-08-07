@@ -1,9 +1,12 @@
 import { Router, type Request, type Response } from 'express';
+import fs from 'fs';
+import path from 'path';
 import { listCatalogModels, refreshCatalog, resolveModelRoute, getProviderStates } from '../catalog';
 import { getDefaultSnapshot, setDefault } from '../default-model';
-import { getProvider, providerIds } from '../providers';
+import { getProvider, providerIds, allProviders } from '../providers';
 import { serializeCatalogModelDetail } from '../model-response';
 import { getLiveQuota } from '../services/rate-limit-tracker';
+import { concurrencySnapshot, ensureGroupConfig } from '../services/concurrency-queue';
 
 export const adminRouter = Router();
 
@@ -16,6 +19,16 @@ adminRouter.get('/router/status', async (_req: Request, res: Response) => {
     routing: 'per-request-model',
     provider_states: getProviderStates(),
   });
+});
+
+adminRouter.get('/router/queue', (_req: Request, res: Response) => {
+  ensureGroupConfig(allProviders());
+  res.json(concurrencySnapshot());
+});
+
+adminRouter.get('/queue', (_req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(fs.readFileSync(path.join(__dirname, '..', 'public', 'queue.html'), 'utf8'));
 });
 
 adminRouter.get('/router/providers', (_req: Request, res: Response) => {

@@ -81,7 +81,8 @@
       },
       "MiniMaxAI/MiniMax-M2.7": {
         "concurrent": 1,
-        "inPreferredGroup": true
+        "inPreferredGroup": true,
+        "reasoningEffort": "low"
       }
     }
   },
@@ -94,7 +95,36 @@
       },
       "MiniMaxAI/MiniMax-M2.7": {
         "concurrent": 1,
+        "inPreferredGroup": true,
+        "reasoningEffort": "low"
+      }
+    }
+  },
+  "gonka-api": {
+    "rateLimits": {},
+    "models": {
+      "moonshotai/Kimi-K2.6": {
+        "concurrent": 1,
         "inPreferredGroup": true
+      },
+      "MiniMaxAI/MiniMax-M2.7": {
+        "concurrent": 1,
+        "inPreferredGroup": true,
+        "reasoningEffort": "low"
+      }
+    }
+  },
+  "joingonka": {
+    "rateLimits": {},
+    "models": {
+      "moonshotai/Kimi-K2.6": {
+        "concurrent": 1,
+        "inPreferredGroup": true
+      },
+      "MiniMaxAI/MiniMax-M2.7": {
+        "concurrent": 1,
+        "inPreferredGroup": true,
+        "reasoningEffort": "low"
       }
     }
   },

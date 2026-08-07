@@ -118,6 +118,11 @@ export const appConfig = {
    *  "too many concurrent requests" 429 before giving up. After the
    *  last attempt it proceeds to the normal fallback/429 path. */
   retryLoopCounter: envNum('RETRY_LOOP_COUNTER', 1),
+  /** When true, the preferred-group pool picks a random free member
+   *  instead of the first one in chain order. Spreads load across all
+   *  providers in the pool (e.g. gonka + gonka-dahl) instead of
+   *  pinning every request on the single lowest-display-order provider. */
+  preferredGroupRandom: env('PREFERRED_GROUP_RANDOM') === 'true',
   systemPrompt: env('SYSTEM_PROMPT'),
   systemPromptSuffix: env('SYSTEM_PROMPT_SUFFIX'),
   gpu: {
@@ -168,11 +173,11 @@ function buildPricing(
 
 // Load curated metadata from JSON (context lengths, rate limits per model & provider)
 const metaRateLimits = Object.fromEntries(
-  (['local', 'gonka', 'gonka-dahl', 'hyperfusion', 'google', 'cursor', 'deepseek', 'groq', 'cerebras', 'openrouter'] as ProviderId[])
+  (['local', 'gonka', 'gonka-dahl', 'gonka-api', 'joingonka', 'hyperfusion', 'google', 'cursor', 'deepseek', 'groq', 'cerebras', 'openrouter'] as ProviderId[])
     .map((id) => [id, getMetadataRateLimits(id)] as const),
 );
 const metaModelQuirks = Object.fromEntries(
-  (['local', 'gonka', 'gonka-dahl', 'hyperfusion', 'google', 'cursor', 'deepseek', 'groq', 'cerebras', 'openrouter'] as ProviderId[])
+  (['local', 'gonka', 'gonka-dahl', 'gonka-api', 'joingonka', 'hyperfusion', 'google', 'cursor', 'deepseek', 'groq', 'cerebras', 'openrouter'] as ProviderId[])
     .map((id) => [id, getMetadataModelQuirks(id)] as const),
 );
 
@@ -211,6 +216,30 @@ export const providerConfigs: Record<ProviderId, ProviderConfig> = {
     ownedBy: 'gonka-dahl',
     rateLimits: mergeRateLimits(metaRateLimits['gonka-dahl'], 'GONKA_DAHL', {}),
     modelQuirks: { ...metaModelQuirks['gonka-dahl'] },
+  },
+
+  'gonka-api': {
+    id: 'gonka-api',
+    displayOrder: 1,
+    baseUrl: env('GONKA_API_ORG_BASE_URL', 'https://hskyauefqcgbvgvxkluj.supabase.co/functions/v1/gonka/v1'),
+    apiKey: env('GONKA_API_ORG_API_KEY'),
+    defaultModel: env('GONKA_API_ORG_DEFAULT_MODEL', 'MiniMaxAI/MiniMax-M2.7'),
+    pricing: buildPricing('GONKA_API_ORG', { inputPerMillion: 0, outputPerMillion: 0 }),
+    ownedBy: 'gonka-api',
+    rateLimits: mergeRateLimits(metaRateLimits['gonka-api'], 'GONKA_API_ORG', {}),
+    modelQuirks: { ...metaModelQuirks['gonka-api'] },
+  },
+
+  joingonka: {
+    id: 'joingonka',
+    displayOrder: 1,
+    baseUrl: env('JOINGONKA_BASE_URL', 'https://gate.joingonka.ai/v1'),
+    apiKey: env('JOINGONKA_API_KEY'),
+    defaultModel: env('JOINGONKA_DEFAULT_MODEL', 'MiniMaxAI/MiniMax-M2.7'),
+    pricing: buildPricing('JOINGONKA', { inputPerMillion: 0, outputPerMillion: 0 }),
+    ownedBy: 'joingonka',
+    rateLimits: mergeRateLimits(metaRateLimits.joingonka, 'JOINGONKA', {}),
+    modelQuirks: { ...metaModelQuirks.joingonka },
   },
 
   hyperfusion: {

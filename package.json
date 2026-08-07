@@ -4,7 +4,7 @@
   "description": "OpenAI-compatible LLM router for Hermes (LM Studio, Gonka, Google Gemini, Cursor SDK)",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc && cp src/providers/model-metadata.json dist/providers/model-metadata.json",
+    "build": "tsc && cp src/providers/model-metadata.json dist/providers/ && cp -r public dist/",
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
     "stats": "tsx scripts/stats.ts"

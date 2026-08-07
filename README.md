@@ -25,11 +25,15 @@ Client (OpenAI SDK / curl)
   └── ...all 8 providers
 ```
 
-## Supported Providers (8)
+## Supported Providers (11)
 
 | Provider | Chat URL | Supports |
 |----------|---------|----------|
 | **Gonka** | `/gonka/v1/` | Kimi-K2.6, MiniMax-M2.7, Qwen3-235B — garbage detection enabled |
+| **Gonka-Dahl** | `/gonka-dahl/v1/` | Kimi-K2.6, MiniMax-M2.7 — Dahl inference proxy |
+| **Gonka-API** | `/gonka-api/v1/` | Kimi-K2.6, MiniMax-M2.7 — Supabase edge |
+| **JoinGonka** | `/joingonka/v1/` | Kimi-K2.6, MiniMax-M2.7 — gate.joingonka.ai |
+| **Hyperfusion** | `/hyperfusion/v1/` | MiniMax-M2.7 — LiteLLM proxy |
 | **DeepSeek** | `/deepseek/v1/` | v4-flash (1M context), v4-pro, cache billing |
 | **Google** | `/google/v1/` | Gemini 2.0/2.5 flash, flash-image, pro |
 | **Cursor** | `/cursor/v1/` | Composer 2.5 via Cursor SDK (200K context) |
@@ -84,6 +88,52 @@ curl -s http://localhost:5001/deepseek/v1/chat/completions \
 | `GET` | `/v1/models/:id` | Single alias detail (id, provider, upstream, pricing) |
 | `POST` | `/v1/chat/completions` | Chat with alias → fallback chain on failure |
 | `GET` | `/health` | Health check |
+| `GET` | `/v1/router/queue` | Real-time queue + stats (JSON) |
+| `GET` | `/v1/queue` | Queue dashboard (HTML, auto-refresh) |
+
+### Queue API (`GET /v1/router/queue`)
+
+Returns live snapshot of all queues, active requests, and per-model statistics.
+
+```json
+{
+  "perModel": [{
+    "key": "provider:model",
+    "active": 1, "limit": 1,
+    "waiters": [{"preview": "first 60 chars of request"}]
+  }],
+  "groups": [{
+    "key": "preferred-group",
+    "active": 5, "limit": 9,
+    "members": [
+      {"provider": "gonka", "model": "moonshotai/Kimi-K2.6", "active": 1, "limit": 1}
+    ],
+    "waiters": [{"preview": "..."}]
+  }],
+  "stats": {
+    "gonka:moonshotai/Kimi-K2.6": {
+      "lastStatus": 200, "total": 15, "ok": 12, "fail": 3
+    }
+  },
+  "active": [{
+    "provider": "openrouter", "model": "deepseek/deepseek-v4-flash",
+    "reqPreview": "first 40 chars of request",
+    "startedAt": 1786142339603
+  }],
+  "recent": [{
+    "provider": "gonka", "model": "MiniMaxAI/MiniMax-M2.7",
+    "status": 200,
+    "reqPreview": "first 40 chars...",
+    "respPreview": "...last 40 chars",
+    "startedAt": 1786142338000
+  }]
+}
+```
+
+- `active` — requests currently in-flight. `startedAt` is unix ms.
+- `recent` — last 20 completed requests. First 40 chars of request, last 40 of response.
+- `stats` — cumulative since proxy start. `lastStatus` is most recent HTTP code.
+- Stats persist across restarts only for the proxy process lifetime.
 
 ### Per-Provider (`/{provider}/v1/`)
 

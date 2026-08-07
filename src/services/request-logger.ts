@@ -1,6 +1,6 @@
 /** Collapse whitespace, then truncate with middle cut (max visible width). */
 export function truncateMiddle(text: string, maxLen = 20): string {
-  const clean = text.replace(/[\\r\\n\\t]+/g, ' ').replace(/\\s+/g, ' ').trim();
+  const clean = text.replace(/[]+/g, ' ').replace(/\s+/g, ' ').trim();
   if (!clean) return '';
   if (clean.length <= maxLen) return clean;
   const edge = Math.floor((maxLen - 3) / 2);
@@ -10,7 +10,7 @@ export function truncateMiddle(text: string, maxLen = 20): string {
 /** Show first ~head chars + "..." + last (maxLen - head - 3) chars.
  *  Useful to see the *end* of streaming responses. */
 export function truncateEnd(text: string, maxLen = 512, head = 30): string {
-  const clean = text.replace(/[\\r\\n\\t]+/g, ' ').replace(/\\s+/g, ' ').trim();
+  const clean = text.replace(/[]+/g, ' ').replace(/\s+/g, ' ').trim();
   if (!clean) return '';
   if (clean.length <= maxLen) return clean;
   if (head >= maxLen) return `...${clean.slice(-(maxLen - 3))}`;
@@ -140,7 +140,7 @@ export function logOutgoing(opts: {
   const { provider, url, stream, endpointPrefix, requestedModel, effectiveModel } = opts;
   const tag = modelTag({ endpointPrefix, requestedModel, effectiveModel });
   console.log(
-    `[${ts()}] → OUT [${endpointPrefix}] ${provider} | ${truncateMiddle(url, 50)} | ${tag} | ${stream ? 'stream' : 'sync'}`,
+    `[${ts()}] → OUT [${endpointPrefix}] ${provider} | ${tag} | ${stream ? 'stream' : 'sync'}`,
   );
 
   emitWs(buildEvent('request:forward', {
@@ -166,7 +166,7 @@ export function formatUpstreamError(status: number, body: unknown): string {
     try {
       parsed = JSON.parse(trimmed);
     } catch {
-      return trimmed.replace(/[\\r\\n\\t]+/g, ' ').replace(/\\s+/g, ' ').trim();
+      return trimmed.replace(/[]+/g, ' ').replace(/\s+/g, ' ').trim();
     }
   }
 

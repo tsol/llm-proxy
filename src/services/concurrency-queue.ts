@@ -1,4 +1,5 @@
 import type { ProviderAdapter } from '../types';
+import { appConfig } from '../config';
 
 /**
  * Per-key FIFO concurrency limiter.
@@ -17,12 +18,14 @@ interface Waiter {
   resolve: (result: AcquireResult) => void;
   timer: NodeJS.Timeout;
   onClientClose: () => boolean;
+  preview: string;
 }
 
 interface GroupWaiter {
   resolve: (result: PreferredGroupAcquireResult) => void;
   timer: NodeJS.Timeout;
   onClientClose: () => boolean;
+  preview: string;
 }
 
 interface QueueState {
@@ -42,6 +45,81 @@ export type AcquireResult =
   | { ok: false; reason: 'timeout' | 'client-closed' };
 
 const queues = new Map<string, QueueState>();
+
+// Per-model response stats
+interface ModelStats {
+  lastStatus: number;
+  total: number;
+  ok: number;
+  fail: number;
+}
+
+const modelStats = new Map<string, ModelStats>();
+
+// Live request tracking
+interface LiveRequest {
+  key: string;
+  provider: string;
+  model: string;
+  reqPreview: string;
+  respPreview: string;
+  startedAt: number;
+  status: number | null;
+}
+
+const liveRequests = new Map<string, LiveRequest>();
+const recentRequests: LiveRequest[] = [];
+const MAX_RECENT = 20;
+
+// Cached group config for dashboard (always visible)
+let cachedGroupConfig: Array<{ provider: string; model: string; limit: number }> = [];
+
+export function updateGroupConfig(cfg: Array<{ provider: string; model: string; limit: number }>): void {
+  cachedGroupConfig = cfg;
+}
+
+export function ensureGroupConfig(adapters: Array<{ id: string; config: { displayOrder?: number; modelQuirks?: Record<string, { inPreferredGroup?: boolean; concurrent?: number }> } }>): void {
+  if (cachedGroupConfig.length > 0) return;
+  const spec = buildPreferredGroupSpec(adapters);
+  if (spec) {
+    cachedGroupConfig = spec.members.map(m => ({ provider: m.provider, model: m.model, limit: m.limit }));
+  }
+}
+
+export function recordRequestStart(key: string, provider: string, model: string, preview: string): string {
+  const id = Math.random().toString(36).slice(2, 10);
+  const lr: LiveRequest = {
+    key, provider, model,
+    reqPreview: preview.slice(0, 40),
+    respPreview: '',
+    startedAt: Date.now(),
+    status: null,
+  };
+  liveRequests.set(id, lr);
+  return id;
+}
+
+export function recordRequestEnd(id: string, status: number, respPreview: string): void {
+  const lr = liveRequests.get(id);
+  if (!lr) return;
+  lr.status = status;
+  lr.respPreview = respPreview.slice(-40);
+  liveRequests.delete(id);
+  recentRequests.unshift(lr);
+  if (recentRequests.length > MAX_RECENT) recentRequests.length = MAX_RECENT;
+}
+
+export function recordModelResponse(key: string, status: number): void {
+  let s = modelStats.get(key);
+  if (!s) {
+    s = { lastStatus: status, total: 0, ok: 0, fail: 0 };
+    modelStats.set(key, s);
+  }
+  s.lastStatus = status;
+  s.total++;
+  if (status >= 200 && status < 400) s.ok++;
+  else s.fail++;
+}
 
 function stateFor(key: string, limit: number): QueueState {
   let state = queues.get(key);
@@ -86,6 +164,7 @@ export function acquireSlot(
   limit: number,
   timeoutMs: number,
   onClientClose: () => boolean,
+  preview = '',
 ): Promise<AcquireResult> {
   if (limit <= 0) {
     // No limit configured — immediate no-op handle.
@@ -112,6 +191,7 @@ export function acquireSlot(
     const waiter: Waiter = {
       resolve,
       onClientClose,
+      preview,
       timer: setTimeout(() => {
         const idx = state.waiters.indexOf(waiter);
         if (idx >= 0) state.waiters.splice(idx, 1);
@@ -222,12 +302,28 @@ function groupCleanupIfEmpty(key: string): void {
 }
 
 /** Find the first member (chain order) with a free slot, or null. */
-function findFreeGroupMember(state: GroupState): PreferredGroupMember | null {
+/** List members (chain order) that currently have a free slot. */
+function freeGroupMembers(state: GroupState): PreferredGroupMember[] {
+  const free: PreferredGroupMember[] = [];
   for (const member of state.members) {
     const active = state.activeByKey.get(member.key) ?? 0;
-    if (active < member.limit) return member;
+    if (active < member.limit) free.push(member);
   }
-  return null;
+  return free;
+}
+
+/**
+ * Find the member to take next. With PREFERRED_GROUP_RANDOM=true the
+ * choice is random among all members with spare capacity; otherwise it is
+ * the first free member in chain order (backwards-compatible default).
+ */
+function findFreeGroupMember(state: GroupState): PreferredGroupMember | null {
+  const free = freeGroupMembers(state);
+  if (free.length === 0) return null;
+  if (appConfig.preferredGroupRandom && free.length > 1) {
+    return free[Math.floor(Math.random() * free.length)];
+  }
+  return free[0];
 }
 
 function occupyGroupMember(state: GroupState, member: PreferredGroupMember): void {
@@ -273,6 +369,7 @@ export function acquirePreferredGroupSlot(
   spec: PreferredGroupSpec,
   timeoutMs: number,
   onClientClose: () => boolean,
+  preview = '',
 ): Promise<PreferredGroupAcquireResult> {
   const state = groupStateFor(spec);
 
@@ -303,6 +400,7 @@ export function acquirePreferredGroupSlot(
     const waiter: GroupWaiter = {
       resolve,
       onClientClose,
+      preview,
       timer: setTimeout(() => {
         const idx = state.waiters.indexOf(waiter);
         if (idx >= 0) state.waiters.splice(idx, 1);
@@ -350,4 +448,77 @@ export function buildPreferredGroupSpec(
   }
   if (members.length === 0) return null;
   return { key: 'preferred-group', members };
+}
+
+// ═══════════════════════════════════════════════════════
+// Snapshot for dashboard logging
+// ═══════════════════════════════════════════════════════
+
+export interface QueueSnapshotEntry {
+  key: string;
+  active: number;
+  limit: number;
+  waiters: Array<{ preview: string }>;
+}
+
+export interface GroupSnapshot {
+  key: string;
+  active: number;
+  limit: number;
+  members: Array<{ provider: string; model: string; active: number; limit: number }>;
+  waiters: Array<{ preview: string }>;
+}
+
+export interface ConcurrencySnapshot {
+  perModel: QueueSnapshotEntry[];
+  groups: GroupSnapshot[];
+  groupConfig: Array<{ provider: string; model: string; limit: number }>;
+  stats: Record<string, { lastStatus: number; total: number; ok: number; fail: number }>;
+  active: Array<{ key: string; provider: string; model: string; reqPreview: string; startedAt: number }>;
+  recent: Array<{ key: string; provider: string; model: string; reqPreview: string; respPreview: string; status: number; startedAt: number }>;
+}
+
+export function concurrencySnapshot(): ConcurrencySnapshot {
+  const perModel: QueueSnapshotEntry[] = [];
+  for (const [key, state] of queues.entries()) {
+    if (state.active === 0 && state.waiters.length === 0) continue;
+    perModel.push({
+      key,
+      active: state.active,
+      limit: state.limit,
+      waiters: state.waiters.map((w) => ({ preview: w.preview })),
+    });
+  }
+
+  const groups: GroupSnapshot[] = [];
+  for (const [key, state] of groupStates.entries()) {
+    if (state.totalActive === 0 && state.waiters.length === 0) continue;
+    groups.push({
+      key,
+      active: state.totalActive,
+      limit: state.totalLimit,
+      members: state.members.map((m) => ({
+        provider: m.provider,
+        model: m.model,
+        active: state.activeByKey.get(m.key) ?? 0,
+        limit: m.limit,
+      })),
+      waiters: state.waiters.map((w) => ({ preview: w.preview })),
+    });
+  }
+
+  return {
+    perModel, groups,
+    groupConfig: cachedGroupConfig,
+    stats: Object.fromEntries(modelStats),
+    active: [...liveRequests.values()].map(lr => ({
+      key: lr.key, provider: lr.provider, model: lr.model,
+      reqPreview: lr.reqPreview, startedAt: lr.startedAt,
+    })),
+    recent: recentRequests.map(lr => ({
+      key: lr.key, provider: lr.provider, model: lr.model,
+      reqPreview: lr.reqPreview, respPreview: lr.respPreview,
+      status: lr.status ?? 0, startedAt: lr.startedAt,
+    })),
+  };
 }

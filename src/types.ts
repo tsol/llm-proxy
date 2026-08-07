@@ -1,4 +1,4 @@
-export type ProviderId = 'local' | 'gonka' | 'gonka-dahl' | 'hyperfusion' | 'google' | 'cursor' | 'deepseek' | 'groq' | 'cerebras' | 'openrouter';
+export type ProviderId = 'local' | 'gonka' | 'gonka-dahl' | 'gonka-api' | 'joingonka' | 'hyperfusion' | 'google' | 'cursor' | 'deepseek' | 'groq' | 'cerebras' | 'openrouter';
 
 /** Legacy alias used by switch-model.sh / TODO doc */
 export type RouterTarget = ProviderId | 'remote';
@@ -107,6 +107,9 @@ export interface ModelQuirkOverrides {
    *  model in the group wait up to RETRY_QUEUE_WAIT_TIMEOUT for the FIRST
    *  available slot across ALL group members, then fall through the chain. */
   inPreferredGroup?: boolean;
+  /** Force reasoning_effort for models that inline thinking tokens in
+   *  output content (e.g. MiniMax <think> blocks). Applied in adaptForModel(). */
+  reasoningEffort?: string;
 }
 
 export interface RouterSnapshot {
