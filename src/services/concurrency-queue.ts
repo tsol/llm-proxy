@@ -59,6 +59,10 @@ interface ThroughputWindow {
 }
 const modelThroughput = new Map<string, ThroughputSample[]>();
 
+// Rolling failure timestamps per model key — used by the "fastest" group
+// strategy to deprioritise members that failed recently (last hour).
+const modelFailures = new Map<string, number[]>();
+
 function pushThroughput(key: string, sample: ThroughputSample): void {
   let arr = modelThroughput.get(key);
   if (!arr) {
@@ -93,6 +97,34 @@ function aggregateThroughput(arr: ThroughputSample[], windowMs: number): Through
   const secs = durMs / 1000;
   const tps = secs > 0 ? (tokensOut > 0 ? tokensOut / secs : bytes / secs) : 0;
   return { count, durMs, bytes, tokensOut, tps };
+}
+
+function recordFailure(key: string, ts = Date.now()): void {
+  let arr = modelFailures.get(key);
+  if (!arr) {
+    arr = [];
+    modelFailures.set(key, arr);
+  }
+  arr.push(ts);
+  // Prune failures older than 1h to bound memory.
+  const cutoff = ts - WINDOW_1H;
+  if (arr.length > 1 && arr[0] < cutoff) {
+    let i = 0;
+    while (i < arr.length && arr[i] < cutoff) i++;
+    if (i > 0) arr.splice(0, i);
+  }
+}
+
+/** Count of failures for a model key in the last hour (for the fastest strategy). */
+function memberFailures(key: string): number {
+  const arr = modelFailures.get(key);
+  if (!arr || arr.length === 0) return 0;
+  const cutoff = Date.now() - WINDOW_1H;
+  let count = 0;
+  for (const ts of arr) {
+    if (ts >= cutoff) count++;
+  }
+  return count;
 }
 
 // Live request tracking
@@ -213,7 +245,10 @@ export function recordModelResponse(
   // status 0 = garbage; anything not 2xx-3xx is a failure.
   const ok = status >= 200 && status < 400;
   if (ok) s.ok++;
-  else s.fail++;
+  else {
+    s.fail++;
+    recordFailure(key);
+  }
   // Rolling throughput windows: only measurable successful replies count.
   if (
     ok &&
@@ -407,15 +442,18 @@ function findFreeAliasGroupMember(
   if (free.length === 0) return null;
   if (strategy === 'random') return free[Math.floor(Math.random() * free.length)];
   if (strategy === 'fastest') {
-    // Rank by throughput: members with a measured tps first (highest wins),
-    // unknown (tps 0) members last. Ties are broken randomly.
-    const known = free.filter(m => memberTps(m) > 0);
+    // Highest priority: fewest failures in the last hour. Among those, pick
+    // the fastest by measured throughput (1h window preferred, 24h fallback).
+    // Ties are broken randomly.
+    const minFail = Math.min(...free.map(m => memberFailures(m.key)));
+    const healthy = free.filter(m => memberFailures(m.key) === minFail);
+    const known = healthy.filter(m => memberTps(m) > 0);
     if (known.length > 0) {
       const best = Math.max(...known.map(memberTps));
       const tied = known.filter(m => memberTps(m) === best);
       return tied[Math.floor(Math.random() * tied.length)];
     }
-    return free[Math.floor(Math.random() * free.length)];
+    return healthy[Math.floor(Math.random() * healthy.length)];
   }
   return free[0];
 }
@@ -576,7 +614,15 @@ export interface ConcurrencySnapshot {
   aliasGroups: Array<{
     key: string; alias: string; strategy: string;
     active: number; limit: number;
-    members: Array<{ provider: string; model: string; active: number; limit: number }>;
+    members: Array<{
+      provider: string; model: string; active: number; limit: number;
+      /** 1-based selection order per the group strategy (1 = chosen first). */
+      rank?: number;
+      /** Failures in the last hour. */
+      failH1?: number;
+      /** Measured tokens/sec over the last hour. */
+      tpsH1?: number;
+    }>;
     waiters: Array<{ preview: string }>;
   }>;
   groupConfig: Array<{ provider: string; model: string; limit: number; group: number; strategy: string }>;
@@ -603,12 +649,29 @@ export function concurrencySnapshot(): ConcurrencySnapshot {
   // zero counters), merging live state where a request has touched the group.
   const aliasGroups: ConcurrencySnapshot['aliasGroups'] = cachedAliasGroupSpecs.map(spec => {
     const state = aliasGroupStates.get(spec.key);
-    const members = spec.members.map(m => ({
-      provider: m.provider,
-      model: m.model,
-      active: state ? (state.activeByKey.get(m.key) ?? 0) : 0,
-      limit: m.limit,
-    }));
+    const members: ConcurrencySnapshot['aliasGroups'][number]['members'] = spec.members.map(
+      (m): ConcurrencySnapshot['aliasGroups'][number]['members'][number] => {
+        const samples = modelThroughput.get(m.key);
+        const h1 = samples ? aggregateThroughput(samples, WINDOW_1H) : undefined;
+        return {
+          provider: m.provider,
+          model: m.model,
+          active: state ? (state.activeByKey.get(m.key) ?? 0) : 0,
+          limit: m.limit,
+          failH1: memberFailures(m.key),
+          tpsH1: h1?.tps ?? 0,
+        };
+      });
+    // Assign a 1-based selection rank mirroring the group strategy so the UI
+    // can order members the same way the router would choose them.
+    if (spec.strategy === 'fastest') {
+      const ranked = [...members].sort((a, b) => (a.failH1 ?? 0) - (b.failH1 ?? 0) || (b.tpsH1 ?? 0) - (a.tpsH1 ?? 0));
+      const rankByIdx = new Map<number, number>();
+      ranked.forEach((m, i) => rankByIdx.set(members.indexOf(m), i + 1));
+      members.forEach((m, i) => { m.rank = rankByIdx.get(i)!; });
+    } else {
+      members.forEach((m, i) => { m.rank = i + 1; });
+    }
     return {
       key: spec.key,
       alias: spec.alias,
@@ -637,10 +700,12 @@ export function concurrencySnapshot(): ConcurrencySnapshot {
       key: lr.key, provider: lr.provider, model: lr.model,
       reqPreview: lr.reqPreview, reqSuffix: lr.reqSuffix, startedAt: lr.startedAt,
     })),
-    recent: recentRequests.map(lr => ({
-      key: lr.key, provider: lr.provider, model: lr.model,
-      reqPreview: lr.reqPreview, respPreview: lr.respPreview,
-      status: lr.status ?? 0, startedAt: lr.startedAt,
-    })),
+    recent: [...recentRequests]
+      .sort((a, b) => b.startedAt - a.startedAt)
+      .map(lr => ({
+        key: lr.key, provider: lr.provider, model: lr.model,
+        reqPreview: lr.reqPreview, respPreview: lr.respPreview,
+        status: lr.status ?? 0, startedAt: lr.startedAt,
+      })),
   };
 }

@@ -4,7 +4,7 @@
     "kimi": {
       "groups": [
         {
-          "strategy": "random",
+          "strategy": "fastest",
           "members": [
             "gonka-dahl/moonshotai/Kimi-K2.6",
             "gonka-dahl/MiniMaxAI/MiniMax-M2.7",

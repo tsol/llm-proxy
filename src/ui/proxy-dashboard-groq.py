@@ -485,6 +485,18 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     border-radius: 6px;
   }
 
+  .rank-badge {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--accent);
+    background: rgba(77, 159, 255, 0.16);
+    border: 1px solid rgba(77, 159, 255, 0.35);
+    border-radius: 5px;
+    padding: 1px 6px;
+    flex-shrink: 0;
+  }
+
   .member {
     display: flex;
     align-items: center;
@@ -878,17 +890,21 @@ HTML_CONTENT = r"""<!DOCTYPE html>
           </div>
           <div class="slots" style="margin-bottom:8px">${g.active || 0} / ${g.limit || 0} slots</div>
           <div class="bar-wrap"><div class="bar ${full ? 'full' : ''}" style="width:${pct}%"></div></div>
-          ${(g.members || []).map(m => {
+          ${(g.members || []).slice().sort((x, y) => (x.rank || 0) - (y.rank || 0)).map(m => {
             const mp = m.limit ? Math.min(100, (m.active / m.limit) * 100) : 0;
             const s = (data.stats || {})[`${m.provider}:${m.model}`];
             const stTotal = (s && s.total) || 0;
             const stOk = (s && s.ok) || 0;
             const stFail = (s && s.fail) || 0;
             const mtp = (data.throughput || {})[`${m.provider}:${m.model}`];
+            const shownFail = (m.failH1 != null) ? m.failH1 : stFail;
             return `
               <div class="member">
                 <div style="min-width:0">
-                  <div style="font-weight:600">${escapeHtml(m.model)}</div>
+                  <div style="display:flex;align-items:center;gap:6px">
+                    ${m.rank ? `<span class="rank-badge">#${m.rank}</span>` : ''}
+                    <div style="font-weight:600">${escapeHtml(m.model)}</div>
+                  </div>
                   <div class="provider">${escapeHtml(m.provider)}</div>
                 </div>
                 <div style="display:flex;align-items:center;gap:12px">
@@ -899,7 +915,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
                 <div style="display:flex;gap:12px;margin-top:10px;font-family:var(--mono);font-size:12px">
                   <span style="color:var(--text)">${stTotal} total</span>
                   <span style="color:var(--ok)">${stOk} ok</span>
-                  <span style="color:var(--fail)">${stFail} fail</span>
+                  <span style="color:var(--fail)">${shownFail} fail<span style="color:var(--muted)">/h</span></span>
                 </div>
               </div>`;
           }).join('')}
@@ -914,7 +930,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
   }
 
   function renderRecent() {
-    const recent = data.recent || [];
+    const recent = (data.recent || []).slice().sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
     if (!recent.length) return `<div class="empty">Нет завершённых запросов</div>`;
 
     return recent.map(r => {
