@@ -76,12 +76,10 @@
     "rateLimits": {},
     "models": {
       "moonshotai/Kimi-K2.6": {
-        "concurrent": 1,
-        "inPreferredGroup": true
+        "concurrent": 1
       },
       "MiniMaxAI/MiniMax-M2.7": {
         "concurrent": 1,
-        "inPreferredGroup": true,
         "reasoningEffort": "low"
       }
     }
@@ -90,12 +88,10 @@
     "rateLimits": {},
     "models": {
       "moonshotai/Kimi-K2.6": {
-        "concurrent": 1,
-        "inPreferredGroup": true
+        "concurrent": 1
       },
       "MiniMaxAI/MiniMax-M2.7": {
         "concurrent": 1,
-        "inPreferredGroup": true,
         "reasoningEffort": "low"
       }
     }
@@ -104,12 +100,10 @@
     "rateLimits": {},
     "models": {
       "moonshotai/Kimi-K2.6": {
-        "concurrent": 1,
-        "inPreferredGroup": true
+        "concurrent": 1
       },
       "MiniMaxAI/MiniMax-M2.7": {
         "concurrent": 1,
-        "inPreferredGroup": true,
         "reasoningEffort": "low"
       }
     }
@@ -118,12 +112,10 @@
     "rateLimits": {},
     "models": {
       "moonshotai/Kimi-K2.6": {
-        "concurrent": 1,
-        "inPreferredGroup": true
+        "concurrent": 1
       },
       "MiniMaxAI/MiniMax-M2.7": {
         "concurrent": 1,
-        "inPreferredGroup": true,
         "reasoningEffort": "low"
       }
     }
@@ -133,8 +125,7 @@
     "models": {
       "MiniMaxAI/MiniMax-M2.7": {
         "contextLength": 196608,
-        "concurrent": 1,
-        "inPreferredGroup": true
+        "concurrent": 1
       }
     }
   },

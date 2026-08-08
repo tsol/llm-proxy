@@ -25,7 +25,7 @@ Client (OpenAI SDK / curl)
   └── ...all 8 providers
 ```
 
-## Supported Providers (11)
+## Supported Providers (12)
 
 | Provider | Chat URL | Supports |
 |----------|---------|----------|
@@ -93,7 +93,7 @@ curl -s http://localhost:5001/deepseek/v1/chat/completions \
 
 ### Queue API (`GET /v1/router/queue`)
 
-Returns live snapshot of all queues, active requests, and per-model statistics.
+Returns live snapshot of all queues, active requests, and per-model statistics. А вот подробный дашборд описан отдельно — см. `PROXY_DASHBOARD_UI.md` в корне репозитория.
 
 ```json
 {
@@ -102,42 +102,53 @@ Returns live snapshot of all queues, active requests, and per-model statistics.
     "active": 1, "limit": 1,
     "waiters": [{"preview": "first 60 chars of request"}]
   }],
-  "groups": [{
-    "key": "preferred-group",
-    "active": 5, "limit": 9,
+  "aliasGroups": [{
+    "key": "kimi:g0", "alias": "kimi", "strategy": "random",
+    "active": 5, "limit": 6,
     "members": [
       {"provider": "gonka", "model": "moonshotai/Kimi-K2.6", "active": 1, "limit": 1}
     ],
-    "waiters": [{"preview": "..."}]
+    "waiters": []
+  }],
+  "groupConfig": [{
+    "provider": "gonka", "model": "moonshotai/Kimi-K2.6",
+    "limit": 1, "group": 0, "strategy": "random"
   }],
   "stats": {
-    "gonka:moonshotai/Kimi-K2.6": {
-      "lastStatus": 200, "total": 15, "ok": 12, "fail": 3
-    }
+    "gonka:moonshotai/Kimi-K2.6": { "lastStatus": 200, "total": 15, "ok": 12, "fail": 3 }
   },
+  "incoming": [{
+    "preview": "first 60 chars of request", "startedAt": 1786142339603
+  }],
   "active": [{
-    "provider": "openrouter", "model": "deepseek/deepseek-v4-flash",
-    "reqPreview": "first 40 chars of request",
+    "key": "gonka:moonshotai/Kimi-K2.6", "provider": "gonka", "model": "moonshotai/Kimi-K2.6",
+    "reqPreview": "first 40 chars of request", "reqSuffix": "last 40 chars",
     "startedAt": 1786142339603
   }],
   "recent": [{
-    "provider": "gonka", "model": "MiniMaxAI/MiniMax-M2.7",
-    "status": 200,
-    "reqPreview": "first 40 chars...",
-    "respPreview": "...last 40 chars",
+    "key": "gonka:moonshotai/Kimi-K2.6", "provider": "gonka", "model": "moonshotai/Kimi-K2.6",
+    "status": 200, "reqPreview": "first 40 chars...", "respPreview": "...last 40 chars",
     "startedAt": 1786142338000
   }]
 }
 ```
 
-- `active` — requests currently in-flight. `startedAt` is unix ms.
-- `recent` — last 20 completed requests. First 40 chars of request, last 40 of response.
+- `perModel` — per-model concurrency queues (waiters in FIFO).
+- `aliasGroups` — per-alias group pools: `strategy` = `random` (FIFO + random member) или `order` (sequential).
+- `groupConfig` — статическая конфигурация групп алиаса (для дашборда).
 - `stats` — cumulative since proxy start. `lastStatus` is most recent HTTP code.
-- Stats persist across restarts only for the proxy process lifetime.
+- `incoming` — client→proxy connections currently open. `startedAt` is unix ms.
+- `active` — proxy→upstream requests in-flight, `reqPreview`/`reqSuffix` = first/last 40 chars.
+- `recent` — last 20 completed requests (dashboard shows 10).
+- Zombie connections старше 10 минут вычищается фоновым reaper.
+
+### HTML Dashboard (`GET /v1/queue`)
+
+Готовая страница мониторинга с автообновлением раз в секунду.
 
 ### Per-Provider (`/{provider}/v1/`)
 
-All 8 providers support `GET /{provider}/v1/models` and `POST /{provider}/v1/chat/completions` — no aliases, no fallback, direct pass-through.
+All 12 providers support `GET /{provider}/v1/models` and `POST /{provider}/v1/chat/completions` — no aliases, no fallback, direct pass-through.
 
 ### Aliases (`/v1/aliases`)
 

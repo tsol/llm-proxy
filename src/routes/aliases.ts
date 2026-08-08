@@ -113,11 +113,16 @@ aliasesRouter.post('/aliases', (req: Request, res: Response) => {
     }
 
     const created = createAlias(alias, chain);
+    if (!created.ok) {
+      res.status(400).json({ error: { message: created.error, type: 'invalid_request' } });
+      return;
+    }
+    const aliasDef = getAlias(alias)!;
     res.status(201).json({
-      alias: created.alias,
-      chain: created.chain,
-      locked: created.locked,
-      updated_at: created.updatedAt,
+      alias: aliasDef.alias,
+      chain: aliasDef.chain,
+      locked: aliasDef.locked,
+      updated_at: aliasDef.updatedAt,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to create alias';
@@ -159,11 +164,16 @@ aliasesRouter.put('/aliases/:name', (req: Request, res: Response) => {
     }
 
     const updated = updateAlias(req.params.name as string, chain);
+    if (!updated.ok) {
+      res.status(400).json({ error: { message: updated.error, type: 'invalid_request' } });
+      return;
+    }
+    const aliasDef = getAlias(req.params.name as string)!;
     res.json({
-      alias: updated.alias,
-      chain: updated.chain,
-      locked: updated.locked,
-      updated_at: updated.updatedAt,
+      alias: aliasDef.alias,
+      chain: aliasDef.chain,
+      locked: aliasDef.locked,
+      updated_at: aliasDef.updatedAt,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Failed to update alias';

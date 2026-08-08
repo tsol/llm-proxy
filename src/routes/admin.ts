@@ -6,7 +6,8 @@ import { getDefaultSnapshot, setDefault } from '../default-model';
 import { getProvider, providerIds, allProviders } from '../providers';
 import { serializeCatalogModelDetail } from '../model-response';
 import { getLiveQuota } from '../services/rate-limit-tracker';
-import { concurrencySnapshot, ensureGroupConfig } from '../services/concurrency-queue';
+import { concurrencySnapshot, updateAliasChainConfig } from '../services/concurrency-queue';
+import { getAliasGroups } from '../services/alias-store';
 
 export const adminRouter = Router();
 
@@ -22,7 +23,10 @@ adminRouter.get('/router/status', async (_req: Request, res: Response) => {
 });
 
 adminRouter.get('/router/queue', (_req: Request, res: Response) => {
-  ensureGroupConfig(allProviders());
+  const groups = getAliasGroups('kimi');
+  if (groups) {
+    updateAliasChainConfig(groups, allProviders());
+  }
   res.json(concurrencySnapshot());
 });
 

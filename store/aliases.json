@@ -1,22 +1,39 @@
 {
-    "version": 1,
-    "aliases": {
-        "kimi": [
+  "version": 2,
+  "aliases": {
+    "kimi": {
+      "groups": [
+        {
+          "strategy": "random",
+          "members": [
             "gonka-dahl/moonshotai/Kimi-K2.6",
             "gonka-dahl/MiniMaxAI/MiniMax-M2.7",
             "gonka-api/moonshotai/Kimi-K2.6",
             "gonka-api/MiniMaxAI/MiniMax-M2.7",
-            "joingonka/Kimi-K2.6",
-            "joingonka/MiniMaxAI/MiniMax-M2.7",
-            "hyperfusion/MiniMaxAI/MiniMax-M2.7",
             "gonka/Kimi-K2.6",
-            "gonka/MiniMaxAI/MiniMax-M2.7",
+            "gonka/MiniMaxAI/MiniMax-M2.7"
+          ]
+        },
+        {
+          "strategy": "order",
+          "members": [
+            "hyperfusion/MiniMaxAI/MiniMax-M2.7",
             "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
             "openrouter/deepseek/deepseek-v4-flash",
             "deepseek/deepseek-v4-flash"
-        ],
-        "ofree": [
+          ]
+        }
+      ]
+    },
+    "ofree": {
+      "groups": [
+        {
+          "strategy": "order",
+          "members": [
             "openrouter/openrouter/free"
-        ]
+          ]
+        }
+      ]
     }
+  }
 }

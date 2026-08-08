@@ -3,26 +3,10 @@ import { appConfig } from '../config';
 
 /**
  * Per-key FIFO concurrency limiter.
- *
- * Keys are `provider:upstreamModel`. When a model has a `concurrent`
- * limit set (via model-metadata.json → modelQuirks), requests beyond
- * the limit are queued FIFO instead of being fired at the upstream
- * (whose 429 "too many concurrent requests" we've seen from gonka/Kimi).
- *
- * Models without a limit are not tracked at all — `acquireSlot` returns
- * a no-op handle immediately, so the rest of the proxy behaves exactly
- * as before.
  */
 
 interface Waiter {
   resolve: (result: AcquireResult) => void;
-  timer: NodeJS.Timeout;
-  onClientClose: () => boolean;
-  preview: string;
-}
-
-interface GroupWaiter {
-  resolve: (result: PreferredGroupAcquireResult) => void;
   timer: NodeJS.Timeout;
   onClientClose: () => boolean;
   preview: string;
@@ -62,35 +46,83 @@ interface LiveRequest {
   provider: string;
   model: string;
   reqPreview: string;
+  reqSuffix: string;
   respPreview: string;
   startedAt: number;
   status: number | null;
 }
 
-const liveRequests = new Map<string, LiveRequest>();
-const recentRequests: LiveRequest[] = [];
-const MAX_RECENT = 20;
-
-// Cached group config for dashboard (always visible)
-let cachedGroupConfig: Array<{ provider: string; model: string; limit: number }> = [];
-
-export function updateGroupConfig(cfg: Array<{ provider: string; model: string; limit: number }>): void {
-  cachedGroupConfig = cfg;
+interface IncomingRequest {
+  preview: string;
+  startedAt: number;
 }
 
-export function ensureGroupConfig(adapters: Array<{ id: string; config: { displayOrder?: number; modelQuirks?: Record<string, { inPreferredGroup?: boolean; concurrent?: number }> } }>): void {
-  if (cachedGroupConfig.length > 0) return;
-  const spec = buildPreferredGroupSpec(adapters);
-  if (spec) {
-    cachedGroupConfig = spec.members.map(m => ({ provider: m.provider, model: m.model, limit: m.limit }));
-  }
+const liveRequests = new Map<string, LiveRequest>();
+const recentRequests: LiveRequest[] = [];
+const incomingRequests = new Map<string, IncomingRequest>();
+let _incomingSeq = 0;
+let _reqSeq = 0;
+const MAX_RECENT = 20;
+
+// Zombie reaper: track live requests and force-clean stale ones
+const ZOMBIE_MAX_AGE_MS = 10 * 60 * 1000; // 10 min
+const REAP_INTERVAL_MS = 30 * 1000; // every 30s
+interface ReapableRequest {
+  id: string;
+  kind: 'incoming' | 'outgoing';
+  startedAt: number;
+  destroy?: () => void;
+}
+const reapable = new Map<string, ReapableRequest>();
+
+export function registerReapable(req: ReapableRequest): void {
+  reapable.set(req.id, req);
+}
+
+export function unregisterReapable(id: string): void {
+  reapable.delete(id);
+}
+
+let reaperStarted = false;
+export function startZombieReaper(): void {
+  if (reaperStarted) return;
+  reaperStarted = true;
+  setInterval(() => {
+    const now = Date.now();
+    let cleaned = 0;
+    for (const [id, req] of [...reapable.entries()]) {
+      if (now - req.startedAt <= ZOMBIE_MAX_AGE_MS) continue;
+      try { req.destroy?.(); } catch { /* ignore */ }
+      if (req.kind === 'incoming') incomingRequests.delete(id);
+      else liveRequests.delete(id);
+      reapable.delete(id);
+      cleaned++;
+    }
+    if (cleaned > 0) {
+      console.log(`[zombie-reaper] cleaned ${cleaned} stale ${cleaned === 1 ? 'request' : 'requests'}`);
+    }
+  }, REAP_INTERVAL_MS);
+  reaperStarted = true;
+}
+
+export function recordIncomingStart(preview: string): string {
+  const id = String(++_incomingSeq);
+  incomingRequests.set(id, { preview: preview.slice(0, 60), startedAt: Date.now() });
+  return id;
+}
+
+export function recordIncomingEnd(id: string): void {
+  incomingRequests.delete(id);
+  unregisterReapable(id);
 }
 
 export function recordRequestStart(key: string, provider: string, model: string, preview: string): string {
   const id = Math.random().toString(36).slice(2, 10);
+  const clean = preview.replace(/\s+/g, ' ').trim();
   const lr: LiveRequest = {
     key, provider, model,
-    reqPreview: preview.slice(0, 40),
+    reqPreview: clean.slice(0, 40),
+    reqSuffix: clean.length > 40 ? clean.slice(-40) : '',
     respPreview: '',
     startedAt: Date.now(),
     status: null,
@@ -103,10 +135,12 @@ export function recordRequestEnd(id: string, status: number, respPreview: string
   const lr = liveRequests.get(id);
   if (!lr) return;
   lr.status = status;
-  lr.respPreview = respPreview.slice(-40);
+  const clean = respPreview.replace(/\s+/g, ' ').trim();
+  lr.respPreview = clean;
   liveRequests.delete(id);
   recentRequests.unshift(lr);
   if (recentRequests.length > MAX_RECENT) recentRequests.length = MAX_RECENT;
+  unregisterReapable(id);
 }
 
 export function recordModelResponse(key: string, status: number): void {
@@ -142,7 +176,6 @@ function tryDispatch(state: QueueState): void {
     const waiter = state.waiters.shift()!;
     clearTimeout(waiter.timer);
     if (waiter.onClientClose()) {
-      // Client went away while waiting — drop this request.
       waiter.resolve({ ok: false, reason: 'client-closed' });
       continue;
     }
@@ -158,7 +191,6 @@ function tryDispatch(state: QueueState): void {
   }
 }
 
-/** Acquire a concurrency slot for `key`, waiting up to `timeoutMs` in FIFO order. */
 export function acquireSlot(
   key: string,
   limit: number,
@@ -167,12 +199,9 @@ export function acquireSlot(
   preview = '',
 ): Promise<AcquireResult> {
   if (limit <= 0) {
-    // No limit configured — immediate no-op handle.
     return Promise.resolve({ ok: true, handle: { release: () => undefined } });
   }
-
   const state = stateFor(key, limit);
-
   if (state.active < limit) {
     state.active++;
     return Promise.resolve({
@@ -186,12 +215,9 @@ export function acquireSlot(
       },
     });
   }
-
   return new Promise<AcquireResult>((resolve) => {
     const waiter: Waiter = {
-      resolve,
-      onClientClose,
-      preview,
+      resolve, onClientClose, preview,
       timer: setTimeout(() => {
         const idx = state.waiters.indexOf(waiter);
         if (idx >= 0) state.waiters.splice(idx, 1);
@@ -203,8 +229,6 @@ export function acquireSlot(
   });
 }
 
-/** Resolve the CONCURRENT limit for a provider+model, or undefined if unlimited.
- *  Uses the same exact-then-prefix modelQuirks lookup as model-display.ts. */
 export function resolveConcurrentLimit(
   adapter: ProviderAdapter,
   upstreamModel: string,
@@ -222,7 +246,6 @@ export function resolveConcurrentLimit(
   return undefined;
 }
 
-/** True when an upstream 429 body is the "too many concurrent requests" variant. */
 export function isTooManyConcurrentRequests(rawBody: unknown): boolean {
   if (typeof rawBody === 'string') {
     return rawBody.toLowerCase().includes('too many concurrent requests');
@@ -236,147 +259,120 @@ export function isTooManyConcurrentRequests(rawBody: unknown): boolean {
   }
   return false;
 }
+
 // ══════════════════════════════════════════════════════════════
-// Preferred-group pool
-//
-// Models with `inPreferredGroup: true` form ONE shared FIFO pool.
-// A request targeting any member of the group:
-//   1. grabs the FIRST free slot among ALL group members (chain order);
-//   2. if every slot is busy, waits in the group's FIFO queue up to
-//      RETRY_QUEUE_WAIT_TIMEOUT for the next freed slot;
-//   3. on timeout, the request exits the pool and falls through the
-//      normal fallback chain (skipping remaining group members).
+// Alias Group Pool (v2.0)
 // ══════════════════════════════════════════════════════════════
 
-export interface PreferredGroupMember {
+export interface AliasGroupMember {
   provider: string;
   model: string;
   limit: number;
   key: string;
 }
 
-export interface PreferredGroupSpec {
+export interface AliasGroupSpec {
   key: string;
-  members: PreferredGroupMember[];
+  alias: string;
+  strategy: 'random' | 'order';
+  members: AliasGroupMember[];
 }
 
-export type PreferredGroupAcquireResult =
-  | {
-      ok: true;
-      provider: string;
-      model: string;
-      handle: QueueHandle;
-    }
-  | { ok: false; reason: 'timeout' | 'client-closed' };
+export type AliasGroupAcquireResult =
+  | { ok: true; provider: string; model: string; handle: QueueHandle }
+  | { ok: false; reason: 'timeout' | 'client-closed' | 'all-busy' };
 
-interface GroupState {
-  members: PreferredGroupMember[];
+interface AliasGroupState {
+  members: AliasGroupMember[];
   activeByKey: Map<string, number>;
   totalLimit: number;
   totalActive: number;
-  waiters: GroupWaiter[];
+  waiters: AliasGroupWaiter[];
 }
 
-const groupStates = new Map<string, GroupState>();
+interface AliasGroupWaiter {
+  resolve: (result: AliasGroupAcquireResult) => void;
+  timer: NodeJS.Timeout;
+  onClientClose: () => boolean;
+  preview: string;
+}
 
-function groupStateFor(spec: PreferredGroupSpec): GroupState {
-  let state = groupStates.get(spec.key);
+const aliasGroupStates = new Map<string, AliasGroupState>();
+
+function aliasGroupStateFor(spec: AliasGroupSpec): AliasGroupState {
+  let state = aliasGroupStates.get(spec.key);
   if (!state) {
     state = {
       members: spec.members,
-      activeByKey: new Map(spec.members.map((m) => [m.key, 0])),
+      activeByKey: new Map(spec.members.map(m => [m.key, 0] as const)),
       totalLimit: spec.members.reduce((s, m) => s + m.limit, 0),
       totalActive: 0,
       waiters: [],
     };
-    groupStates.set(spec.key, state);
+    aliasGroupStates.set(spec.key, state);
   }
   return state;
 }
 
-function groupCleanupIfEmpty(key: string): void {
-  const state = groupStates.get(key);
-  if (state && state.totalActive === 0 && state.waiters.length === 0) {
-    groupStates.delete(key);
-  }
-}
-
-/** Find the first member (chain order) with a free slot, or null. */
-/** List members (chain order) that currently have a free slot. */
-function freeGroupMembers(state: GroupState): PreferredGroupMember[] {
-  const free: PreferredGroupMember[] = [];
-  for (const member of state.members) {
-    const active = state.activeByKey.get(member.key) ?? 0;
-    if (active < member.limit) free.push(member);
-  }
-  return free;
-}
-
-/**
- * Find the member to take next. With PREFERRED_GROUP_RANDOM=true the
- * choice is random among all members with spare capacity; otherwise it is
- * the first free member in chain order (backwards-compatible default).
- */
-function findFreeGroupMember(state: GroupState): PreferredGroupMember | null {
-  const free = freeGroupMembers(state);
+function findFreeAliasGroupMember(state: AliasGroupState, strategy: 'random' | 'order'): AliasGroupMember | null {
+  const free = state.members.filter(m => (state.activeByKey.get(m.key) ?? 0) < m.limit);
   if (free.length === 0) return null;
-  if (appConfig.preferredGroupRandom && free.length > 1) {
-    return free[Math.floor(Math.random() * free.length)];
-  }
+  if (strategy === 'random') return free[Math.floor(Math.random() * free.length)];
   return free[0];
 }
 
-function occupyGroupMember(state: GroupState, member: PreferredGroupMember): void {
+function occupyAliasGroupMember(state: AliasGroupState, member: AliasGroupMember): void {
   state.activeByKey.set(member.key, (state.activeByKey.get(member.key) ?? 0) + 1);
   state.totalActive++;
 }
 
-function dispatchGroupWaiters(state: GroupState, groupKey: string): void {
-  while (state.waiters.length > 0 && state.totalActive < state.totalLimit) {
+function dispatchAliasGroupWaiters(state: AliasGroupState, groupKey: string, strategy: 'random' | 'order'): void {
+  while (state.waiters.length > 0) {
+    const free = findFreeAliasGroupMember(state, strategy);
+    if (!free) break;
     const waiter = state.waiters.shift()!;
     clearTimeout(waiter.timer);
     if (waiter.onClientClose()) {
       waiter.resolve({ ok: false, reason: 'client-closed' });
       continue;
     }
-    const member = findFreeGroupMember(state)!;
-    occupyGroupMember(state, member);
+    occupyAliasGroupMember(state, free);
     let released = false;
     const release = (): void => {
       if (released) return;
       released = true;
-      state.activeByKey.set(member.key, Math.max(0, (state.activeByKey.get(member.key) ?? 0) - 1));
+      state.activeByKey.set(free.key, Math.max(0, (state.activeByKey.get(free.key) ?? 0) - 1));
       state.totalActive = Math.max(0, state.totalActive - 1);
-      dispatchGroupWaiters(state, groupKey);
-      groupCleanupIfEmpty(groupKey);
+      dispatchAliasGroupWaiters(state, groupKey, strategy);
     };
-    waiter.resolve({
-      ok: true,
-      provider: member.provider,
-      model: member.model,
-      handle: { release },
-    });
+    waiter.resolve({ ok: true, provider: free.provider, model: free.model, handle: { release } });
   }
 }
 
-/**
- * Acquire a slot from the preferred group pool.
- * On success, returns the member (provider/model) that got the slot — the
- * caller must forward the request to THAT member, not the originally
- * requested one.
- */
-export function acquirePreferredGroupSlot(
-  spec: PreferredGroupSpec,
+export function acquireAliasGroupSlot(
+  spec: AliasGroupSpec,
   timeoutMs: number,
   onClientClose: () => boolean,
   preview = '',
-): Promise<PreferredGroupAcquireResult> {
-  const state = groupStateFor(spec);
-
-  // Fast path: a member already has a free slot → take the first one in chain order.
-  const immediate = findFreeGroupMember(state);
+): Promise<AliasGroupAcquireResult> {
+  if (spec.strategy === 'order') {
+    const state = aliasGroupStateFor(spec);
+    const free = findFreeAliasGroupMember(state, 'order');
+    if (!free) return Promise.resolve({ ok: false, reason: 'all-busy' });
+    occupyAliasGroupMember(state, free);
+    let released = false;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      state.activeByKey.set(free.key, Math.max(0, (state.activeByKey.get(free.key) ?? 0) - 1));
+      state.totalActive = Math.max(0, state.totalActive - 1);
+    };
+    return Promise.resolve({ ok: true, provider: free.provider, model: free.model, handle: { release } });
+  }
+  const state = aliasGroupStateFor(spec);
+  const immediate = findFreeAliasGroupMember(state, 'random');
   if (immediate) {
-    occupyGroupMember(state, immediate);
+    occupyAliasGroupMember(state, immediate);
     let released = false;
     const key = immediate.key;
     const release = (): void => {
@@ -384,136 +380,158 @@ export function acquirePreferredGroupSlot(
       released = true;
       state.activeByKey.set(key, Math.max(0, (state.activeByKey.get(key) ?? 0) - 1));
       state.totalActive = Math.max(0, state.totalActive - 1);
-      dispatchGroupWaiters(state, spec.key);
-      groupCleanupIfEmpty(spec.key);
+      dispatchAliasGroupWaiters(state, spec.key, 'random');
     };
-    return Promise.resolve({
-      ok: true,
-      provider: immediate.provider,
-      model: immediate.model,
-      handle: { release },
-    });
+    return Promise.resolve({ ok: true, provider: immediate.provider, model: immediate.model, handle: { release } });
   }
-
-  // All members busy → FIFO wait for the first freed slot.
-  return new Promise<PreferredGroupAcquireResult>((resolve) => {
-    const waiter: GroupWaiter = {
-      resolve,
-      onClientClose,
-      preview,
+  return new Promise<AliasGroupAcquireResult>(resolve => {
+    const waiter: AliasGroupWaiter = {
+      resolve, onClientClose, preview,
       timer: setTimeout(() => {
         const idx = state.waiters.indexOf(waiter);
         if (idx >= 0) state.waiters.splice(idx, 1);
         resolve({ ok: false, reason: 'timeout' });
-        groupCleanupIfEmpty(spec.key);
       }, timeoutMs),
     };
     state.waiters.push(waiter);
   });
 }
 
-/** True when provider+model is a member of the preferred group pool. */
-export function isPreferredGroupMember(
-  provider: string,
-  model: string,
-  quirks: { inPreferredGroup?: boolean } | undefined,
-): boolean {
-  return Boolean(quirks?.inPreferredGroup);
+export function buildAliasGroupSpecs(
+  groups: Array<{ strategy: string; members: string[] }>,
+  adapters: Array<{ id: string; config: { modelQuirks?: Record<string, { concurrent?: number }> } }>,
+  alias: string,
+): AliasGroupSpec[] {
+  const specs: AliasGroupSpec[] = [];
+  for (let gi = 0; gi < groups.length; gi++) {
+    const g = groups[gi];
+    const strategy = g.strategy === 'order' ? 'order' as const : 'random' as const;
+    const members: AliasGroupMember[] = [];
+    for (const entry of g.members) {
+      const parts = entry.split('/');
+      if (parts.length < 2) continue;
+      const provider = parts[0];
+      const model = parts.slice(1).join('/');
+      let limit = 0;
+      const quirks = adapters.find(a => a.id === provider)?.config.modelQuirks ?? {};
+      const exact = quirks[model];
+      if (exact?.concurrent !== undefined && exact.concurrent > 0) {
+        limit = exact.concurrent;
+      } else {
+        const shortModel = model.split('/').pop()!;
+        for (const [qk, qv] of Object.entries(quirks)) {
+          if (qk.endsWith('/' + shortModel) && qv.concurrent !== undefined && qv.concurrent > 0) {
+            limit = qv.concurrent;
+            break;
+          }
+        }
+      }
+      members.push({ provider, model, limit, key: `${provider}:${model}` });
+    }
+    specs.push({ key: `${alias}:g${gi}`, alias, strategy, members });
+  }
+  return specs;
 }
 
-/**
- * Build the preferred-group spec from all registered provider adapters.
- * Members are sorted by provider display order, then model id — this is
- * the "chain order" used to pick the first free slot.
- */
-export function buildPreferredGroupSpec(
-  adapters: Array<{ id: string; config: { displayOrder?: number; modelQuirks?: Record<string, { inPreferredGroup?: boolean; concurrent?: number }> } }>,
-): PreferredGroupSpec | null {
-  const members: PreferredGroupMember[] = [];
-  const sorted = [...adapters].sort(
-    (a, b) => (a.config.displayOrder ?? 99) - (b.config.displayOrder ?? 99),
-  );
-  for (const adapter of sorted) {
-    const quirks = adapter.config.modelQuirks ?? {};
-    for (const [model, q] of Object.entries(quirks)) {
-      if (q.inPreferredGroup && q.concurrent !== undefined && q.concurrent > 0) {
-        members.push({
-          provider: adapter.id,
-          model,
-          limit: q.concurrent,
-          key: `${adapter.id}:${model}`,
-        });
+// Cached alias chain config for dashboard
+let cachedAliasChain: Array<{ provider: string; model: string; limit: number; group: number; strategy: string }> = [];
+
+export function updateAliasChainConfig(
+  groups: Array<{ strategy: string; members: string[] }>,
+  adapters: Array<{ id: string; config: { modelQuirks?: Record<string, { concurrent?: number }> } }>,
+): void {
+  const entries: Array<{ provider: string; model: string; limit: number; group: number; strategy: string }> = [];
+  for (let gi = 0; gi < groups.length; gi++) {
+    const g = groups[gi];
+    for (const entry of g.members) {
+      const parts = entry.split('/');
+      if (parts.length < 2) continue;
+      const provider = parts[0];
+      const model = parts.slice(1).join('/');
+      let limit = 0;
+      const quirks = adapters.find(a => a.id === provider)?.config.modelQuirks ?? {};
+      const exact = quirks[model];
+      if (exact?.concurrent !== undefined && exact.concurrent > 0) {
+        limit = exact.concurrent;
+      } else {
+        const shortModel = model.split('/').pop()!;
+        for (const [qk, qv] of Object.entries(quirks)) {
+          if (qk.endsWith('/' + shortModel) && qv.concurrent !== undefined && qv.concurrent > 0) {
+            limit = qv.concurrent;
+            break;
+          }
+        }
       }
+      entries.push({ provider, model, limit, group: gi, strategy: g.strategy });
     }
   }
-  if (members.length === 0) return null;
-  return { key: 'preferred-group', members };
+  cachedAliasChain = entries;
 }
 
 // ═══════════════════════════════════════════════════════
 // Snapshot for dashboard logging
 // ═══════════════════════════════════════════════════════
 
-export interface QueueSnapshotEntry {
-  key: string;
-  active: number;
-  limit: number;
-  waiters: Array<{ preview: string }>;
-}
-
-export interface GroupSnapshot {
-  key: string;
-  active: number;
-  limit: number;
-  members: Array<{ provider: string; model: string; active: number; limit: number }>;
-  waiters: Array<{ preview: string }>;
-}
-
 export interface ConcurrencySnapshot {
-  perModel: QueueSnapshotEntry[];
-  groups: GroupSnapshot[];
-  groupConfig: Array<{ provider: string; model: string; limit: number }>;
+  perModel: Array<{
+    key: string;
+    active: number;
+    limit: number;
+    waiters: Array<{ preview: string }>;
+  }>;
+  aliasGroups: Array<{
+    key: string; alias: string; strategy: string;
+    active: number; limit: number;
+    members: Array<{ provider: string; model: string; active: number; limit: number }>;
+    waiters: Array<{ preview: string }>;
+  }>;
+  groupConfig: Array<{ provider: string; model: string; limit: number; group: number; strategy: string }>;
   stats: Record<string, { lastStatus: number; total: number; ok: number; fail: number }>;
-  active: Array<{ key: string; provider: string; model: string; reqPreview: string; startedAt: number }>;
+  incoming: Array<{ preview: string; startedAt: number }>;
+  active: Array<{ key: string; provider: string; model: string; reqPreview: string; reqSuffix: string; startedAt: number }>;
   recent: Array<{ key: string; provider: string; model: string; reqPreview: string; respPreview: string; status: number; startedAt: number }>;
 }
 
 export function concurrencySnapshot(): ConcurrencySnapshot {
-  const perModel: QueueSnapshotEntry[] = [];
+  const perModel: ConcurrencySnapshot['perModel'] = [];
   for (const [key, state] of queues.entries()) {
     if (state.active === 0 && state.waiters.length === 0) continue;
     perModel.push({
       key,
       active: state.active,
       limit: state.limit,
-      waiters: state.waiters.map((w) => ({ preview: w.preview })),
+      waiters: state.waiters.map(w => ({ preview: w.preview })),
     });
   }
 
-  const groups: GroupSnapshot[] = [];
-  for (const [key, state] of groupStates.entries()) {
-    if (state.totalActive === 0 && state.waiters.length === 0) continue;
-    groups.push({
+  const aliasGroups: ConcurrencySnapshot['aliasGroups'] = [];
+  for (const [key, state] of aliasGroupStates.entries()) {
+    aliasGroups.push({
       key,
+      alias: key.split(':')[0],
+      strategy: state.members.length > 0 ? (key.includes(':g0') ? 'random' : 'order') : 'random',
       active: state.totalActive,
       limit: state.totalLimit,
-      members: state.members.map((m) => ({
+      members: state.members.map(m => ({
         provider: m.provider,
         model: m.model,
         active: state.activeByKey.get(m.key) ?? 0,
         limit: m.limit,
       })),
-      waiters: state.waiters.map((w) => ({ preview: w.preview })),
+      waiters: state.waiters.map(w => ({ preview: w.preview })),
     });
   }
 
   return {
-    perModel, groups,
-    groupConfig: cachedGroupConfig,
+    perModel, aliasGroups,
+    groupConfig: cachedAliasChain,
     stats: Object.fromEntries(modelStats),
+    incoming: [...incomingRequests.values()].map(ir => ({
+      preview: ir.preview, startedAt: ir.startedAt,
+    })),
     active: [...liveRequests.values()].map(lr => ({
       key: lr.key, provider: lr.provider, model: lr.model,
-      reqPreview: lr.reqPreview, startedAt: lr.startedAt,
+      reqPreview: lr.reqPreview, reqSuffix: lr.reqSuffix, startedAt: lr.startedAt,
     })),
     recent: recentRequests.map(lr => ({
       key: lr.key, provider: lr.provider, model: lr.model,

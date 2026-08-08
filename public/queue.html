@@ -18,6 +18,7 @@
   .ok { color:#6f6 }
   .err { color:#f66 }
   .dim { color:#555 }
+  .stale { color:#555 }
 </style>
 </head>
 <body>
@@ -33,6 +34,11 @@ function bar(a, l) {
   let b = '[';
   for (let i = 0; i < l; i++) b += (i < a ? '<span class="bar-on">█</span>' : '<span class="bar-off">░</span>');
   return b + ']';
+}
+
+function preview(first, last) {
+  if (!last) return esc(first);
+  return esc(first) + ' ... ' + esc(last);
 }
 
 function stat(k, stats) {
@@ -63,50 +69,72 @@ async function tick() {
         const cls = s.lastStatus < 400 ? 'ok' : 'err';
         let line = '<span class="item ' + cls + '">' + esc(k) + '  ok=' + s.ok + ' fail=' + s.fail + ' last=' + s.lastStatus + ' total=' + s.total;
         if (lastR) {
-          line += '  ' + esc(lastR.reqPreview.slice(0, 40)) + ' ... ' + esc(lastR.respPreview.slice(-40));
+          line += '  ' + preview(lastR.reqPreview, lastR.respPreview);
         }
         line += '</span>';
         lines.push(line);
       }
     }
 
-    // ── 2. QUEUES (group config + per-model queues) ──
+    // ── 2. QUEUES (alias chain with groups) ──
     const gc = d.groupConfig || [];
     if (gc.length) {
       lines.push('');
-      lines.push('<span class="section">── preferred group (' + gc.length + ') ──</span>');
+      lines.push('<span class="section">── alias kimi chain (' + gc.length + ') ──</span>');
+
+      // Group by group index
+      const byGroup = {};
       for (const m of gc) {
-        const k = m.provider + ':' + m.model;
-        const st = stat(k, stats);
-        let act = 0;
-        for (const g of d.groups||[]) for (const gm of g.members||[]) {
-          if (gm.provider === m.provider && gm.model === m.model) { act = gm.active; break; }
+        const gk = m.group;
+        if (!byGroup[gk]) byGroup[gk] = { strategy: m.strategy, members: [] };
+        byGroup[gk].members.push(m);
+      }
+      for (const gk of Object.keys(byGroup).sort()) {
+        const grp = byGroup[gk];
+        const isGroup = grp.strategy === 'random';
+        lines.push('<span class="dim">  ' + grp.strategy + ' (' + grp.members.length + ')' + (isGroup ? ' [G]' : '') + '</span>');
+        for (const m of grp.members) {
+          const k = m.provider + ':' + m.model;
+          const st = stat(k, stats);
+          let act = 0;
+          for (const ag of d.aliasGroups||[]) {
+            for (const gm of ag.members||[]) {
+              if (gm.provider === m.provider && gm.model === m.model) { act = gm.active; break; }
+            }
+          }
+          const s = st ? st.replace(/<[^>]*>/g,'').trim() : '';
+          if (isGroup && m.limit > 0) {
+            lines.push('<span class="item">' + esc(m.provider + '/' + m.model) + ' ' + bar(act, m.limit) + ' ' + act + '/' + m.limit + '  ' + s + '</span>');
+          } else {
+            lines.push('<span class="item stale">' + esc(m.provider + '/' + m.model) + '  -  ' + s + '</span>');
+          }
         }
-        lines.push('<span class="item">' + esc(m.provider + '/' + m.model) + ' ' + bar(act, m.limit) + ' ' + act + '/' + m.limit + '  ' + (st ? st.replace(/<[^>]*>/g,'').trim() : '') + '</span>');
       }
     }
-    for (const m of d.perModel || []) {
-      lines.push('<span class="item">' + esc(m.key) + ' ' + bar(m.active, m.limit) + ' ' + m.active + '/' + m.limit + ' w=' + m.waiters.length + '</span>');
-      const st = stat(m.key, stats);
-      if (st) lines.push(st);
-      for (let i = 0; i < m.waiters.length; i++)
-        lines.push('<span class="waiter">#' + (i+1) + ' "' + esc((m.waiters[i].preview||'').slice(0,60)) + '"</span>');
-    }
-    for (const g of d.groups || []) {
-      lines.push('<span class="item">' + esc(g.key) + ' ' + bar(g.active, g.limit) + ' ' + g.active + '/' + g.limit + ' w=' + g.waiters.length + '</span>');
-      for (let i = 0; i < g.waiters.length; i++)
-        lines.push('<span class="waiter">#' + (i+1) + ' "' + esc((g.waiters[i].preview||'').slice(0,60)) + '"</span>');
-    }
-
     // ── 3. LIVE CONNECTIONS ──
+    const incoming = d.incoming || [];
     const active = d.active || [];
+    lines.push('');
+    lines.push('<span class="section">── live ──</span>');
+    if (incoming.length) {
+      lines.push('<span class="dim">  incoming (' + incoming.length + ')</span>');
+      for (const a of incoming) {
+        const dur = Math.round((Date.now() - a.startedAt) / 1000);
+        const cls = dur > 60 ? 'stale' : '';
+        lines.push('<span class="item ' + cls + '">  ' + dur + 's  ' + esc(a.preview) + '</span>');
+      }
+    } else {
+      lines.push('<span class="dim">  incoming (0)</span>');
+    }
     if (active.length) {
-      lines.push('');
-      lines.push('<span class="section">── live (' + active.length + ') ──</span>');
+      lines.push('<span class="dim">  outgoing (' + active.length + ')</span>');
       for (const a of active) {
         const dur = Math.round((Date.now() - a.startedAt) / 1000);
-        lines.push('<span class="item bar-on">' + esc(a.provider + '/' + a.model) + '  ' + dur + 's  ' + esc(a.reqPreview) + '</span>');
+        const cls = dur > 60 ? 'stale' : 'bar-on';
+        lines.push('<span class="item ' + cls + '">' + esc(a.provider + '/' + a.model) + '  ' + dur + 's  ' + preview(a.reqPreview, a.reqSuffix) + '</span>');
       }
+    } else {
+      lines.push('<span class="dim">  outgoing (0)</span>');
     }
 
     // ── 4. RECENT 10 ──
@@ -117,9 +145,10 @@ async function tick() {
         const r = recent[i];
         const cls = r.status < 400 ? 'ok' : 'err';
         const dur = Math.round((Date.now() - r.startedAt) / 1000);
-        lines.push('<span class="item ' + cls + '">' + esc(r.provider + '/' + r.model)
+        const stale = dur > 60 ? ' stale' : '';
+        lines.push('<span class="item ' + cls + stale + '">' + esc(r.provider + '/' + r.model)
           + '  ' + r.status + '  ' + dur + 's  '
-          + esc(r.reqPreview.slice(0, 40)) + ' ... ' + esc(r.respPreview.slice(-40)) + '</span>');
+          + preview(r.reqPreview, r.respPreview) + '</span>');
       }
     }
 
@@ -129,7 +158,9 @@ async function tick() {
   }
 }
 
-function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function esc(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\s+/g, ' ');
+}
 
 tick();
 setInterval(tick, 1000);

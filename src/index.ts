@@ -11,6 +11,7 @@ import { gpuRouter } from './routes/gpu';
 import { androidRouter } from './routes/android';
 import { configureAndroidBridge } from './services/android-bridge';
 import { ensureReqLogDir, rotateReqLogs } from './services/request-dump-logger';
+import { startZombieReaper } from './services/concurrency-queue';
 
 const app = express();
 
@@ -48,6 +49,7 @@ rotateReqLogs()
     dns.setDefaultResultOrder('ipv4first');
 
     app.listen(appConfig.port, appConfig.host, () => {
+      startZombieReaper();
       console.log(
         `Hermes LLM proxy listening on http://${appConfig.host}:${appConfig.port}`,
       );

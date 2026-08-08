@@ -10,6 +10,7 @@ import type {
   TokenUsage,
 } from '../types';
 import { appConfig } from '../config';
+import { getAliasGroups } from '../services/alias-store';
 import { resilientPost } from './resilient-http';
 import {
   captureRequestContext,
@@ -33,16 +34,19 @@ import { trackUpstreamHeaders } from './rate-limit-tracker';
 import { logRateLimit } from './rate-limit-logger';
 import {
   acquireSlot,
-  acquirePreferredGroupSlot,
-  buildPreferredGroupSpec,
-  isPreferredGroupMember,
+  acquireAliasGroupSlot,
+  buildAliasGroupSpecs,
   resolveConcurrentLimit,
   isTooManyConcurrentRequests,
   recordModelResponse,
   recordRequestStart,
   recordRequestEnd,
-  updateGroupConfig,
-  type PreferredGroupSpec,
+  recordIncomingStart,
+  recordIncomingEnd,
+  registerReapable,
+  unregisterReapable,
+  startZombieReaper,
+  type AliasGroupSpec,
 } from './concurrency-queue';
 import { allProviders } from '../providers';
 import {
@@ -356,31 +360,47 @@ async function bufferedStreamRequest(
   let streamUsage: UsageBreakdown | null = null;
   const chunks: Buffer[] = [];
 
-  await new Promise<void>((resolve, reject) => {
-    upstream.data.on('data', (chunk: Buffer) => {
-      chunks.push(chunk);
-      const text = chunk.toString('utf8');
-      if (upstreamFailed) {
-        rawErrorBody += text;
-      } else {
+  // For error responses, don't wait for stream end — close after 5s max
+  if (upstreamFailed) {
+    await new Promise<void>((resolve) => {
+      const stream = upstream.data as NodeJS.ReadableStream & { destroy?: () => void };
+      const timer = setTimeout(() => { stream.destroy?.(); resolve(); }, 5000);
+      stream.on('data', (chunk: Buffer) => { rawErrorBody += chunk.toString('utf8'); });
+      stream.on('end', () => { clearTimeout(timer); resolve(); });
+      stream.on('error', () => { clearTimeout(timer); stream.destroy?.(); resolve(); });
+    });
+  } else {
+    // Success stream: timeout at 300s (5 min) to prevent hung connections
+    const STREAM_TIMEOUT_MS = 300_000;
+    await new Promise<void>((resolve, reject) => {
+      const stream = upstream.data as NodeJS.ReadableStream & { destroy?: () => void };
+      let timer = setTimeout(() => {
+        stream.destroy?.();
+        reject(new Error(`stream timeout after ${STREAM_TIMEOUT_MS / 1000}s`));
+      }, STREAM_TIMEOUT_MS);
+      stream.on('data', (chunk: Buffer) => {
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          stream.destroy?.();
+          reject(new Error(`stream timeout after ${STREAM_TIMEOUT_MS / 1000}s`));
+        }, STREAM_TIMEOUT_MS);
+        chunks.push(chunk);
+        const text = chunk.toString('utf8');
         completionText += extractStreamText(text);
         streamUsage = collectStreamUsage(text, streamUsage);
-      }
+      });
+      stream.on('end', () => {
+        clearTimeout(timer);
+        stream.destroy?.();
+        resolve();
+      });
+      stream.on('error', (err) => {
+        clearTimeout(timer);
+        stream.destroy?.();
+        reject(err);
+      });
     });
-    upstream.data.on('end', () => {
-      // Close upstream cleanly after buffering — we re-stream validated chunks later
-      (
-        upstream.data as NodeJS.ReadableStream & { destroy?: () => void }
-      ).destroy?.();
-      resolve();
-    });
-    upstream.data.on('error', (err) => {
-      (
-        upstream.data as NodeJS.ReadableStream & { destroy?: () => void }
-      ).destroy?.();
-      reject(err);
-    });
-  });
+  }
 
   return {
     completionText,
@@ -400,6 +420,7 @@ function flushBufferedChunks(
   chunks: Buffer[],
   upstreamStatus: number,
   upstreamHeaders: Record<string, string>,
+  onDone?: () => void,
 ): void {
   if (!res.headersSent) {
     res.status(upstreamStatus);
@@ -416,6 +437,7 @@ function flushBufferedChunks(
     res.write(chunk);
   }
   res.end();
+  onDone?.();
 }
 
 /**
@@ -629,6 +651,7 @@ function sanitizeProviderParams(
   // Strip unsupported params from provider quirks (e.g. groq: ['reasoning_effort'])
   const knownUnsupported: Record<string, string[]> = {
     groq: ['reasoning_effort'],
+    hyperfusion: ['reasoning_effort'],
   };
   const strip = knownUnsupported[providerId];
   if (strip && strip.length > 0) {
@@ -782,13 +805,26 @@ export async function forwardChatCompletion(
   const model = activeModel.trim() || adapter.resolveModel(body.model);
   const limit = resolveConcurrentLimit(adapter, model);
   const queueKey = `${adapter.id}:${model}`;
-  const inGroup = isPreferredGroupMember(adapter.id, model, adapter.config.modelQuirks?.[model]);
-  const groupSpec: PreferredGroupSpec | null = inGroup ? buildPreferredGroupSpec(allProviders()) : null;
-  if (groupSpec) {
-    updateGroupConfig(groupSpec.members.map(m => ({ provider: m.provider, model: m.model, limit: m.limit })));
-  }
+  // Build alias group specs from alias config
+  const aliasName = String(body.model ?? '');
+  const groups = aliasName ? buildAliasGroupSpecs(getAliasGroups(aliasName) ?? [], allProviders(), aliasName) : [];
   const groupExhausted = new Set<string>();
   let attemptsLeft = appConfig.retryLoopCounter;
+  let groupIdx = 0;
+
+  // Track incoming connection for dashboard
+  const incPreview = (() => {
+    const msgs = body.messages ?? [];
+    const lastUser = [...msgs].reverse().find((m: any) => m.role === 'user');
+    return typeof lastUser?.content === 'string' ? lastUser.content.replace(/\s+/g, ' ').trim().slice(0, 60) : '';
+  })();
+  const incId = recordIncomingStart(incPreview);
+  const markIncomingDone = () => recordIncomingEnd(incId);
+  // Reaper: kill incoming connection if client stream hangs > limit
+  registerReapable({ id: incId, kind: 'incoming', startedAt: Date.now(), destroy: () => res.destroy?.() });
+  const doneIncoming = () => { unregisterReapable(incId); markIncomingDone(); };
+  // Safety net: guaranteed cleanup when response fully sent to client
+  res.on('finish', doneIncoming);
 
   // Preview for queue dashboard: last user message, ~60 chars
   const userMsg = (body.messages ?? [])
@@ -802,71 +838,42 @@ export async function forwardChatCompletion(
   while (true) {
     const waitMs = appConfig.retryQueueWaitTimeout * 1000;
 
-    // Preferred-group pool: take the first free slot among ALL group members.
-    if (groupSpec) {
-      const gAcquired = await acquirePreferredGroupSlot(
-        groupSpec,
-        waitMs,
-        () => res.writableEnded || res.destroyed,
-        queuePreview,
-      );
+    // Iterate alias groups in order
+    if (groupIdx < groups.length) {
+      const g = groups[groupIdx];
+      const gAcquired = await acquireAliasGroupSlot(g, waitMs, () => res.writableEnded || res.destroyed, queuePreview);
+      
       if (gAcquired.ok) {
         const grpAdapter = getProvider(gAcquired.provider as ProviderId);
         const { release } = gAcquired.handle;
         try {
-          await forwardChatCompletionOnce(
-            grpAdapter,
-            gAcquired.model,
-            body,
-            incomingHeaders,
-            res,
-            endpointPrefix,
-            fallbackFrom,
-            attemptsLeft > 0,
-          );
+          await forwardChatCompletionOnce(grpAdapter, gAcquired.model, body, incomingHeaders, res, endpointPrefix, fallbackFrom, attemptsLeft > 0, doneIncoming);
           return;
         } catch (err) {
-          if (err instanceof QueueRetry429 && attemptsLeft > 0) {
-            attemptsLeft--;
-            console.log(
-              `[queue] ${queueKey} upstream 429 "too many concurrent requests", re-queuing (${attemptsLeft} left)`,
-            );
-            continue;
-          }
-          throw err;
+          if (err instanceof QueueRetry429 && attemptsLeft > 0) { attemptsLeft--; continue; }
+          release();
+          groupExhausted.add(`${gAcquired.provider}:${gAcquired.model}`);
+          continue;
         } finally {
           release();
         }
       }
-      // Group pool timed out → exit pool, skip exhausted members in chain.
-      if (gAcquired.reason === 'timeout') {
-        console.log(
-          `[queue] ${queueKey} preferred-group pool timeout after ${waitMs}ms, exiting pool`,
-        );
-        for (const member of groupSpec.members) groupExhausted.add(member.key);
-        const rerouted = await tryFallbackChain(
-          'preferred-group-timeout',
-          adapter,
-          model,
-          body,
-          incomingHeaders,
-          res,
-          endpointPrefix,
-          [...groupExhausted],
-        );
-        if (!rerouted && !res.headersSent) {
-          res.status(429).json({
-            error: {
-              message: 'rate limit exceeded: preferred group pool timed out',
-              type: 'rate_limit_error',
-            },
-          });
-        }
-        return;
-      }
+      
+      if (gAcquired.reason === 'timeout' || gAcquired.reason === 'all-busy') { groupIdx++; continue; }
       if (gAcquired.reason === 'client-closed') return;
     }
 
+    // All alias groups exhausted — fall back through flat chain
+    if (groupIdx >= groups.length && groups.length > 0) {
+      const rerouted = await tryFallbackChain('alias-groups-exhausted', adapter, model, body, incomingHeaders, res, endpointPrefix, [...groupExhausted]);
+      if (rerouted) return;
+      if (!res.headersSent) {
+        res.status(429).json({ error: { message: 'All alias groups exhausted', type: 'proxy_error' } });
+      }
+      return;
+    }
+
+    // Per-model concurrency slot
     const acquired = await acquireSlot(
       queueKey,
       limit ?? 0,
@@ -877,43 +884,17 @@ export async function forwardChatCompletion(
 
     if (!acquired.ok) {
       if (acquired.reason === 'client-closed') return;
-      // Queue slot was busy past RETRY_QUEUE_WAIT_TIMEOUT → fall back or pass 429.
-      // No re-queue here: RETRY_LOOP_COUNTER is only spent on a real upstream
-      // "too many concurrent requests" re-queue (see QueueRetry429 below).
-      const label = 'queue-timeout';
-      if (appConfig.doNotFallbackOn429) {
-        console.log(
-          `[queue] ${queueKey} queue timeout, DO_NOT_FALLBACK_ON_429: passing through`,
-        );
-        if (!res.headersSent) {
-          res.status(429).json({
-            error: {
-              message: 'rate limit exceeded: queued request timed out',
-              type: 'rate_limit_error',
-            },
-          });
-        }
-        return;
-      }
       const rerouted = await tryFallbackChain(
-        label,
+        'queue-timeout',
         adapter,
         model,
         body,
         incomingHeaders,
         res,
         endpointPrefix,
-        [...groupExhausted],
       );
-      if (!rerouted) {
-        if (!res.headersSent) {
-          res.status(429).json({
-            error: {
-              message: 'rate limit exceeded: queued request timed out',
-              type: 'rate_limit_error',
-            },
-          });
-        }
+      if (!rerouted && !res.headersSent) {
+        res.status(429).json({ error: { message: 'Request queue timeout', type: 'rate_limit_error' } });
       }
       return;
     }
@@ -929,14 +910,13 @@ export async function forwardChatCompletion(
         endpointPrefix,
         fallbackFrom,
         attemptsLeft > 0,
+        markIncomingDone,
       );
       return;
     } catch (err) {
       if (err instanceof QueueRetry429 && attemptsLeft > 0) {
         attemptsLeft--;
-        console.log(
-          `[queue] ${queueKey} upstream 429 "too many concurrent requests", re-queuing (${attemptsLeft} left)`,
-        );
+        console.log(`[queue] ${queueKey} upstream 429 "too many concurrent requests", re-queuing (${attemptsLeft} left)`);
         continue;
       }
       throw err;
@@ -957,6 +937,7 @@ async function forwardChatCompletionOnce(
   fallbackFrom?: string,
   /** Whether a QueueRetry429 re-queue is still available (RETRY_LOOP_COUNTER). */
   canRetry = true,
+  markIncomingDone?: () => void,
 ): Promise<void> {
   const model = activeModel.trim() || adapter.resolveModel(body.model);
   const requestCtx = captureRequestContext(body.messages);
@@ -974,6 +955,10 @@ async function forwardChatCompletionOnce(
     `${adapter.id}:${model}`, adapter.id, model,
     requestCtx.userRequestPreview,
   );
+  // Reaper: kill upstream stream if it hangs > limit
+  const reqStartedAt = Date.now();
+  const outboundAbort = { aborted: false };
+  registerReapable({ id: reqId, kind: 'outgoing', startedAt: reqStartedAt, destroy: () => { outboundAbort.aborted = true; (res as any).__abortOutbound?.(); } });
 
   // Isolate a per-attempt copy of the request adapted for this model.
   // The original `body` is never mutated — every fallback step starts
@@ -999,7 +984,7 @@ async function forwardChatCompletionOnce(
   // === Streaming path ===
   if (body.stream) {
     // Gonka streaming: buffer, detect garbage, fallback on garbage (same as any error)
-    if (adapter.id === 'gonka' || adapter.id === 'gonka-dahl' || adapter.id === 'hyperfusion') {
+    if (adapter.id === 'gonka' || adapter.id === 'gonka-dahl' || adapter.id === 'gonka-api' || adapter.id === 'joingonka' || adapter.id === 'hyperfusion') {
       await forwardStreamWithGarbageProtection(
         adapter,
         model,
@@ -1015,6 +1000,7 @@ async function forwardChatCompletionOnce(
         fallbackFrom,
         canRetry,
         reqId,
+        markIncomingDone,
       );
       return;
     }
@@ -1149,6 +1135,7 @@ async function forwardChatCompletionOnce(
         if (!res.headersSent) {
           res.status(upstreamStatus).json(parsedError);
         }
+        markIncomingDone?.();
         await recordUsage(adapter, model, null, promptEstimate, '', requestCtx, {
           requestBody: body,
           upstreamUrl: url,
@@ -1218,6 +1205,7 @@ async function forwardChatCompletionOnce(
         if (!res.headersSent) {
           res.status(upstreamStatus).json(parsedError);
         }
+        markIncomingDone?.();
         await recordUsage(adapter, model, null, promptEstimate, '', requestCtx, {
           requestBody: body,
           upstreamUrl: url,
@@ -1262,6 +1250,7 @@ async function forwardChatCompletionOnce(
         });
         upstream!.data.on('end', () => {
           res.end();
+          markIncomingDone?.();
           resolve();
         });
         upstream!.data.on('error', reject);
@@ -1365,6 +1354,7 @@ async function forwardChatCompletionOnce(
         if (!res.headersSent) {
           res.status(502).json({ error: { message, type: 'proxy_error' } });
         }
+        markIncomingDone?.();
       }
     }
     return;
@@ -1454,8 +1444,8 @@ async function forwardChatCompletionOnce(
       if (rerouted) return;
     }
 
-    // Upstream 5xx — try fallback chain before passing through to client
-    if (upstream.status >= 500) {
+    // Upstream 5xx or 402 (insufficient balance) — try fallback chain before passing through to client
+    if (upstream.status >= 500 || upstream.status === 402) {
       recordRequestEnd(reqId, upstream.status, `upstream-${upstream.status}`);
       await logRequestDump({
         provider: adapter.id,
@@ -1682,6 +1672,7 @@ async function forwardChatCompletionOnce(
     });
 
     res.status(upstream.status).json(upstream.data);
+    markIncomingDone?.();
   } catch (err) {
     // Re-queue signal must propagate to the queue loop, not fallback.
     if (err instanceof QueueRetry429) throw err;
@@ -1765,6 +1756,7 @@ async function forwardStreamWithGarbageProtection(
   /** Whether a QueueRetry429 re-queue is still available (RETRY_LOOP_COUNTER). */
   canRetry = true,
   reqId = '',
+  markIncomingDone?: () => void,
 ): Promise<void> {
   const requestedModelName = String(body.model ?? '');
   let completionText = '';
@@ -1787,6 +1779,7 @@ async function forwardStreamWithGarbageProtection(
     }
   } catch (err) {
     const message = describeForwardError(err);
+    recordRequestEnd(reqId, 502, message);
     logProxyError({
       provider: adapter.id,
       endpointPrefix,
@@ -1850,7 +1843,7 @@ async function forwardStreamWithGarbageProtection(
       }).catch((err) => {
         console.error('[request-dump] recordUsage failed:', (err as Error)?.message ?? String(err));
       });
-      flushBufferedChunks(res, chunks, 429, upstreamHeaders);
+      flushBufferedChunks(res, chunks, 429, upstreamHeaders, markIncomingDone);
       return;
     }
 
@@ -1874,14 +1867,14 @@ async function forwardStreamWithGarbageProtection(
       }).catch((err) => {
         console.error('[request-dump] recordUsage failed:', (err as Error)?.message ?? String(err));
       });
-      flushBufferedChunks(res, chunks, upstreamStatus, upstreamHeaders);
+      flushBufferedChunks(res, chunks, upstreamStatus, upstreamHeaders, markIncomingDone);
     }
     return;
   }
 
   // Clean output — flush to client
   if (!isGarbage(completionText)) {
-    flushBufferedChunks(res, chunks, upstreamStatus, upstreamHeaders);
+    flushBufferedChunks(res, chunks, upstreamStatus, upstreamHeaders, markIncomingDone);
 
     await recordUsage(
       adapter,
