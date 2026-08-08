@@ -349,7 +349,7 @@ export interface AliasGroupMember {
 export interface AliasGroupSpec {
   key: string;
   alias: string;
-  strategy: 'random' | 'order';
+  strategy: 'random' | 'order' | 'fastest';
   members: AliasGroupMember[];
 }
 
@@ -389,10 +389,34 @@ function aliasGroupStateFor(spec: AliasGroupSpec): AliasGroupState {
   return state;
 }
 
-function findFreeAliasGroupMember(state: AliasGroupState, strategy: 'random' | 'order'): AliasGroupMember | null {
+// Best available throughput estimate for a member: prefer the 1h window,
+// fall back to 24h when there's no data in the last hour, else 0 (unknown).
+function memberTps(m: AliasGroupMember): number {
+  const samples = modelThroughput.get(m.key);
+  if (!samples || samples.length === 0) return 0;
+  const h1 = aggregateThroughput(samples, WINDOW_1H);
+  if (h1.count > 0) return h1.tps;
+  return aggregateThroughput(samples, WINDOW_24H).tps;
+}
+
+function findFreeAliasGroupMember(
+  state: AliasGroupState,
+  strategy: 'random' | 'order' | 'fastest',
+): AliasGroupMember | null {
   const free = state.members.filter(m => (state.activeByKey.get(m.key) ?? 0) < m.limit);
   if (free.length === 0) return null;
   if (strategy === 'random') return free[Math.floor(Math.random() * free.length)];
+  if (strategy === 'fastest') {
+    // Rank by throughput: members with a measured tps first (highest wins),
+    // unknown (tps 0) members last. Ties are broken randomly.
+    const known = free.filter(m => memberTps(m) > 0);
+    if (known.length > 0) {
+      const best = Math.max(...known.map(memberTps));
+      const tied = known.filter(m => memberTps(m) === best);
+      return tied[Math.floor(Math.random() * tied.length)];
+    }
+    return free[Math.floor(Math.random() * free.length)];
+  }
   return free[0];
 }
 
@@ -401,7 +425,7 @@ function occupyAliasGroupMember(state: AliasGroupState, member: AliasGroupMember
   state.totalActive++;
 }
 
-function dispatchAliasGroupWaiters(state: AliasGroupState, groupKey: string, strategy: 'random' | 'order'): void {
+function dispatchAliasGroupWaiters(state: AliasGroupState, groupKey: string, strategy: 'random' | 'order' | 'fastest'): void {
   while (state.waiters.length > 0) {
     const free = findFreeAliasGroupMember(state, strategy);
     if (!free) break;
@@ -445,7 +469,8 @@ export function acquireAliasGroupSlot(
     return Promise.resolve({ ok: true, provider: free.provider, model: free.model, handle: { release } });
   }
   const state = aliasGroupStateFor(spec);
-  const immediate = findFreeAliasGroupMember(state, 'random');
+  const strategy = spec.strategy;
+  const immediate = findFreeAliasGroupMember(state, strategy);
   if (immediate) {
     occupyAliasGroupMember(state, immediate);
     let released = false;
@@ -455,7 +480,7 @@ export function acquireAliasGroupSlot(
       released = true;
       state.activeByKey.set(key, Math.max(0, (state.activeByKey.get(key) ?? 0) - 1));
       state.totalActive = Math.max(0, state.totalActive - 1);
-      dispatchAliasGroupWaiters(state, spec.key, 'random');
+      dispatchAliasGroupWaiters(state, spec.key, strategy);
     };
     return Promise.resolve({ ok: true, provider: immediate.provider, model: immediate.model, handle: { release } });
   }
@@ -480,7 +505,7 @@ export function buildAliasGroupSpecs(
   const specs: AliasGroupSpec[] = [];
   for (let gi = 0; gi < groups.length; gi++) {
     const g = groups[gi];
-    const strategy = g.strategy === 'order' ? 'order' as const : 'random' as const;
+    const strategy = g.strategy === 'order' ? 'order' as const : (g.strategy === 'fastest' ? 'fastest' as const : 'random' as const);
     const members: AliasGroupMember[] = [];
     for (const entry of g.members) {
       const parts = entry.split('/');

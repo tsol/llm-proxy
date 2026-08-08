@@ -703,6 +703,44 @@ function isMoonshotReasoningModel(providerId: string, model: string): boolean {
   );
 }
 
+/** Providers behind the gonka gateway(s) — they validate content as arrays of blocks. */
+function isGonkaFamilyProvider(providerId: string): boolean {
+  return /gonka/i.test(providerId);
+}
+
+/**
+ * Normalize message `content` to the array-of-blocks form the gonka gateway
+ * requires (`messages[].content` must be a non-empty array of `{type,text}`).
+ * - string content → `[{ type: 'text', text: ... }]`
+ * - assistant messages that only carry tool_calls (empty string/empty array
+ *   content) → drop the `content` field entirely (OpenAI convention)
+ */
+function normalizeContentBlocks(messages: ChatMessage[]): ChatMessage[] {
+  let changed = false;
+  const out = messages.map((m): ChatMessage => {
+    if (!m || typeof m.content === 'undefined' || m.content === null) return m;
+    const c = m.content as unknown;
+    if (typeof c === 'string') {
+      changed = true;
+      if (m.role === 'assistant' && c.trim() === '') {
+        const { content: _drop, ...rest } = m as Record<string, unknown>;
+        return rest as ChatMessage;
+      }
+      return { ...m, content: [{ type: 'text', text: c }] } as ChatMessage;
+    }
+    if (Array.isArray(c) && c.length === 0) {
+      changed = true;
+      if (m.role === 'assistant') {
+        const { content: _drop, ...rest } = m as Record<string, unknown>;
+        return rest as ChatMessage;
+      }
+      return { ...m, content: [{ type: 'text', text: '' }] } as ChatMessage;
+    }
+    return m;
+  });
+  return changed ? out : messages;
+}
+
 /**
  * Isolate a per-attempt copy of the request, adapted for a specific target
  * model. The original `body` is NEVER mutated — each fallback step starts
@@ -722,6 +760,11 @@ function adaptForModel(
 ): ChatCompletionRequest {
   let messages = applyPromptOverrides(body.messages);
   messages = sanitizeEmptyToolCalls(messages);
+
+  // gonka gateway requires content as a non-empty array of {type,text} blocks.
+  if (isGonkaFamilyProvider(providerId) && messages) {
+    messages = normalizeContentBlocks(messages);
+  }
 
   if (!isMoonshotReasoningModel(providerId, model)) {
     let stripped = 0;
