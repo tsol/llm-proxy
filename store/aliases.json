@@ -11,7 +11,13 @@
             "gonka-api/moonshotai/Kimi-K2.6",
             "gonka-api/MiniMaxAI/MiniMax-M2.7",
             "gonka/moonshotai/Kimi-K2.6",
-            "gonka/MiniMaxAI/MiniMax-M2.7"
+            "gonka/MiniMaxAI/MiniMax-M2.7",
+            "gonka-mingles/moonshotai/Kimi-K2.6",
+            "gonka-mingles/MiniMaxAI/MiniMax-M2.7",
+            "gonka-router-io/moonshotai/Kimi-K2.6",
+            "gonka-router-io/MiniMaxAI/MiniMax-M2.7",
+            "gonkabroker/moonshotai/Kimi-K2.6",
+            "gonkabroker/MiniMaxAI/MiniMax-M2.7"
           ]
         },
         {

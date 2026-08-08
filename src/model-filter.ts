@@ -22,6 +22,13 @@ export function loadModelAllowPatterns(): Partial<Record<ProviderId, RegExp[]>> 
   const providerIds: ProviderId[] = [
     'local',
     'gonka',
+    'gonka-dahl',
+    'gonka-api',
+    'joingonka',
+    'gonka-mingles',
+    'gonka-router-io',
+    'gonkabroker',
+    'hyperfusion',
     'google',
     'cursor',
     'deepseek',

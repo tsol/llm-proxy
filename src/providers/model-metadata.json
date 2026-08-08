@@ -120,6 +120,42 @@
       }
     }
   },
+  "gonka-mingles": {
+    "rateLimits": {},
+    "models": {
+      "moonshotai/Kimi-K2.6": {
+        "concurrent": 1
+      },
+      "MiniMaxAI/MiniMax-M2.7": {
+        "concurrent": 1,
+        "reasoningEffort": "low"
+      }
+    }
+  },
+  "gonka-router-io": {
+    "rateLimits": {},
+    "models": {
+      "moonshotai/Kimi-K2.6": {
+        "concurrent": 1
+      },
+      "MiniMaxAI/MiniMax-M2.7": {
+        "concurrent": 1,
+        "reasoningEffort": "low"
+      }
+    }
+  },
+  "gonkabroker": {
+    "rateLimits": {},
+    "models": {
+      "moonshotai/Kimi-K2.6": {
+        "concurrent": 1
+      },
+      "MiniMaxAI/MiniMax-M2.7": {
+        "concurrent": 1,
+        "reasoningEffort": "low"
+      }
+    }
+  },
   "hyperfusion": {
     "rateLimits": {},
     "models": {

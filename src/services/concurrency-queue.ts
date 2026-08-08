@@ -40,6 +40,61 @@ interface ModelStats {
 
 const modelStats = new Map<string, ModelStats>();
 
+// Rolling throughput windows per model (reply time + bytes/tokens returned)
+const WINDOW_1H = 60 * 60 * 1000;
+const WINDOW_24H = 24 * 60 * 60 * 1000;
+const MAX_THROUGHPUT_SAMPLES = 5000;
+interface ThroughputSample {
+  ts: number; // timestamp ms
+  durationMs: number;
+  bytes: number;
+  tokensOut?: number;
+}
+interface ThroughputWindow {
+  count: number;
+  durMs: number;
+  bytes: number;
+  tokensOut: number;
+  tps: number;
+}
+const modelThroughput = new Map<string, ThroughputSample[]>();
+
+function pushThroughput(key: string, sample: ThroughputSample): void {
+  let arr = modelThroughput.get(key);
+  if (!arr) {
+    arr = [];
+    modelThroughput.set(key, arr);
+  }
+  arr.push(sample);
+  // Prune samples older than 24h; hard-cap to bound memory.
+  const cutoff = Date.now() - WINDOW_24H;
+  if (arr.length > MAX_THROUGHPUT_SAMPLES) {
+    arr.splice(0, arr.length - MAX_THROUGHPUT_SAMPLES);
+  } else if (arr.length > 1 && arr[0].ts < cutoff) {
+    let i = 0;
+    while (i < arr.length && arr[i].ts < cutoff) i++;
+    if (i > 0) arr.splice(0, i);
+  }
+}
+
+function aggregateThroughput(arr: ThroughputSample[], windowMs: number): ThroughputWindow {
+  const cutoff = Date.now() - windowMs;
+  let count = 0;
+  let durMs = 0;
+  let bytes = 0;
+  let tokensOut = 0;
+  for (const s of arr) {
+    if (s.ts < cutoff) continue;
+    count++;
+    durMs += s.durationMs;
+    bytes += s.bytes;
+    tokensOut += s.tokensOut ?? 0;
+  }
+  const secs = durMs / 1000;
+  const tps = secs > 0 ? (tokensOut > 0 ? tokensOut / secs : bytes / secs) : 0;
+  return { count, durMs, bytes, tokensOut, tps };
+}
+
 // Live request tracking
 interface LiveRequest {
   key: string;
@@ -143,7 +198,11 @@ export function recordRequestEnd(id: string, status: number, respPreview: string
   unregisterReapable(id);
 }
 
-export function recordModelResponse(key: string, status: number): void {
+export function recordModelResponse(
+  key: string,
+  status: number,
+  metrics?: { durationMs?: number; bytes?: number; tokensOut?: number },
+): void {
   let s = modelStats.get(key);
   if (!s) {
     s = { lastStatus: status, total: 0, ok: 0, fail: 0 };
@@ -151,8 +210,24 @@ export function recordModelResponse(key: string, status: number): void {
   }
   s.lastStatus = status;
   s.total++;
-  if (status >= 200 && status < 400) s.ok++;
+  // status 0 = garbage; anything not 2xx-3xx is a failure.
+  const ok = status >= 200 && status < 400;
+  if (ok) s.ok++;
   else s.fail++;
+  // Rolling throughput windows: only measurable successful replies count.
+  if (
+    ok &&
+    metrics &&
+    typeof metrics.durationMs === 'number' &&
+    typeof metrics.bytes === 'number'
+  ) {
+    pushThroughput(key, {
+      ts: Date.now(),
+      durationMs: metrics.durationMs,
+      bytes: metrics.bytes,
+      tokensOut: metrics.tokensOut,
+    });
+  }
 }
 
 function stateFor(key: string, limit: number): QueueState {
@@ -481,6 +556,7 @@ export interface ConcurrencySnapshot {
   }>;
   groupConfig: Array<{ provider: string; model: string; limit: number; group: number; strategy: string }>;
   stats: Record<string, { lastStatus: number; total: number; ok: number; fail: number }>;
+  throughput: Record<string, { h1: ThroughputWindow; h24: ThroughputWindow }>;
   incoming: Array<{ preview: string; startedAt: number }>;
   active: Array<{ key: string; provider: string; model: string; reqPreview: string; reqSuffix: string; startedAt: number }>;
   recent: Array<{ key: string; provider: string; model: string; reqPreview: string; respPreview: string; status: number; startedAt: number }>;
@@ -523,6 +599,12 @@ export function concurrencySnapshot(): ConcurrencySnapshot {
     perModel, aliasGroups,
     groupConfig: cachedAliasChain,
     stats: Object.fromEntries(modelStats),
+    throughput: Object.fromEntries(
+      [...modelThroughput.entries()].map(([key, arr]) => [
+        key,
+        { h1: aggregateThroughput(arr, WINDOW_1H), h24: aggregateThroughput(arr, WINDOW_24H) },
+      ]),
+    ),
     incoming: [...incomingRequests.values()].map(ir => ({
       preview: ir.preview, startedAt: ir.startedAt,
     })),

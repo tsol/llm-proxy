@@ -173,11 +173,11 @@ function buildPricing(
 
 // Load curated metadata from JSON (context lengths, rate limits per model & provider)
 const metaRateLimits = Object.fromEntries(
-  (['local', 'gonka', 'gonka-dahl', 'gonka-api', 'joingonka', 'hyperfusion', 'google', 'cursor', 'deepseek', 'groq', 'cerebras', 'openrouter'] as ProviderId[])
+  (['local', 'gonka', 'gonka-dahl', 'gonka-api', 'joingonka', 'gonka-mingles', 'gonka-router-io', 'gonkabroker', 'hyperfusion', 'google', 'cursor', 'deepseek', 'groq', 'cerebras', 'openrouter'] as ProviderId[])
     .map((id) => [id, getMetadataRateLimits(id)] as const),
 );
 const metaModelQuirks = Object.fromEntries(
-  (['local', 'gonka', 'gonka-dahl', 'gonka-api', 'joingonka', 'hyperfusion', 'google', 'cursor', 'deepseek', 'groq', 'cerebras', 'openrouter'] as ProviderId[])
+  (['local', 'gonka', 'gonka-dahl', 'gonka-api', 'joingonka', 'gonka-mingles', 'gonka-router-io', 'gonkabroker', 'hyperfusion', 'google', 'cursor', 'deepseek', 'groq', 'cerebras', 'openrouter'] as ProviderId[])
     .map((id) => [id, getMetadataModelQuirks(id)] as const),
 );
 
@@ -240,6 +240,42 @@ export const providerConfigs: Record<ProviderId, ProviderConfig> = {
     ownedBy: 'joingonka',
     rateLimits: mergeRateLimits(metaRateLimits.joingonka, 'JOINGONKA', {}),
     modelQuirks: { ...metaModelQuirks.joingonka },
+  },
+
+  'gonka-mingles': {
+    id: 'gonka-mingles',
+    displayOrder: 1,
+    baseUrl: env('GONKA_MINGLES_BASE_URL', 'https://router.mingles.ai/v1'),
+    apiKey: env('GONKA_MINGLES_API_KEY'),
+    defaultModel: env('GONKA_MINGLES_DEFAULT_MODEL', 'MiniMaxAI/MiniMax-M2.7'),
+    pricing: buildPricing('GONKA_MINGLES', { inputPerMillion: 0, outputPerMillion: 0 }),
+    ownedBy: 'gonka-mingles',
+    rateLimits: mergeRateLimits(metaRateLimits['gonka-mingles'], 'GONKA_MINGLES', {}),
+    modelQuirks: { ...metaModelQuirks['gonka-mingles'] },
+  },
+
+  'gonka-router-io': {
+    id: 'gonka-router-io',
+    displayOrder: 1,
+    baseUrl: env('GONKA_ROUTER_IO_BASE_URL', 'https://api.gonkarouter.io/v1'),
+    apiKey: env('GONKA_ROUTER_IO_API_KEY'),
+    defaultModel: env('GONKA_ROUTER_IO_DEFAULT_MODEL', 'MiniMaxAI/MiniMax-M2.7'),
+    pricing: buildPricing('GONKA_ROUTER_IO', { inputPerMillion: 0, outputPerMillion: 0 }),
+    ownedBy: 'gonka-router-io',
+    rateLimits: mergeRateLimits(metaRateLimits['gonka-router-io'], 'GONKA_ROUTER_IO', {}),
+    modelQuirks: { ...metaModelQuirks['gonka-router-io'] },
+  },
+
+  gonkabroker: {
+    id: 'gonkabroker',
+    displayOrder: 1,
+    baseUrl: env('GONKABROKER_BASE_URL', 'https://proxy.gonkabroker.com/v1'),
+    apiKey: env('GONKABROKER_API_KEY'),
+    defaultModel: env('GONKABROKER_DEFAULT_MODEL', 'MiniMaxAI/MiniMax-M2.7'),
+    pricing: buildPricing('GONKABROKER', { inputPerMillion: 0, outputPerMillion: 0 }),
+    ownedBy: 'gonkabroker',
+    rateLimits: mergeRateLimits(metaRateLimits.gonkabroker, 'GONKABROKER', {}),
+    modelQuirks: { ...metaModelQuirks.gonkabroker },
   },
 
   hyperfusion: {

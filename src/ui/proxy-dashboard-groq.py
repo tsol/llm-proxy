@@ -284,6 +284,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
   .status-pill.ok { background: rgba(52, 211, 153, 0.22); color: var(--ok); }
   .status-pill.fail { background: rgba(248, 113, 113, 0.22); color: var(--fail); }
   .status-pill.neutral { background: var(--bg3); color: var(--muted); }
+  .status-pill.garbage { background: rgba(251, 191, 36, 0.22); color: var(--warn); }
 
   /* Progress bar */
   .bar-wrap {
@@ -643,9 +644,27 @@ HTML_CONTENT = r"""<!DOCTYPE html>
   }
 
   function statusClass(code) {
+    if (code === 0) return 'garbage';
     if (code >= 200 && code < 300) return 'ok';
     if (code >= 400) return 'fail';
     return 'neutral';
+  }
+
+  function fmtBytes(b) {
+    if (b == null || isNaN(b)) return '—';
+    const kb = b / 1024;
+    if (kb < 1024) return kb.toFixed(0) + ' KB';
+    return (kb / 1024).toFixed(1) + ' MB';
+  }
+
+  function fmtTps(t) {
+    if (t == null || !isFinite(t) || t <= 0) return '—';
+    return (t >= 10 ? t.toFixed(0) : t.toFixed(1)) + ' tok/s';
+  }
+
+  function statusLabel(code) {
+    if (code === 0) return '000 · garbage';
+    return code ?? '—';
   }
 
   function escapeHtml(s) {
@@ -733,6 +752,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         const model = rest.join(':') || key;
         const st = statusClass(s.lastStatus);
         const cardStatus = st === 'ok' ? 'status-ok' : (st === 'fail' ? 'status-fail' : '');
+        const tp = (data.throughput || {})[key];
         html += `
           <div class="card ${cardStatus}">
             <div class="card-row">
@@ -746,8 +766,12 @@ HTML_CONTENT = r"""<!DOCTYPE html>
                 <div class="counter fail"><div class="val">${s.fail || 0}</div><div class="lbl">fail</div></div>
               </div>
             </div>
+            <div style="display:flex;justify-content:space-between;gap:14px;margin-top:12px;flex-wrap:wrap;font-family:var(--mono);font-size:12px;color:var(--muted)">
+              <span>1h: <b style="color:var(--accent2)">${tp ? fmtTps(tp.h1.tps) : '—'}</b> · ${tp ? fmtBytes(tp.h1.bytes) : '—'} · ${tp ? tp.h1.count : 0} req</span>
+              <span>24h: <b style="color:var(--accent2)">${tp ? fmtTps(tp.h24.tps) : '—'}</b> · ${tp ? fmtBytes(tp.h24.bytes) : '—'} · ${tp ? tp.h24.count : 0} req</span>
+            </div>
             <div style="margin-top:12px">
-              <span class="status-pill ${st}">${s.lastStatus ?? '—'}</span>
+              <span class="status-pill ${st}">${statusLabel(s.lastStatus)}</span>
             </div>
           </div>`;
       });
@@ -860,6 +884,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
             const stTotal = (s && s.total) || 0;
             const stOk = (s && s.ok) || 0;
             const stFail = (s && s.fail) || 0;
+            const mtp = (data.throughput || {})[`${m.provider}:${m.model}`];
             return `
               <div class="member">
                 <div style="min-width:0">
@@ -869,6 +894,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
                 <div style="display:flex;align-items:center;gap:12px">
                   <span class="slots">${m.active}/${m.limit}</span>
                   <div class="member-bar"><div style="width:${mp}%"></div></div>
+                  <span style="font-family:var(--mono);font-size:12px;color:var(--accent2)">${mtp ? fmtTps(mtp.h1.tps) : '—'}</span>
                 </div>
                 <div style="display:flex;gap:12px;margin-top:10px;font-family:var(--mono);font-size:12px">
                   <span style="color:var(--text)">${stTotal} total</span>
@@ -900,7 +926,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         <div class="recent-item ${cardStatus} ${stale ? 'stale' : ''}">
           <div class="recent-top">
             <div class="recent-key">${escapeHtml(r.provider)}/${escapeHtml(r.model)}</div>
-            <span class="status-pill ${st}">${r.status ?? '—'}</span>
+            <span class="status-pill ${st}">${statusLabel(r.status)}</span>
           </div>
           <div class="preview-pair">
             <span class="req">${escapeHtml(truncate(r.reqPreview, 55))}</span>

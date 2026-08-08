@@ -596,6 +596,18 @@ export function createProvider(config: ProviderConfig): ProviderAdapter {
       const { GonkaProvider } = require('./gonka') as typeof import('./gonka');
       return new GonkaProvider(config);
     }
+    case 'gonka-mingles': {
+      const { GonkaProvider } = require('./gonka') as typeof import('./gonka');
+      return new GonkaProvider(config);
+    }
+    case 'gonka-router-io': {
+      const { GonkaProvider } = require('./gonka') as typeof import('./gonka');
+      return new GonkaProvider(config);
+    }
+    case 'gonkabroker': {
+      const { GonkaProvider } = require('./gonka') as typeof import('./gonka');
+      return new GonkaProvider(config);
+    }
     case 'hyperfusion': {
       // Hyperfusion is OpenAI-compatible (no Gonka /api/* endpoints — GonkaProvider
       // tolerates this via Promise.allSettled and falls back to live GET /v1/models).

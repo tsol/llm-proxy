@@ -245,6 +245,19 @@ function withStreamUsage(body: ChatCompletionRequest): ChatCompletionRequest {
   };
 }
 
+/** Build throughput metrics for a completed model reply (successful only). */
+function throughputMetrics(
+  startedAt: number,
+  text: string,
+  tokensOut?: number,
+): { durationMs: number; bytes: number; tokensOut?: number } {
+  return {
+    durationMs: Date.now() - startedAt,
+    bytes: Buffer.byteLength(text || ''),
+    tokensOut,
+  };
+}
+
 async function recordUsage(
   adapter: ProviderAdapter,
   model: string,
@@ -682,7 +695,7 @@ function sanitizeProviderParams(
 
 /** Models whose reasoning_content must be preserved for round-trip. */
 function isMoonshotReasoningModel(providerId: string, model: string): boolean {
-  if (providerId !== 'gonka' && providerId !== 'gonka-dahl' && providerId !== 'hyperfusion') return false;
+  if (providerId !== 'gonka' && providerId !== 'gonka-dahl' && providerId !== 'gonka-api' && providerId !== 'joingonka' && providerId !== 'gonka-mingles' && providerId !== 'gonka-router-io' && providerId !== 'gonkabroker' && providerId !== 'hyperfusion') return false;
   const lower = model.toLowerCase();
   return (
     lower.includes('moonshotai/kimi') ||
@@ -984,7 +997,7 @@ async function forwardChatCompletionOnce(
   // === Streaming path ===
   if (body.stream) {
     // Gonka streaming: buffer, detect garbage, fallback on garbage (same as any error)
-    if (adapter.id === 'gonka' || adapter.id === 'gonka-dahl' || adapter.id === 'gonka-api' || adapter.id === 'joingonka' || adapter.id === 'hyperfusion') {
+    if (adapter.id === 'gonka' || adapter.id === 'gonka-dahl' || adapter.id === 'gonka-api' || adapter.id === 'joingonka' || adapter.id === 'gonka-mingles' || adapter.id === 'gonka-router-io' || adapter.id === 'gonkabroker' || adapter.id === 'hyperfusion') {
       await forwardStreamWithGarbageProtection(
         adapter,
         model,
@@ -997,6 +1010,7 @@ async function forwardChatCompletionOnce(
         res,
         incomingHeaders,
         endpointPrefix,
+        reqStartedAt,
         fallbackFrom,
         canRetry,
         reqId,
@@ -1296,7 +1310,11 @@ async function forwardChatCompletionOnce(
         effectiveModel: model,
         fallbackFrom,
       });
-      recordModelResponse(`${adapter.id}:${model}`, finalStatus);
+      recordModelResponse(
+        `${adapter.id}:${model}`,
+        finalStatus,
+        throughputMetrics(reqStartedAt, completionText, (streamUsage as UsageBreakdown | null)?.usage?.completion_tokens ?? estimateTokensFromText(completionText)),
+      );
       recordRequestEnd(reqId, finalStatus, completionText);
     } catch (err) {
       // Re-queue signal must propagate to the queue loop, not fallback.
@@ -1311,6 +1329,7 @@ async function forwardChatCompletionOnce(
         message,
       });
 
+      recordModelResponse(`${adapter.id}:${model}`, 502);
       recordRequestEnd(reqId, 502, message);
 
       await logRequestDump({
@@ -1369,6 +1388,7 @@ async function forwardChatCompletionOnce(
 
     // Rate-limit fallback: 429 or 413 (TPM exceeded) → try chain
     if (upstream.status === 429 || upstream.status === 413) {
+      recordModelResponse(`${adapter.id}:${model}`, upstream.status);
       recordRequestEnd(reqId, upstream.status, 'rate-limited');
       await logRequestDump({
         provider: adapter.id,
@@ -1446,6 +1466,7 @@ async function forwardChatCompletionOnce(
 
     // Upstream 5xx or 402 (insufficient balance) — try fallback chain before passing through to client
     if (upstream.status >= 500 || upstream.status === 402) {
+      recordModelResponse(`${adapter.id}:${model}`, upstream.status);
       recordRequestEnd(reqId, upstream.status, `upstream-${upstream.status}`);
       await logRequestDump({
         provider: adapter.id,
@@ -1542,7 +1563,13 @@ async function forwardChatCompletionOnce(
             effectiveModel: model,
             fallbackFrom,
           });
-          recordModelResponse(`${adapter.id}:${model}`, retryResp.status);
+          recordModelResponse(
+            `${adapter.id}:${model}`,
+            retryResp.status,
+            !retryFailed
+              ? throughputMetrics(reqStartedAt, retryText, parseUsage(retryResp.data)?.usage.completion_tokens)
+              : undefined,
+          );
           recordRequestEnd(reqId, retryResp.status, retryText);
           const usage = parseUsage(retryResp.data);
           await recordUsage(
@@ -1595,7 +1622,8 @@ async function forwardChatCompletionOnce(
 
     // Garbage detected in non-streaming output — treat as upstream error, try fallback
     if (!upstreamFailed && completionText && isGarbage(completionText)) {
-      recordRequestEnd(reqId, 200, 'garbage-detected');
+      recordModelResponse(`${adapter.id}:${model}`, 0);
+      recordRequestEnd(reqId, 0, 'garbage-detected');
       const metrics = analyzeText(completionText);
       logProxyError({
         provider: adapter.id,
@@ -1641,7 +1669,11 @@ async function forwardChatCompletionOnce(
       fallbackFrom,
     });
 
-    recordModelResponse(`${adapter.id}:${model}`, upstream.status);
+    recordModelResponse(
+      `${adapter.id}:${model}`,
+      upstream.status,
+      throughputMetrics(reqStartedAt, completionText, parseUsage(upstream.data)?.usage.completion_tokens ?? estimateTokensFromText(completionText)),
+    );
     recordRequestEnd(reqId, upstream.status, completionText);
 
     const usage = parseUsage(upstream.data);
@@ -1686,6 +1718,7 @@ async function forwardChatCompletionOnce(
       message,
     });
 
+    recordModelResponse(`${adapter.id}:${model}`, 502);
     recordRequestEnd(reqId, 502, message);
 
     await logRequestDump({
@@ -1752,6 +1785,7 @@ async function forwardStreamWithGarbageProtection(
   res: Response,
   incomingHeaders: IncomingHttpHeaders,
   endpointPrefix: string,
+  reqStartedAt: number,
   fallbackFrom?: string,
   /** Whether a QueueRetry429 re-queue is still available (RETRY_LOOP_COUNTER). */
   canRetry = true,
@@ -1779,6 +1813,7 @@ async function forwardStreamWithGarbageProtection(
     }
   } catch (err) {
     const message = describeForwardError(err);
+    recordModelResponse(`${adapter.id}:${model}`, 502);
     recordRequestEnd(reqId, 502, message);
     logProxyError({
       provider: adapter.id,
@@ -1817,6 +1852,7 @@ async function forwardStreamWithGarbageProtection(
 
   // Upstream error — try fallback (or pass 429 through when configured)
   if (upstreamStatus >= 400) {
+    recordModelResponse(`${adapter.id}:${model}`, upstreamStatus);
     // "too many concurrent requests" with retries left → re-queue
     if (upstreamStatus === 429) {
       throwIfTooManyConcurrent(adapter, model, errorDetail ?? '', canRetry);
@@ -1902,13 +1938,18 @@ async function forwardStreamWithGarbageProtection(
       effectiveModel: model,
       fallbackFrom,
     });
-    recordModelResponse(`${adapter.id}:${model}`, upstreamStatus);
+    recordModelResponse(
+      `${adapter.id}:${model}`,
+      upstreamStatus,
+      throughputMetrics(reqStartedAt, completionText, streamUsage?.usage.completion_tokens ?? estimateTokensFromText(completionText)),
+    );
     recordRequestEnd(reqId, upstreamStatus, completionText);
     return;
   }
 
   // Garbage detected — log, try fallback chain (no retry to same model)
-  recordRequestEnd(reqId, 200, 'garbage-detected');
+  recordModelResponse(`${adapter.id}:${model}`, 0);
+  recordRequestEnd(reqId, 0, 'garbage-detected');
   const metrics = analyzeText(completionText);
   const garbageLog = `garbage detected in stream (cjks=${metrics.maxCJK}, digits=${metrics.maxDigits}, artifacts=${metrics.artifactWords}, ratio=${metrics.garbageRatio.toFixed(3)}), trying fallback chain`;
   logProxyError({
