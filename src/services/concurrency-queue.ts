@@ -141,6 +141,9 @@ interface LiveRequest {
   lastChunkAt: number;
   /** Cumulative upstream bytes received so far. */
   bytes: number;
+  /** Rolling tail of the provider's response so far (last ~80 chars) — lets
+   *  the dashboard show live streaming progress (not the user prompt). */
+  respHint: string;
 }
 
 interface IncomingRequest {
@@ -218,6 +221,7 @@ export function recordRequestStart(key: string, provider: string, model: string,
     startedAt: Date.now(),
     lastChunkAt: Date.now(),
     bytes: 0,
+    respHint: '',
     status: null,
   };
   liveRequests.set(id, lr);
@@ -231,6 +235,19 @@ export function touchLiveRequest(id: string, bytesDelta: number): void {
   if (!lr) return;
   lr.lastChunkAt = Date.now();
   if (bytesDelta > 0) lr.bytes += bytesDelta;
+}
+
+/** Record a live upstream DATA chunk: refresh last-activity, add bytes, and
+ *  keep a rolling tail of the provider's response (respHint) so the dashboard
+ *  can show live streaming progress. */
+export function touchLiveResponse(id: string, text: string, bytesDelta: number): void {
+  const lr = liveRequests.get(id);
+  if (!lr) return;
+  lr.lastChunkAt = Date.now();
+  if (bytesDelta > 0) lr.bytes += bytesDelta;
+  if (text) {
+    lr.respHint = (lr.respHint + text).slice(-80);
+  }
 }
 
 export function recordRequestEnd(id: string, status: number, respPreview: string): void {
@@ -644,7 +661,7 @@ export interface ConcurrencySnapshot {
   stats: Record<string, { lastStatus: number; total: number; ok: number; fail: number }>;
   throughput: Record<string, { h1: ThroughputWindow; h24: ThroughputWindow }>;
   incoming: Array<{ preview: string; startedAt: number }>;
-  active: Array<{ key: string; provider: string; model: string; reqPreview: string; reqSuffix: string; startedAt: number; lastChunkAt: number; bytes: number }>;
+  active: Array<{ key: string; provider: string; model: string; reqPreview: string; reqSuffix: string; respHint: string; startedAt: number; lastChunkAt: number; bytes: number }>;
   recent: Array<{ key: string; provider: string; model: string; reqPreview: string; respPreview: string; status: number; startedAt: number }>;
 }
 
@@ -713,7 +730,8 @@ export function concurrencySnapshot(): ConcurrencySnapshot {
     })),
     active: [...liveRequests.values()].map(lr => ({
       key: lr.key, provider: lr.provider, model: lr.model,
-      reqPreview: lr.reqPreview, reqSuffix: lr.reqSuffix, startedAt: lr.startedAt,
+      reqPreview: lr.reqPreview, reqSuffix: lr.reqSuffix, respHint: lr.respHint,
+      startedAt: lr.startedAt,
       lastChunkAt: lr.lastChunkAt, bytes: lr.bytes,
     })),
     recent: [...recentRequests]

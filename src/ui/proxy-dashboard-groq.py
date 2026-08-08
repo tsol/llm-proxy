@@ -346,6 +346,45 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     opacity: 0.4;
     border-style: dashed;
   }
+  .req-preview {
+    font-size: 13px;
+    color: var(--text);
+    line-height: 1.4;
+  }
+  .resp-hint {
+    margin-top: 5px;
+    font-size: 12px;
+    color: var(--accent, #7aa7ff);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    word-break: break-word;
+    opacity: 0.92;
+  }
+  .stream-dots {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #3ddc84;
+    margin-right: 6px;
+    vertical-align: middle;
+    animation: streamPulse 1s ease-in-out infinite;
+  }
+  @keyframes streamPulse {
+    0%, 100% { opacity: 0.25; }
+    50% { opacity: 1; }
+  }
+  .req-meta {
+    margin-top: 8px;
+    font-size: 11px;
+    color: var(--muted);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 10px;
+  }
+  .req-meta .bytes-live {
+    color: #3ddc84;
+    font-weight: 600;
+  }
 
   .req-preview {
     font-size: 13px;
@@ -859,15 +898,24 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
   function renderActive(item) {
     const a = age(item.startedAt);
+    const idle = item.lastChunkAt ? Date.now() - item.lastChunkAt : a;
     const stale = isStale(item.startedAt);
     const zombie = isZombie(item.startedAt);
     const preview = (item.reqPreview || '') + (item.reqSuffix ? ' … ' + item.reqSuffix : '');
+    const hint = item.respHint || '';
+    const bytes = item.bytes || 0;
+    // "Streaming" = we've received bytes, or last byte was recent (<60s).
+    const streaming = bytes > 0 || idle < STALE_MS;
     return `
       <div class="req-item ${stale ? 'stale' : ''} ${zombie ? 'zombie' : ''}">
-        <div class="req-preview">${escapeHtml(truncate(preview, 110))}</div>
+        <div class="req-preview"><span class="stream-dots"></span>${escapeHtml(truncate(preview, 90))}</div>
+        ${hint ? `<div class="resp-hint">… ${escapeHtml(truncate(hint, 120))}</div>` : ''}
         <div class="req-meta">
           <span>${escapeHtml(item.provider)}/${escapeHtml(item.model)}</span>
-          <span>${fmtDur(a)}</span>
+          <span>start ${fmtDur(a)}</span>
+          <span>last byte ${fmtDur(idle)}</span>
+          <span class="bytes-live">${fmtBytes(bytes)}</span>
+          ${streaming ? '' : '<span>silent</span>'}
           ${stale ? '<span>stale</span>' : ''}
           ${zombie ? '<span>zombie</span>' : ''}
         </div>

@@ -43,7 +43,7 @@ import {
   recordRequestEnd,
   recordIncomingStart,
   recordIncomingEnd,
-  touchLiveRequest,
+  touchLiveResponse,
   registerReapable,
   unregisterReapable,
   startZombieReaper,
@@ -393,6 +393,7 @@ async function bufferedStreamRequest(
   payload: ChatCompletionRequest,
   headers: Record<string, string>,
   upstreamAbort?: { signal: AbortSignal; ok(): void; abort(): void },
+  liveReqId?: string,
 ): Promise<{
   completionText: string;
   streamUsage: UsageBreakdown | null;
@@ -461,6 +462,7 @@ async function bufferedStreamRequest(
         }, STREAM_IDLE_MS);
         chunks.push(chunk);
         const text = chunk.toString('utf8');
+        if (liveReqId) touchLiveResponse(liveReqId, text, chunk.length);
         completionText += extractStreamText(text);
         streamUsage = collectStreamUsage(text, streamUsage);
       });
@@ -1690,9 +1692,9 @@ async function forwardChatCompletionOnce(
         };
 
         upstream!.data.on('data', (chunk: Buffer) => {
-          touchLiveRequest(reqId, chunk.length);
-          liveBytes += chunk.length;
           const text = chunk.toString('utf8');
+          touchLiveResponse(reqId, text, chunk.length);
+          liveBytes += chunk.length;
           if (upstreamFailed) {
             rawErrorBody += text;
           } else {
@@ -2257,7 +2259,7 @@ async function forwardStreamWithGarbageProtection(
   let errorDetail: string | undefined;
 
   try {
-    const result = await bufferedStreamRequest(url, payload, headers, upstreamAbort);
+    const result = await bufferedStreamRequest(url, payload, headers, upstreamAbort, reqId);
     completionText = result.completionText;
     streamUsage = result.streamUsage;
     chunks = result.chunks;
