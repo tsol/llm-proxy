@@ -116,7 +116,7 @@ function recordFailure(key: string, ts = Date.now()): void {
 }
 
 /** Count of failures for a model key in the last hour (for the fastest strategy). */
-function memberFailures(key: string): number {
+export function memberFailures(key: string): number {
   const arr = modelFailures.get(key);
   if (!arr || arr.length === 0) return 0;
   const cutoff = Date.now() - WINDOW_1H;

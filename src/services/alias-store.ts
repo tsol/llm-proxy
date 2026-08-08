@@ -27,6 +27,23 @@ interface StoreDataV2 {
 const STORE_DIR = path.resolve(__dirname, '..', '..', 'store');
 const STORE_PATH = path.join(STORE_DIR, 'aliases.json');
 
+// ------- JSON parsing (defensive) -------
+
+/**
+ * Parse the store JSON, tolerating trailing commas before `}` / `]` — the
+ * classic mistake when someone edits aliases.json by hand. A broken store
+ * must NEVER silently empty the alias map: that disables the fallback chain
+ * entirely and turns any upstream 4xx/5xx into a hard client error.
+ */
+function repairedParse(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    const fixed = raw.replace(/,\s*([}\]])/g, '$1');
+    return JSON.parse(fixed);
+  }
+}
+
 // ------- In-memory state -------
 
 let storeAliases = new Map<string, { chain: string[]; groups?: Array<{ strategy: string; members: string[] }> }>();
@@ -49,7 +66,10 @@ function loadStore(): void {
   try {
     if (fs.existsSync(STORE_PATH)) {
       const raw = fs.readFileSync(STORE_PATH, 'utf-8');
-      const data = JSON.parse(raw);
+      const data = repairedParse(raw) as {
+        version?: number;
+        aliases?: Record<string, unknown>;
+      };
       if (data && data.aliases) {
         if (data.version === 2) {
           // v2: groups format

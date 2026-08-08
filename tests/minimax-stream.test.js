@@ -98,6 +98,26 @@ const chunks = [
   console.log('PASS  minimax tool_call XML → standard tool_calls stream');
 }
 
+// ── Case 1b: MiniMax shorthand `<invoke="name">` (no `name=` keyword) ──
+{
+  const shorthandText =
+    'Делаю:\n' +
+    XML_TOOL_CALL.replace('<invoke name="terminal">', '<invoke="terminal">');
+  const out = rewriteStreamForMiniMax(chunks, shorthandText, 'MiniMaxAI/MiniMax-M2.7');
+  const joined = Buffer.concat(out).toString('utf8');
+  assert.ok(
+    !joined.includes('<invoke') && !joined.includes('<minimax:tool_call>'),
+    'shorthand: raw minimax XML must be stripped',
+  );
+  const tcLine = joined.split('\n').find((l) => l.includes('"tool_calls"'));
+  assert.ok(tcLine, 'shorthand: rewritten stream contains a tool_calls delta');
+  const tcBody = JSON.parse(tcLine.slice(5));
+  const call = tcBody.choices[0].delta.tool_calls[0];
+  assert.strictEqual(call.function.name, 'terminal');
+  assert.strictEqual(JSON.parse(call.function.arguments).timeout, '15');
+  console.log('PASS  minimax shorthand <invoke="terminal"> → tool_calls');
+}
+
 // ── Case 2: no minimax marker → byte-for-byte passthrough ──
 {
   const plainText = 'Просто текст без вызовов инструментов.';

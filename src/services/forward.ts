@@ -46,6 +46,7 @@ import {
   registerReapable,
   unregisterReapable,
   startZombieReaper,
+  memberFailures,
   type AliasGroupSpec,
 } from './concurrency-queue';
 import { allProviders } from '../providers';
@@ -68,6 +69,16 @@ const HOP_BY_HOP = new Set([
 
 const OVERWHELMED_MESSAGE =
   'I am a bit overwhelmed. Let me take a deep breath and continue.';
+
+/**
+ * During a fallback-chain walk, skip a candidate provider:model that has
+ * failed this many times in the last hour. Free/leaky upstreams (gonka family)
+ * fail a lot; re-trying them every request burns time (and cron/agent
+ * timeouts) before the reliable paid backstop at the tail of the chain is
+ * reached. Skidding over recently-flaky members lets the fallback converge to
+ * a working model much faster. Healthy models rarely hit this threshold.
+ */
+const FALLBACK_SKIP_FAIL_THRESHOLD = 3;
 
 /**
  * Thrown by 429 handlers when the upstream rejects with
@@ -487,22 +498,76 @@ async function tryFallbackChain(
   }
   if (!chain.length) return false;
 
-  // Find current model's index in chain, start from next
-  let startIndex = 0;
-  for (let si = 0; si < chain.length; si++) {
-    const sr = await resolveModelRoute(chain[si]);
-    if (
-      sr &&
-      sr.provider === originalAdapter.id &&
-      sr.upstreamModel === originalModel
-    ) {
-      startIndex = si + 1;
-      break;
+  // ── Group-aware candidate ordering ───────────────────────────────────
+  // We must STAY within the alias "preferred" group (the group that contains
+  // the failing model) and try its other capable members first. Only once
+  // that whole group is spent do we escalate to later groups / the paid tail.
+  // Within a group, members are ordered by health (fewest recent failures
+  // first) so we avoid flaky ones without abandoning the group.
+  const origKey = `${originalAdapter.id}/${originalModel}`;
+  const groups = requestedModel ? getAliasGroups(requestedModel) ?? [] : [];
+  let preferredGi = -1;
+
+  let ordered: string[] = chain;
+
+  if (groups.length > 0) {
+    const groupEntries: string[][] = groups.map(g => g.members);
+    const totalSet = new Set<string>();
+    for (const members of groupEntries) for (const m of members) totalSet.add(m);
+
+    // Preferred group = first group (in config order) containing the failing model.
+    for (let gi = 0; gi < groupEntries.length && preferredGi < 0; gi++) {
+      if (groupEntries[gi].includes(origKey)) preferredGi = gi;
+    }
+
+    // Convert a raw chain entry "provider/model" to the failure-tracking key
+    // "provider:model" used by memberFailures().
+    const entryToKey = (entry: string): string => {
+      const slash = entry.indexOf('/');
+      if (slash <= 0) return entry;
+      return `${entry.slice(0, slash)}:${entry.slice(slash + 1)}`;
+    };
+
+    // Health-order a group's members (fewest failures first), stable.
+    const healthOrder = (entries: string[]): string[] =>
+      [...entries].sort(
+        (a, b) => memberFailures(entryToKey(a)) - memberFailures(entryToKey(b)),
+      );
+
+    ordered = [];
+    const seen = new Set<string>();
+    const pushMembers = (entries: string[]) => {
+      for (const m of entries) {
+        if (seen.has(m)) continue;
+        seen.add(m);
+        ordered.push(m);
+      }
+    };
+
+    // 1) Stay in the preferred group (all its members, health-ordered),
+    //    except the exact member that just failed.
+    for (let gi = 0; gi < groupEntries.length; gi++) {
+      const isPreferred = gi === preferredGi;
+      let members = healthOrder(groupEntries[gi]);
+      if (isPreferred) {
+        members = members.filter(m => m !== origKey);
+      }
+      pushMembers(members);
+      // Once the preferred group is pushed, everything after is escalation.
+      if (isPreferred) break;
+    }
+    // 2) Escalation groups (config order, each health-ordered).
+    for (let gi = 0; gi < groupEntries.length; gi++) {
+      if (gi === preferredGi) continue;
+      pushMembers(healthOrder(groupEntries[gi]));
+    }
+    // 3) Flat-chain entries not covered by any group (e.g. global remainder).
+    for (const entry of chain) {
+      if (!totalSet.has(entry)) pushMembers([entry]);
     }
   }
 
-  for (let i = startIndex; i < chain.length; i++) {
-    const alias = chain[i];
+  for (const alias of ordered) {
     const route = await resolveModelRoute(alias);
     if (!route) {
       console.warn(
@@ -512,7 +577,7 @@ async function tryFallbackChain(
     }
 
     // Skip models that already failed inside the preferred group pool.
-    if (route && skipGroupMembers.includes(`${route.provider}:${route.upstreamModel}`)) {
+    if (skipGroupMembers.includes(`${route.provider}:${route.upstreamModel}`)) {
       console.log(
         `[fallback] skipping ${route.provider}/${route.upstreamModel} (member already exhausted in group)`,
       );
@@ -537,8 +602,26 @@ async function tryFallbackChain(
         endpointPrefix,
         requestedModel: requestedModelName,
         effectiveModel: route.upstreamModel,
-        message: `skipping fallback chain[${i}] - incompatible with model capabilities`,
+        message: `skipping fallback chain entry - incompatible with model capabilities`,
       });
+      continue;
+    }
+
+    // Escalation circuit breaker: once we've left the preferred group, skip
+    // candidates that have failed repeatedly in the last hour so we don't re-try
+    // flaky members while moving toward the reliable backstop. Within the
+    // preferred group we do NOT hard-skip — we simply health-order, so we keep
+    // trying its capable members before ever leaving the group.
+    const fbFails = memberFailures(`${route.provider}:${route.upstreamModel}`);
+    if (
+      preferredGi < 0 &&
+      fbFails >= FALLBACK_SKIP_FAIL_THRESHOLD
+    ) {
+      // Only applied when there is no recognized preferred group at all
+      // (e.g. global fallback without alias groups).
+      console.log(
+        `[fallback] skipping ${route.provider}/${route.upstreamModel} (circuit breaker: ${fbFails} fails/h)`,
+      );
       continue;
     }
 
@@ -550,7 +633,7 @@ async function tryFallbackChain(
       endpointPrefix,
       requestedModel: requestedModelName,
       effectiveModel: originalModel,
-      message: `${label}, falling back to ${route.provider}/${route.upstreamModel} (chain[${i}])`,
+      message: `${label}, falling back to ${route.provider}/${route.upstreamModel}`,
     });
 
     try {
@@ -571,7 +654,7 @@ async function tryFallbackChain(
         endpointPrefix,
         requestedModel: requestedModelName,
         effectiveModel: route.upstreamModel,
-        message: `fallback chain[${i}] also failed, trying next`,
+        message: `fallback entry also failed, trying next`,
       });
     }
   }
@@ -753,7 +836,9 @@ function normalizeContentBlocks(messages: ChatMessage[]): ChatMessage[] {
  * content, and set finish_reason to "tool_calls", so Hermes can execute it.
  */
 const MINIMAX_TOOLCALL_XML_RE = /<minimax:tool_call>([\s\S]*?)<\/minimax:tool_call>/g;
-const MINIMAX_INVOKE_RE = /<invoke\s+name=["']([^"']+)\s*["']>([\s\S]*?)<\/invoke>/g;
+// Accept `name=`, and the MiniMax shorthand where `name` is dropped but the
+// `=` is kept and the space before it is omitted (`<invoke="terminal">`).
+const MINIMAX_INVOKE_RE = /<invoke\s*(?:name\s*)?=?\s*["']([^"']+)\s*["']>([\s\S]*?)<\/invoke>/g;
 const MINIMAX_PARAM_RE = /<parameter\s+name=["']([^"']+)\s*["']>([\s\S]*?)<\/parameter>/g;
 
 function unescapeXml(s: string): string {
