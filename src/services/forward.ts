@@ -742,6 +742,207 @@ function normalizeContentBlocks(messages: ChatMessage[]): ChatMessage[] {
 }
 
 /**
+ * MiniMax S2/agentic tool calls arrive as XML embedded in assistant `content`
+ * (no `tool_calls` array), e.g.:
+ *
+ *   <minimax:tool_call>
+ *     <invoke name="terminal"><parameter name="command">ls</parameter></invoke>
+ *   </minimax:tool_call>
+ *
+ * Convert any such block into standard OpenAI `tool_calls`, strip the XML from
+ * content, and set finish_reason to "tool_calls", so Hermes can execute it.
+ */
+const MINIMAX_TOOLCALL_XML_RE = /<minimax:tool_call>([\s\S]*?)<\/minimax:tool_call>/g;
+const MINIMAX_INVOKE_RE = /<invoke\s+name=["']([^"']+)\s*["']>([\s\S]*?)<\/invoke>/g;
+const MINIMAX_PARAM_RE = /<parameter\s+name=["']([^"']+)\s*["']>([\s\S]*?)<\/parameter>/g;
+
+function unescapeXml(s: string): string {
+  return s
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>');
+}
+
+/** Extract MiniMax `<invoke>` tool calls from content, or null if none present. */
+function parseMiniMaxToolCalls(content: string): Array<{ name: string; args: Record<string, string> }> | null {
+  if (content.indexOf('<invoke') === -1 && content.indexOf('minimax:tool_call') === -1) return null;
+  const blocks = content.match(MINIMAX_TOOLCALL_XML_RE);
+  const calls: Array<{ name: string; args: Record<string, string> }> = [];
+  const sources = blocks && blocks.length ? blocks : (content.includes('<invoke') ? [content] : []);
+  for (const block of sources) {
+    let m: RegExpExecArray | null;
+    const invoke = new RegExp(MINIMAX_INVOKE_RE.source, MINIMAX_INVOKE_RE.flags);
+    while ((m = invoke.exec(block))) {
+      const name = m[1].trim();
+      const inner = m[2];
+      const args: Record<string, string> = {};
+      const param = new RegExp(MINIMAX_PARAM_RE.source, MINIMAX_PARAM_RE.flags);
+      let p: RegExpExecArray | null;
+      while ((p = param.exec(inner))) {
+        args[p[1].trim()] = unescapeXml(p[2].trim());
+      }
+      calls.push({ name, args });
+    }
+  }
+  return calls.length ? calls : null;
+}
+
+/** In-place convert the assistant message into standard tool_calls if it carries MiniMax XML. */
+function convertMiniMaxAgenticToolCall(body: unknown): unknown {
+  const root = body as { choices?: Array<{ message?: { role?: string; content?: unknown; tool_calls?: unknown }; finish_reason?: string }> };
+  if (!root || !Array.isArray(root.choices)) return body;
+  let converted = false;
+  for (const choice of root.choices) {
+    const msg = choice?.message;
+    if (!msg || msg.role !== 'assistant') continue;
+    if (Array.isArray(msg.tool_calls) && (msg.tool_calls as unknown[]).length > 0) continue;
+    if (typeof msg.content !== 'string') continue;
+    const calls = parseMiniMaxToolCalls(msg.content as string);
+    if (!calls) continue;
+    // Strip the XML tool-call block(s) from content, collapse leftover blank lines.
+    msg.content = (msg.content as string)
+      .replace(MINIMAX_TOOLCALL_XML_RE, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+    msg.tool_calls = calls.map((c, i) => ({
+      id: `call_minimax_${i}_${c.name.replace(/[^A-Za-z0-9_-]/g, '_')}`,
+      type: 'function',
+      function: {
+        name: c.name,
+        arguments: JSON.stringify(c.args),
+      },
+    }));
+    if (choice.finish_reason && choice.finish_reason !== 'length') {
+      choice.finish_reason = 'tool_calls';
+    }
+    converted = true;
+  }
+  return body;
+}
+
+/** True when the effective model string looks like a MiniMax (M2/agentic) model. */
+export function isMiniMaxModel(model: string): boolean {
+  return /minimax/i.test(model);
+}
+
+/** Serialize an OpenAI-style SSE `data:` frame. */
+function sseFrame(obj: unknown): Buffer {
+  return Buffer.from(`data: ${JSON.stringify(obj)}\n\n`, 'utf8');
+}
+
+/**
+ * A MiniMax M2 / agentic stream has the SAME problem as the non-streaming
+ * responder: tool calls arrive as `<minimax:tool_call>` XML embedded in the
+ * assistant `content` delta instead of an OpenAI `tool_calls` array. The
+ * gonka streaming path buffers the whole SSE body (for garbage detection), so
+ * here we re-synthesize those buffered chunks into an OpenAI-compatible
+ * stream carrying proper `tool_calls` + `finish_reason:"tool_calls"`.
+ *
+ * If no MiniMax XML is present, the original chunks are returned untouched so
+ * normal streams keep their exact byte-for-byte forwarding (no latency cost).
+ */
+export function rewriteStreamForMiniMax(
+  chunks: Buffer[],
+  completionText: string,
+  model: string,
+): Buffer[] {
+  // Only touch MiniMax-style responses: either the effective model is MiniMax,
+  // or the content explicitly carries the `<minimax:tool_call>` marker (covers
+  // aliases whose string doesn't include "minimax").
+  const hasMiniMaxXml =
+    isMiniMaxModel(model) ||
+    completionText.indexOf('minimax:tool_call') !== -1;
+  if (!hasMiniMaxXml) return chunks;
+  if (completionText.indexOf('<invoke') === -1 && completionText.indexOf('minimax:tool_call') === -1) {
+    return chunks;
+  }
+
+  const calls = parseMiniMaxToolCalls(completionText);
+  if (!calls) return chunks;
+
+  // Strip the XML block(s) from the narration, mirroring the non-streaming
+  // converter (collapse leftover blank lines, trim).
+  const narration = (completionText as string)
+    .replace(MINIMAX_TOOLCALL_XML_RE, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  const created = Math.floor(Date.now() / 1000);
+  const out: Buffer[] = [];
+
+  // 1) Role + narration delta.
+  out.push(
+    sseFrame({
+      id: 'chatcmpl-minimax-proxy',
+      object: 'chat.completion.chunk',
+      created,
+      model,
+      choices: [
+        {
+          index: 0,
+          delta: { role: 'assistant', content: narration },
+          finish_reason: null,
+        },
+      ],
+    }),
+  );
+
+  // 2) One delta carrying the full tool_calls array.
+  out.push(
+    sseFrame({
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: calls.map((c, i) => ({
+              index: i,
+              id: `call_minimax_${i}_${c.name.replace(/[^A-Za-z0-9_-]/g, '_')}`,
+              type: 'function',
+              function: { name: c.name, arguments: JSON.stringify(c.args) },
+            })),
+          },
+          finish_reason: null,
+        },
+      ],
+    }),
+  );
+
+  // 3) Final finish_reason frame.
+  out.push(
+    sseFrame({
+      choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+    }),
+  );
+
+  // Preserve the upstream usage frame when stream_options.include_usage was set
+  // (upstream emits it as a final `choices: []` data frame).
+  const joined = Buffer.concat(chunks).toString('utf8');
+  for (const line of joined.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) continue;
+    const data = trimmed.slice(5).trim();
+    if (!data || data === '[DONE]') continue;
+    try {
+      const parsed = JSON.parse(data) as {
+        usage?: unknown;
+        choices?: unknown[];
+      };
+      if (parsed.usage && Array.isArray(parsed.choices) && parsed.choices.length === 0) {
+        out.push(Buffer.from(`data: ${data}\n\n`, 'utf8'));
+        break;
+      }
+    } catch {
+      // ignore malformed SSE lines
+    }
+  }
+
+  out.push(Buffer.from('data: [DONE]\n\n', 'utf8'));
+  return out;
+}
+
+/**
  * Isolate a per-attempt copy of the request, adapted for a specific target
  * model. The original `body` is NEVER mutated — each fallback step starts
  * from the pristine client payload.
@@ -1639,7 +1840,7 @@ async function forwardChatCompletionOnce(
               message: describeForwardError(dumpErr),
             });
           });
-          res.status(retryResp.status).json(retryResp.data);
+          res.status(retryResp.status).json(convertMiniMaxAgenticToolCall(retryResp.data));
           return;
         }
       }
@@ -1746,7 +1947,7 @@ async function forwardChatCompletionOnce(
       });
     });
 
-    res.status(upstream.status).json(upstream.data);
+    res.status(upstream.status).json(convertMiniMaxAgenticToolCall(upstream.data));
     markIncomingDone?.();
   } catch (err) {
     // Re-queue signal must propagate to the queue loop, not fallback.
@@ -1951,9 +2152,10 @@ async function forwardStreamWithGarbageProtection(
     return;
   }
 
-  // Clean output — flush to client
+  // Clean output — flush to client (converting any MiniMax tool-call XML first)
   if (!isGarbage(completionText)) {
-    flushBufferedChunks(res, chunks, upstreamStatus, upstreamHeaders, markIncomingDone);
+    const outChunks = rewriteStreamForMiniMax(chunks, completionText, model);
+    flushBufferedChunks(res, outChunks, upstreamStatus, upstreamHeaders, markIncomingDone);
 
     await recordUsage(
       adapter,

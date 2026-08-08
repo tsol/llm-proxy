@@ -25,7 +25,7 @@ Client (OpenAI SDK / curl)
   └── ...all 8 providers
 ```
 
-## Supported Providers (12)
+## Supported Providers (15)
 
 | Provider | Chat URL | Supports |
 |----------|---------|----------|
@@ -33,6 +33,9 @@ Client (OpenAI SDK / curl)
 | **Gonka-Dahl** | `/gonka-dahl/v1/` | Kimi-K2.6, MiniMax-M2.7 — Dahl inference proxy |
 | **Gonka-API** | `/gonka-api/v1/` | Kimi-K2.6, MiniMax-M2.7 — Supabase edge |
 | **JoinGonka** | `/joingonka/v1/` | Kimi-K2.6, MiniMax-M2.7 — gate.joingonka.ai |
+| **Gonka-Mingles** | `/gonka-mingles/v1/` | Kimi-K2.6, MiniMax-M2.7 — router.mingles.ai |
+| **Gonka-Router-IO** | `/gonka-router-io/v1/` | Kimi-K2.6, MiniMax-M2.7 — gonka router gateway |
+| **Gonkabroker** | `/gonkabroker/v1/` | Kimi-K2.6, MiniMax-M2.7 — gonka broker gateway |
 | **Hyperfusion** | `/hyperfusion/v1/` | MiniMax-M2.7 — LiteLLM proxy |
 | **DeepSeek** | `/deepseek/v1/` | v4-flash (1M context), v4-pro, cache billing |
 | **Google** | `/google/v1/` | Gemini 2.0/2.5 flash, flash-image, pro |
@@ -88,12 +91,11 @@ curl -s http://localhost:5001/deepseek/v1/chat/completions \
 | `GET` | `/v1/models/:id` | Single alias detail (id, provider, upstream, pricing) |
 | `POST` | `/v1/chat/completions` | Chat with alias → fallback chain on failure |
 | `GET` | `/health` | Health check |
-| `GET` | `/v1/router/queue` | Real-time queue + stats (JSON) |
-| `GET` | `/v1/queue` | Queue dashboard (HTML, auto-refresh) |
+| `GET` | `/v1/router/queue` | Real-time queue + stats + throughput (JSON) |
 
 ### Queue API (`GET /v1/router/queue`)
 
-Returns live snapshot of all queues, active requests, and per-model statistics. А вот подробный дашборд описан отдельно — см. `PROXY_DASHBOARD_UI.md` в корне репозитория.
+Returns live snapshot of all queues, active requests, per-model statistics, and rolling throughput (1h / 24h) windows. Полный дашборд описан отдельно — см. `PROXY_DASHBOARD_UI.md` и `src/ui/proxy-dashboard-groq.py` (отдельный HTML-сервер на :8080).
 
 ```json
 {
@@ -117,6 +119,12 @@ Returns live snapshot of all queues, active requests, and per-model statistics. 
   "stats": {
     "gonka:moonshotai/Kimi-K2.6": { "lastStatus": 200, "total": 15, "ok": 12, "fail": 3 }
   },
+  "throughput": {
+    "gonka:moonshotai/Kimi-K2.6": {
+      "h1":  { "count": 5,   "durMs": 2500,  "bytes": 50000,  "tokensOut": 12000, "tps": 4800 },
+      "h24": { "count": 120, "durMs": 60000, "bytes": 1200000, "tokensOut": 300000, "tps": 5000 }
+    }
+  },
   "incoming": [{
     "preview": "first 60 chars of request", "startedAt": 1786142339603
   }],
@@ -134,21 +142,28 @@ Returns live snapshot of all queues, active requests, and per-model statistics. 
 ```
 
 - `perModel` — per-model concurrency queues (waiters in FIFO).
-- `aliasGroups` — per-alias group pools: `strategy` = `random` (FIFO + random member) или `order` (sequential).
+- `aliasGroups` — per-alias group pools: `strategy` = `random` (random free member), `order` (sequential), или `fastest` (самый быстрый свободный member по tokens/sec).
 - `groupConfig` — статическая конфигурация групп алиаса (для дашборда).
-- `stats` — cumulative since proxy start. `lastStatus` is most recent HTTP code.
+- `stats` — cumulative since proxy start. `lastStatus` = последний HTTP-код; **`0` = garbage**; 429/413/5xx/garbage учитываются в `fail`.
+- `throughput` — rolling-окна 1h/24h: `count`, суммарное время ответа `durMs`, отданные байты `bytes`, `tokensOut`, и `tps` (tokens/sec = tokens÷сек, либо bytes÷сек при отсутствии токенов). Записываются только успешные (2xx-3xx) ответы.
 - `incoming` — client→proxy connections currently open. `startedAt` is unix ms.
 - `active` — proxy→upstream requests in-flight, `reqPreview`/`reqSuffix` = first/last 40 chars.
 - `recent` — last 20 completed requests (dashboard shows 10).
 - Zombie connections старше 10 минут вычищается фоновым reaper.
 
-### HTML Dashboard (`GET /v1/queue`)
+### HTML Dashboard (`src/ui/proxy-dashboard-groq.py`)
 
-Готовая страница мониторинга с автообновлением раз в секунду.
+Отдельный самодостаточный HTML-дашборд (Python `http.server` на `:8080`, автообновление 1s). Показывает: группы/алиасы целиком (даже с нулевыми счётчиками), модели со счётчиками success/fail и статусом (`000` = garbage), throughput 1h/24h (`tok/s`), живые/queued запросы, recent-лог. Запуск:
+
+```bash
+PROXY_ENV_FILE=~/.env-proxy python3 src/ui/proxy-dashboard-groq.py
+# открой http://localhost:8080
+# данные берёт из GET http://127.0.0.1:5001/v1/router/queue
+```
 
 ### Per-Provider (`/{provider}/v1/`)
 
-All 12 providers support `GET /{provider}/v1/models` and `POST /{provider}/v1/chat/completions` — no aliases, no fallback, direct pass-through.
+All 15 providers support `GET /{provider}/v1/models` and `POST /{provider}/v1/chat/completions` — no aliases, no fallback, direct pass-through.
 
 ### Aliases (`/v1/aliases`)
 
@@ -195,6 +210,13 @@ Locked aliases (from `.env`) show `"locked": true` — cannot be modified via AP
 
 Per-provider paths have **no fallback** — they return upstream errors directly.
 
+Every failed attempt (429/413/5xx/402/network/garbage) is recorded in per-model `stats`: `fail++` and `lastStatus`. **Garbage is stored as `lastStatus: 0`** (отображается как `000 · garbage` в дашборде) — а не как фейковый `200`.
+
+### Gonka-family & MiniMax message handling
+
+- **Request normalization**: провайдеры gonka-family требуют `messages[].content` как массив блоков `[{type:"text",text:"…"}]`. Прокси автоматически нормализует строковый `content` в массив блоков и убирает пустой `content` у assistant-сообщений с `tool_calls` (для всех gonka-провайдеров; остальные провайдеры не затрагиваются).
+- **MiniMax agentic tool calls**: MiniMax S2 иногда возвращает вызов инструмента как XML в `content` (`<minimax:tool_call><invoke name="…"><parameter name="…">…</parameter></invoke></minimax:tool_call>`) вместо стандартного `tool_calls`. Для **sync**-ответов прокси конвертирует такой XML в стандартный `tool_calls` (вырезает XML из `content`, ставит `finish_reason:"tool_calls"`). Streaming-конвертация — в планах.
+
 ## Configuration
 
 ### Config file location
@@ -230,7 +252,7 @@ All env vars are documented in `.env.example`. Key groups:
 Each alias has a **name** (what you ask for in `/v1/chat/completions`) and a **fallback chain** — an ordered list of `provider/model` entries. When a provider fails (rate limit, garbage, timeout, 5xx), the proxy silently tries the next entry.
 
 **Resolution rules for `provider/model`:**
-- Provider part (`gonka`, `deepseek`, `groq`, etc.) matches one of the 8 supported providers
+- Provider part (`gonka`, `deepseek`, `groq`, etc.) matches one of the 15 supported providers
 - Model part is resolved **by suffix** — proxy matches it against the upstream catalog
 - Examples:
   - `gonka/Kimi-K2.6` → matches upstream `moonshotai/Kimi-K2.6` (suffix match)
@@ -259,23 +281,34 @@ anything/Kimi-K2.6               # any prefix, suffix match
    ```
    The `TRY` value is a comma-separated fallback chain — proxy runs left to right.
 
-2. **`store/aliases.json` (user-managed)** — persisted, editable via `/v1/aliases` API.
+2. **`store/aliases.json` (user-managed, v2)** — persisted, editable via `/v1/aliases` API. Each alias has named **groups**, каждый с `strategy` и списком `members`:
    ```json
    {
-     "version": 1,
+     "version": 2,
      "aliases": {
-       "kimi": [
-         "gonka/Kimi-K2.6",
-         "gonka/MiniMaxAI/MiniMax-M2.7",
-         "deepseek/deepseek-v4-flash"
-       ],
-       "my-fast": [
-         "groq/llama-4-maverick-17b-instruct",
-         "cerebras/gpt-oss-120b"
-       ]
+       "kimi": {
+         "groups": [
+           { "strategy": "random",
+             "members": [
+               "gonka-dahl/moonshotai/Kimi-K2.6",
+               "gonka-api/moonshotai/Kimi-K2.6",
+               "gonka/moonshotai/Kimi-K2.6",
+               "gonkabroker/MiniMaxAI/MiniMax-M2.7"
+             ] },
+           { "strategy": "order",
+             "members": [
+               "hyperfusion/MiniMaxAI/MiniMax-M2.7",
+               "deepseek/deepseek-v4-flash"
+             ] }
+         ]
+       }
      }
    }
    ```
+   `strategy` per group: `random` | `order` | `fastest`.
+   - `random` — случайный свободный member.
+   - `order` — первый свободный member.
+   - `fastest` — свободный member с максимальным `tps` (1h window, fallback 24h; неизмеренные — последними, ties random). Питается из `throughput` в `/v1/router/queue`.
 
 **Alias API examples:**
 ```bash
