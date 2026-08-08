@@ -827,6 +827,19 @@ export function isMiniMaxModel(model: string): boolean {
   return /minimax/i.test(model);
 }
 
+/**
+ * Should an upstream HTTP status trigger a fallback attempt along the alias
+ * chain? Intentionally maximally resilient: ANY 4xx/5xx from the upstream is
+ * treated as a provider/route-level failure (bad/rotated key, paused account,
+ * missing model, quota, outage) — a different provider in the chain usually
+ * avoids it. Passing such errors straight to the client is what used to take
+ * down whole cron jobs over a single provider's bad key, so we now always try
+ * the fallback chain first and only surface the error if the chain is spent.
+ */
+export function isRetryableUpstreamStatus(status: number): boolean {
+  return status >= 400;
+}
+
 /** Serialize an OpenAI-style SSE `data:` frame. */
 function sseFrame(obj: unknown): Buffer {
   return Buffer.from(`data: ${JSON.stringify(obj)}\n\n`, 'utf8');
@@ -1407,8 +1420,8 @@ async function forwardChatCompletionOnce(
         return;
       }
 
-      // Upstream 5xx — drain body, dump, try fallback chain
-      if (upstreamStatus >= 500) {
+      // Upstream 4xx/5xx — drain body, dump, try fallback chain
+      if (isRetryableUpstreamStatus(upstreamStatus)) {
         let errorBody = '';
         await new Promise<void>((resolve) => {
           upstream!.data.on('data', (chunk: Buffer) => {
@@ -1708,8 +1721,8 @@ async function forwardChatCompletionOnce(
       if (rerouted) return;
     }
 
-    // Upstream 5xx or 402 (insufficient balance) — try fallback chain before passing through to client
-    if (upstream.status >= 500 || upstream.status === 402) {
+    // Upstream 4xx/5xx or 402 — try fallback chain before passing through to client
+    if (isRetryableUpstreamStatus(upstream.status)) {
       recordModelResponse(`${adapter.id}:${model}`, upstream.status);
       recordRequestEnd(reqId, upstream.status, `upstream-${upstream.status}`);
       await logRequestDump({
