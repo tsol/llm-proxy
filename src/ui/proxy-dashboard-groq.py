@@ -856,6 +856,10 @@ HTML_CONTENT = r"""<!DOCTYPE html>
           <div class="bar-wrap"><div class="bar ${full ? 'full' : ''}" style="width:${pct}%"></div></div>
           ${(g.members || []).map(m => {
             const mp = m.limit ? Math.min(100, (m.active / m.limit) * 100) : 0;
+            const s = (data.stats || {})[`${m.provider}:${m.model}`];
+            const stTotal = (s && s.total) || 0;
+            const stOk = (s && s.ok) || 0;
+            const stFail = (s && s.fail) || 0;
             return `
               <div class="member">
                 <div style="min-width:0">
@@ -865,6 +869,11 @@ HTML_CONTENT = r"""<!DOCTYPE html>
                 <div style="display:flex;align-items:center;gap:12px">
                   <span class="slots">${m.active}/${m.limit}</span>
                   <div class="member-bar"><div style="width:${mp}%"></div></div>
+                </div>
+                <div style="display:flex;gap:12px;margin-top:10px;font-family:var(--mono);font-size:12px">
+                  <span style="color:var(--text)">${stTotal} total</span>
+                  <span style="color:var(--ok)">${stOk} ok</span>
+                  <span style="color:var(--fail)">${stFail} fail</span>
                 </div>
               </div>`;
           }).join('')}

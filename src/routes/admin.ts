@@ -1,13 +1,11 @@
 import { Router, type Request, type Response } from 'express';
-import fs from 'fs';
-import path from 'path';
 import { listCatalogModels, refreshCatalog, resolveModelRoute, getProviderStates } from '../catalog';
 import { getDefaultSnapshot, setDefault } from '../default-model';
 import { getProvider, providerIds, allProviders } from '../providers';
 import { serializeCatalogModelDetail } from '../model-response';
 import { getLiveQuota } from '../services/rate-limit-tracker';
 import { concurrencySnapshot, updateAliasChainConfig } from '../services/concurrency-queue';
-import { getAliasGroups } from '../services/alias-store';
+import { getAliasGroups, listAliases } from '../services/alias-store';
 
 export const adminRouter = Router();
 
@@ -23,16 +21,13 @@ adminRouter.get('/router/status', async (_req: Request, res: Response) => {
 });
 
 adminRouter.get('/router/queue', (_req: Request, res: Response) => {
-  const groups = getAliasGroups('kimi');
-  if (groups) {
-    updateAliasChainConfig(groups, allProviders());
+  const aliasGroups = listAliases()
+    .map(a => ({ alias: a.alias, groups: getAliasGroups(a.alias) ?? [] }))
+    .filter(a => a.groups.length > 0);
+  if (aliasGroups.length) {
+    updateAliasChainConfig(aliasGroups, allProviders());
   }
   res.json(concurrencySnapshot());
-});
-
-adminRouter.get('/queue', (_req: Request, res: Response) => {
-  res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.send(fs.readFileSync(path.join(__dirname, '..', 'public', 'queue.html'), 'utf8'));
 });
 
 adminRouter.get('/router/providers', (_req: Request, res: Response) => {

@@ -433,39 +433,33 @@ export function buildAliasGroupSpecs(
   return specs;
 }
 
-// Cached alias chain config for dashboard
+// Cached complete alias group specs for dashboard (incl. idle groups with zero counters)
+let cachedAliasGroupSpecs: AliasGroupSpec[] = [];
+// Cached flat alias chain config for dashboard
 let cachedAliasChain: Array<{ provider: string; model: string; limit: number; group: number; strategy: string }> = [];
 
 export function updateAliasChainConfig(
-  groups: Array<{ strategy: string; members: string[] }>,
+  aliasGroups: Array<{ alias: string; groups: Array<{ strategy: string; members: string[] }> }>,
   adapters: Array<{ id: string; config: { modelQuirks?: Record<string, { concurrent?: number }> } }>,
 ): void {
-  const entries: Array<{ provider: string; model: string; limit: number; group: number; strategy: string }> = [];
-  for (let gi = 0; gi < groups.length; gi++) {
-    const g = groups[gi];
-    for (const entry of g.members) {
-      const parts = entry.split('/');
-      if (parts.length < 2) continue;
-      const provider = parts[0];
-      const model = parts.slice(1).join('/');
-      let limit = 0;
-      const quirks = adapters.find(a => a.id === provider)?.config.modelQuirks ?? {};
-      const exact = quirks[model];
-      if (exact?.concurrent !== undefined && exact.concurrent > 0) {
-        limit = exact.concurrent;
-      } else {
-        const shortModel = model.split('/').pop()!;
-        for (const [qk, qv] of Object.entries(quirks)) {
-          if (qk.endsWith('/' + shortModel) && qv.concurrent !== undefined && qv.concurrent > 0) {
-            limit = qv.concurrent;
-            break;
-          }
-        }
+  const specs: AliasGroupSpec[] = [];
+  const chain: Array<{ provider: string; model: string; limit: number; group: number; strategy: string }> = [];
+  for (const ag of aliasGroups) {
+    for (const spec of buildAliasGroupSpecs(ag.groups, adapters, ag.alias)) {
+      specs.push(spec);
+      for (const m of spec.members) {
+        chain.push({
+          provider: m.provider,
+          model: m.model,
+          limit: m.limit,
+          group: chain.length,
+          strategy: spec.strategy,
+        });
       }
-      entries.push({ provider, model, limit, group: gi, strategy: g.strategy });
     }
   }
-  cachedAliasChain = entries;
+  cachedAliasGroupSpecs = specs;
+  cachedAliasChain = chain;
 }
 
 // ═══════════════════════════════════════════════════════
@@ -504,23 +498,26 @@ export function concurrencySnapshot(): ConcurrencySnapshot {
     });
   }
 
-  const aliasGroups: ConcurrencySnapshot['aliasGroups'] = [];
-  for (const [key, state] of aliasGroupStates.entries()) {
-    aliasGroups.push({
-      key,
-      alias: key.split(':')[0],
-      strategy: state.members.length > 0 ? (key.includes(':g0') ? 'random' : 'order') : 'random',
-      active: state.totalActive,
-      limit: state.totalLimit,
-      members: state.members.map(m => ({
-        provider: m.provider,
-        model: m.model,
-        active: state.activeByKey.get(m.key) ?? 0,
-        limit: m.limit,
-      })),
-      waiters: state.waiters.map(w => ({ preview: w.preview })),
-    });
-  }
+  // Alias groups: always emit the full configured chain (incl. idle groups with
+  // zero counters), merging live state where a request has touched the group.
+  const aliasGroups: ConcurrencySnapshot['aliasGroups'] = cachedAliasGroupSpecs.map(spec => {
+    const state = aliasGroupStates.get(spec.key);
+    const members = spec.members.map(m => ({
+      provider: m.provider,
+      model: m.model,
+      active: state ? (state.activeByKey.get(m.key) ?? 0) : 0,
+      limit: m.limit,
+    }));
+    return {
+      key: spec.key,
+      alias: spec.alias,
+      strategy: spec.strategy,
+      active: state?.totalActive ?? 0,
+      limit: state?.totalLimit ?? spec.members.reduce((s, m) => s + m.limit, 0),
+      members,
+      waiters: state ? state.waiters.map(w => ({ preview: w.preview })) : [],
+    };
+  });
 
   return {
     perModel, aliasGroups,
