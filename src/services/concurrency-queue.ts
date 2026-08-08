@@ -137,6 +137,10 @@ interface LiveRequest {
   respPreview: string;
   startedAt: number;
   status: number | null;
+  /** Last time a stream chunk (or sync response) arrived from upstream. */
+  lastChunkAt: number;
+  /** Cumulative upstream bytes received so far. */
+  bytes: number;
 }
 
 interface IncomingRequest {
@@ -212,10 +216,21 @@ export function recordRequestStart(key: string, provider: string, model: string,
     reqSuffix: clean.length > 40 ? clean.slice(-40) : '',
     respPreview: '',
     startedAt: Date.now(),
+    lastChunkAt: Date.now(),
+    bytes: 0,
     status: null,
   };
   liveRequests.set(id, lr);
   return id;
+}
+
+/** Record upstream activity (bytes received) for a live request and refresh
+ *  its last-activity timestamp. Used by idle-timeout monitoring. */
+export function touchLiveRequest(id: string, bytesDelta: number): void {
+  const lr = liveRequests.get(id);
+  if (!lr) return;
+  lr.lastChunkAt = Date.now();
+  if (bytesDelta > 0) lr.bytes += bytesDelta;
 }
 
 export function recordRequestEnd(id: string, status: number, respPreview: string): void {
@@ -629,7 +644,7 @@ export interface ConcurrencySnapshot {
   stats: Record<string, { lastStatus: number; total: number; ok: number; fail: number }>;
   throughput: Record<string, { h1: ThroughputWindow; h24: ThroughputWindow }>;
   incoming: Array<{ preview: string; startedAt: number }>;
-  active: Array<{ key: string; provider: string; model: string; reqPreview: string; reqSuffix: string; startedAt: number }>;
+  active: Array<{ key: string; provider: string; model: string; reqPreview: string; reqSuffix: string; startedAt: number; lastChunkAt: number; bytes: number }>;
   recent: Array<{ key: string; provider: string; model: string; reqPreview: string; respPreview: string; status: number; startedAt: number }>;
 }
 
@@ -699,6 +714,7 @@ export function concurrencySnapshot(): ConcurrencySnapshot {
     active: [...liveRequests.values()].map(lr => ({
       key: lr.key, provider: lr.provider, model: lr.model,
       reqPreview: lr.reqPreview, reqSuffix: lr.reqSuffix, startedAt: lr.startedAt,
+      lastChunkAt: lr.lastChunkAt, bytes: lr.bytes,
     })),
     recent: [...recentRequests]
       .sort((a, b) => b.startedAt - a.startedAt)

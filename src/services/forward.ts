@@ -43,6 +43,7 @@ import {
   recordRequestEnd,
   recordIncomingStart,
   recordIncomingEnd,
+  touchLiveRequest,
   registerReapable,
   unregisterReapable,
   startZombieReaper,
@@ -79,6 +80,40 @@ const OVERWHELMED_MESSAGE =
  * a working model much faster. Healthy models rarely hit this threshold.
  */
 const FALLBACK_SKIP_FAIL_THRESHOLD = 3;
+
+/**
+ * AbortController + "no response yet" deadline. If the upstream hasn't sent an
+ * HTTP response (headers/status) within `ms`, the signal is aborted — this
+ * covers connections that hang BEFORE any stream bytes arrive (the phase my
+ * per-chunk idle timer can't see). Call `.ok()` once the upstream has
+ * responded so long-but-active streams are never affected. `ms <= 0` disables.
+ */
+function makeUpstreamAbort(
+  ms: number,
+  label: string,
+): { signal: AbortSignal; ok(): void; abort(): void } {
+  const ctrl = new AbortController();
+  let timer: NodeJS.Timeout | null = null;
+  if (ms > 0) {
+    timer = setTimeout(() => {
+      if (!ctrl.signal.aborted) {
+        console.log(
+          `[upstream] no response in ${Math.round(ms / 1000)}s, aborting ${label}`,
+        );
+        ctrl.abort();
+      }
+    }, ms);
+  }
+  return {
+    signal: ctrl.signal,
+    ok() {
+      if (timer) { clearTimeout(timer); timer = null; }
+    },
+    abort() {
+      if (!ctrl.signal.aborted) ctrl.abort();
+    },
+  };
+}
 
 /**
  * Thrown by 429 handlers when the upstream rejects with
@@ -357,6 +392,7 @@ async function bufferedStreamRequest(
   url: string,
   payload: ChatCompletionRequest,
   headers: Record<string, string>,
+  upstreamAbort?: { signal: AbortSignal; ok(): void; abort(): void },
 ): Promise<{
   completionText: string;
   streamUsage: UsageBreakdown | null;
@@ -369,7 +405,11 @@ async function bufferedStreamRequest(
     headers,
     responseType: 'stream',
     validateStatus: () => true,
+    signal: upstreamAbort?.signal,
   });
+  // Response (headers) received — the pre-response deadline is done; the
+  // buffered per-chunk idle watchdog handles the streaming phase from here.
+  upstreamAbort?.ok();
 
   const upstreamFailed = upstream.status >= 400;
   const upstreamHeaders: Record<string, string> = {};
@@ -394,20 +434,31 @@ async function bufferedStreamRequest(
       stream.on('error', () => { clearTimeout(timer); stream.destroy?.(); resolve(); });
     });
   } else {
-    // Success stream: timeout at 300s (5 min) to prevent hung connections
-    const STREAM_TIMEOUT_MS = 300_000;
+    // Success stream: inactivity timeout (no bytes for STREAM_IDLE_TIMEOUT_MS)
+    // to catch silently-hung upstreams early. Reset on every data chunk.
+    const STREAM_IDLE_MS =
+      appConfig.streamIdleTimeoutMs > 0
+        ? appConfig.streamIdleTimeoutMs
+        : 300_000;
     await new Promise<void>((resolve, reject) => {
       const stream = upstream.data as NodeJS.ReadableStream & { destroy?: () => void };
+      const idleS = Math.round(STREAM_IDLE_MS / 1000);
       let timer = setTimeout(() => {
         stream.destroy?.();
-        reject(new Error(`stream timeout after ${STREAM_TIMEOUT_MS / 1000}s`));
-      }, STREAM_TIMEOUT_MS);
+        console.log(
+          `[stream] abort (buffered) idle=${idleS}s (STREAM_IDLE_TIMEOUT_MS)`,
+        );
+        reject(new Error(`stream idle timeout after ${idleS}s (no upstream data)`));
+      }, STREAM_IDLE_MS);
       stream.on('data', (chunk: Buffer) => {
         clearTimeout(timer);
         timer = setTimeout(() => {
           stream.destroy?.();
-          reject(new Error(`stream timeout after ${STREAM_TIMEOUT_MS / 1000}s`));
-        }, STREAM_TIMEOUT_MS);
+          console.log(
+            `[stream] abort (buffered) idle=${idleS}s (STREAM_IDLE_TIMEOUT_MS)`,
+          );
+          reject(new Error(`stream idle timeout after ${idleS}s (no upstream data)`));
+        }, STREAM_IDLE_MS);
         chunks.push(chunk);
         const text = chunk.toString('utf8');
         completionText += extractStreamText(text);
@@ -1310,10 +1361,27 @@ async function forwardChatCompletionOnce(
     `${adapter.id}:${model}`, adapter.id, model,
     requestCtx.userRequestPreview,
   );
-  // Reaper: kill upstream stream if it hangs > limit
+  // Reaper: kill upstream request if it hangs (no response / no bytes) beyond
+  // limits. __abortOutbound actually aborts the pending upstream HTTP request,
+  // and the client socket is destroyed so Hermes learns immediately instead of
+  // waiting for its own 900s reconnect.
   const reqStartedAt = Date.now();
+  const upstreamAbort = makeUpstreamAbort(
+    appConfig.streamIdleTimeoutMs,
+    `${adapter.id}/${model}`,
+  );
   const outboundAbort = { aborted: false };
-  registerReapable({ id: reqId, kind: 'outgoing', startedAt: reqStartedAt, destroy: () => { outboundAbort.aborted = true; (res as any).__abortOutbound?.(); } });
+  // Real abort hook for the zombie reaper (and any internal kill): abort the
+  // pending upstream HTTP request via its AbortController.
+  (res as any).__abortOutbound = (): void => upstreamAbort.abort();
+  registerReapable({
+    id: reqId, kind: 'outgoing', startedAt: reqStartedAt,
+    destroy: () => {
+      outboundAbort.aborted = true;
+      (res as any).__abortOutbound?.();
+      if (!res.writableEnded && !res.destroyed) res.destroy();
+    },
+  });
 
   // Isolate a per-attempt copy of the request adapted for this model.
   // The original `body` is never mutated — every fallback step starts
@@ -1357,6 +1425,7 @@ async function forwardChatCompletionOnce(
         canRetry,
         reqId,
         markIncomingDone,
+        upstreamAbort,
       );
       return;
     }
@@ -1375,8 +1444,12 @@ async function forwardChatCompletionOnce(
           headers,
           responseType: 'stream',
           validateStatus: () => true,
+          signal: upstreamAbort.signal,
         },
       );
+      // Response (headers) received — the pre-response deadline is done;
+      // the per-chunk idle watchdog handles the streaming phase from here.
+      upstreamAbort.ok();
       const upstreamStatus = upstream.status;
       const upstreamFailed = upstreamStatus >= 400;
 
@@ -1588,7 +1661,37 @@ async function forwardChatCompletionOnce(
       }
 
       await new Promise<void>((resolve, reject) => {
+        // Idle watchdog: if the upstream sends NO bytes for
+        // STREAM_IDLE_TIMEOUT_MS, the connection is silently hung — abort it
+        // and fall back rather than waiting for the 10-min zombie reaper.
+        // Active streams reset the timer on every chunk.
+        const idleMs = appConfig.streamIdleTimeoutMs;
+        let idleTimer: NodeJS.Timeout | null = null;
+        let liveBytes = 0;
+        const clearIdle = (): void => {
+          if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+        };
+        const armIdle = (): void => {
+          if (idleMs <= 0) return;
+          clearIdle();
+          idleTimer = setTimeout(() => {
+            clearIdle();
+            const idleS = Math.round(idleMs / 1000);
+            console.log(
+              `[stream] abort ${adapter.id}/${model} idle=${idleS}s bytes=${liveBytes} (STREAM_IDLE_TIMEOUT_MS)`,
+            );
+            (
+              upstream?.data as NodeJS.ReadableStream & { destroy?: () => void }
+            )?.destroy?.();
+            if (!res.writableEnded && !res.destroyed) res.destroy();
+            markIncomingDone?.();
+            reject(new Error(`stream idle timeout after ${idleS}s (no upstream data)`));
+          }, idleMs);
+        };
+
         upstream!.data.on('data', (chunk: Buffer) => {
+          touchLiveRequest(reqId, chunk.length);
+          liveBytes += chunk.length;
           const text = chunk.toString('utf8');
           if (upstreamFailed) {
             rawErrorBody += text;
@@ -1603,20 +1706,27 @@ async function forwardChatCompletionOnce(
           ) {
             (res as Response & { flush?: () => void }).flush?.();
           }
+          armIdle();
         });
         upstream!.data.on('end', () => {
+          clearIdle();
           res.end();
           markIncomingDone?.();
           resolve();
         });
-        upstream!.data.on('error', reject);
+        upstream!.data.on('error', (err) => {
+          clearIdle();
+          reject(err);
+        });
         res.on('close', () => {
+          clearIdle();
           (
             upstream?.data as NodeJS.ReadableStream & {
               destroy?: () => void;
             }
           )?.destroy?.();
         });
+        armIdle();
       });
 
       const finalStatus = upstream?.status ?? 502;
@@ -1726,7 +1836,10 @@ async function forwardChatCompletionOnce(
     const upstream = await resilientPost(url, patchedPayload, {
       headers,
       validateStatus: () => true,
+      signal: upstreamAbort.signal,
     });
+    // Response received — the pre-response deadline no longer applies.
+    upstreamAbort.ok();
 
     // Rate-limit fallback: 429 or 413 (TPM exceeded) → try chain
     if (upstream.status === 429 || upstream.status === 413) {
@@ -2133,6 +2246,7 @@ async function forwardStreamWithGarbageProtection(
   canRetry = true,
   reqId = '',
   markIncomingDone?: () => void,
+  upstreamAbort?: { signal: AbortSignal; ok(): void; abort(): void },
 ): Promise<void> {
   const requestedModelName = String(body.model ?? '');
   let completionText = '';
@@ -2143,7 +2257,7 @@ async function forwardStreamWithGarbageProtection(
   let errorDetail: string | undefined;
 
   try {
-    const result = await bufferedStreamRequest(url, payload, headers);
+    const result = await bufferedStreamRequest(url, payload, headers, upstreamAbort);
     completionText = result.completionText;
     streamUsage = result.streamUsage;
     chunks = result.chunks;

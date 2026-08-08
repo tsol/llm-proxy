@@ -118,6 +118,11 @@ export const appConfig = {
    *  "too many concurrent requests" 429 before giving up. After the
    *  last attempt it proceeds to the normal fallback/429 path. */
   retryLoopCounter: envNum('RETRY_LOOP_COUNTER', 1),
+  /** Max seconds of upstream SILENCE (no stream bytes / no response) before the
+   *  proxy force-aborts an in-flight request and falls back. Active streams
+   *  reset this timer on every chunk, so only silent hangs are killed early.
+   *  0 disables. Set via STREAM_IDLE_TIMEOUT_MS (default 120s). */
+  streamIdleTimeoutMs: envNum('STREAM_IDLE_TIMEOUT_MS', 120) * 1000,
   /** When true, the preferred-group pool picks a random free member
    *  instead of the first one in chain order. Spreads load across all
    *  providers in the pool (e.g. gonka + gonka-dahl) instead of
