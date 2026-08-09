@@ -1,5 +1,6 @@
 import type { ProviderAdapter } from '../types';
 import { appConfig } from '../config';
+import { recordBanSignal, isModelBanned } from './ban';
 
 /**
  * Per-key FIFO concurrency limiter.
@@ -178,12 +179,29 @@ export function unregisterReapable(id: string): void {
 }
 
 let reaperStarted = false;
+/** Ban models whose live request is silently hanging: present in the pool with
+ *  ZERO bytes received for >= BAN_FROM_GROUP_WHEN_ZERO_BYTE_SECONDS. These never
+ *  complete, so they'd never reach recordModelResponse() — this is what catches
+ *  the "silent hanger" case (e.g. gonka-mingles). */
+function checkZeroByteBans(): void {
+  if (!appConfig.banEnabled) return;
+  const idleMs = appConfig.banZeroByteSeconds * 1000;
+  if (idleMs <= 0) return;
+  const now = Date.now();
+  for (const lr of liveRequests.values()) {
+    if (lr.bytes === 0 && now - (lr.lastChunkAt || lr.startedAt) >= idleMs) {
+      recordBanSignal(lr.key, 'zero-byte');
+    }
+  }
+}
+
 export function startZombieReaper(): void {
   if (reaperStarted) return;
   reaperStarted = true;
   setInterval(() => {
     const now = Date.now();
     let cleaned = 0;
+    checkZeroByteBans();
     for (const [id, req] of [...reapable.entries()]) {
       if (now - req.startedAt <= ZOMBIE_MAX_AGE_MS) continue;
       try { req.destroy?.(); } catch { /* ignore */ }
@@ -280,6 +298,8 @@ export function recordModelResponse(
   else {
     s.fail++;
     recordFailure(key);
+    const kind = status === 429 ? '429' : (status === 0 ? 'garbage' : 'fail');
+    recordBanSignal(key, kind);
   }
   // Rolling throughput windows: only measurable successful replies count.
   if (
@@ -470,7 +490,9 @@ function findFreeAliasGroupMember(
   state: AliasGroupState,
   strategy: 'random' | 'order' | 'fastest',
 ): AliasGroupMember | null {
-  const free = state.members.filter(m => (state.activeByKey.get(m.key) ?? 0) < m.limit);
+  const free = state.members.filter(
+    (m) => (state.activeByKey.get(m.key) ?? 0) < m.limit && !isModelBanned(m.key),
+  );
   if (free.length === 0) return null;
   if (strategy === 'random') return free[Math.floor(Math.random() * free.length)];
   if (strategy === 'fastest') {

@@ -123,6 +123,19 @@ export const appConfig = {
    *  reset this timer on every chunk, so only silent hangs are killed early.
    *  0 disables. Set via STREAM_IDLE_TIMEOUT_MS (default 120s). */
   streamIdleTimeoutMs: envNum('STREAM_IDLE_TIMEOUT_MS', 120) * 1000,
+  /** Temporary ban of misbehaving providers/models. When a model trips any
+   *  BAN_FROM_GROUP_WHEN_* criterion within a BAN_WINDOW_MINUTES sliding window,
+   *  it is excluded from the preferred-group pool and the fallback walk for
+   *  BAN_DURATION_HOURS (then returns with a clean slate). */
+  banEnabled: env('BAN_ENABLED') !== 'false',
+  banDurationHours: envNum('BAN_DURATION_HOURS', 5),
+  banWindowMinutes: envNum('BAN_WINDOW_MINUTES', 30),
+  banFailCount: envNum('BAN_FROM_GROUP_WHEN_FAIL_COUNT', 10),
+  ban429Count: envNum('BAN_FROM_GROUP_WHEN_429_COUNT', 25),
+  banGarbageCount: envNum('BAN_FROM_GROUP_WHEN_GARBAGE_COUNT', 5),
+  banTimeoutCount: envNum('BAN_FROM_GROUP_WHEN_TIMEOUT_COUNT', 5),
+  banZeroByteSeconds: envNum('BAN_FROM_GROUP_WHEN_ZERO_BYTE_SECONDS', 240),
+  banZeroByteCount: envNum('BAN_FROM_GROUP_WHEN_ZERO_BYTE_COUNT', 2),
   /** When true, the preferred-group pool picks a random free member
    *  instead of the first one in chain order. Spreads load across all
    *  providers in the pool (e.g. gonka + gonka-dahl) instead of

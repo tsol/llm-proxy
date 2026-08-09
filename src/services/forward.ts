@@ -50,6 +50,7 @@ import {
   memberFailures,
   type AliasGroupSpec,
 } from './concurrency-queue';
+import { isModelBanned } from './ban';
 import { allProviders } from '../providers';
 import {
   messageInputModalities,
@@ -633,6 +634,14 @@ async function tryFallbackChain(
     if (skipGroupMembers.includes(`${route.provider}:${route.upstreamModel}`)) {
       console.log(
         `[fallback] skipping ${route.provider}/${route.upstreamModel} (member already exhausted in group)`,
+      );
+      continue;
+    }
+
+    // Skip temporarily-banned models (silent hangers / repeated failures).
+    if (isModelBanned(`${route.provider}:${route.upstreamModel}`)) {
+      console.log(
+        `[fallback] skipping ${route.provider}/${route.upstreamModel} (banned)`,
       );
       continue;
     }

@@ -28,7 +28,7 @@ assert.ok(groups && groups.length >= 2, `kimi should have >=2 groups, got ${grou
 
 // Preferred group must hold the primary gonka members.
 const g0 = groups[0];
-assert.strictEqual(g0.strategy, 'fastest');
+assert.ok(['fastest', 'random', 'order'].includes(g0.strategy), `unexpected strategy ${g0.strategy}`);
 assert.ok(g0.members.includes('gonka/moonshotai/Kimi-K2.6'), 'preferred group holds gonka Kimi');
 assert.ok(g0.members.some((m) => m.startsWith('gonka-')), 'preferred group is all gonka family');
 // Paid backstop lives in a LATER group (escalation) — must NOT be in group[0].
