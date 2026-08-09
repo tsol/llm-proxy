@@ -335,10 +335,15 @@ export function isPlaceholderOrBlank(text: string): boolean {
  * Gonka collapse is appending `[no visible text]` to the END of a tool-call or
  * narration reply). Keeps all real text, collapses leftover whitespace and
  * trims. Returns '' when only placeholders/whitespace were present.
+ *
+ * IMPORTANT: Do NOT trim leading/trailing spaces when no placeholders were
+ * actually removed — those spaces may be meaningful word-separators in
+ * streaming SSE deltas.
  */
 export function stripPlaceholderTokens(text: string): string {
   if (typeof text !== 'string') return '';
   let out = text.replace(PLACEHOLDER_TOKEN_RE, '');
+  if (out === text) return text; // No placeholders found — return unchanged (preserve spaces!)
   out = out.replace(/\n{3,}/g, '\n\n'); // collapse leftover 3+ blank lines
   return out.trim();
 }
