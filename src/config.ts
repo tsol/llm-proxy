@@ -31,6 +31,13 @@ function envNum(key: string, fallback: number): number {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function envList(key: string): string[] {
+  return (process.env[key] ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 function mergeRateLimits(
   metadata: ProviderRateLimits,
   envPrefix: string,
@@ -69,6 +76,14 @@ export const appConfig = {
   port: envNum('PORT', 5001),
   host: env('HOST', '0.0.0.0'),
   defaultProvider: env('DEFAULT_PROVIDER', 'local') as ProviderId,
+  /**
+   * Providers that should ALWAYS talk to upstream in non-stream (sync) mode.
+   * Gonka-family streaming sometimes drops the leading space of tokens, so
+   * streamed replies come out with words glued together. Forcing sync keeps
+   * normal spaces. Comma-separated provider ids.
+   */
+  forceSyncProviders: envList('FORCE_SYNC_PROVIDERS'),
+  enableForceSync: env('ENABLE_FORCE_SYNC', 'true').toLowerCase() !== 'false',
   fallbackCharsPerToken: envNum('FALLBACK_CHARS_PER_TOKEN', 4),
   fallbackPricing: {
     inputPerMillion: envNum('FALLBACK_INPUT_PRICE_PER_M', 0.3),

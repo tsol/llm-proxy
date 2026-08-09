@@ -29,7 +29,7 @@ import {
   logResponse,
   truncateMiddle,
 } from '../services/request-logger';
-import { isGarbage, analyzeText } from './garbage-detector';
+import { isGarbage, analyzeText, stripPlaceholderTokens } from './garbage-detector';
 import { trackUpstreamHeaders } from './rate-limit-tracker';
 import { logRateLimit } from './rate-limit-logger';
 import {
@@ -1103,6 +1103,130 @@ export function rewriteStreamForMiniMax(
 }
 
 /**
+ * Sanitize a buffered gonka stream whose aggregated `content` collapsed to a
+ * blank/placeholder (e.g. `[no visible text]`).
+ *
+ * Instead of returning the placeholder verbatim (which looks "non-empty" to
+ * the client and stalls sessions) or garbage-falling-back, we strip the
+ * placeholder/whitespace from each `delta.content` while PRESERVING any real
+ * text, `tool_calls`, `role` and `reasoning_content`. A pure-placeholder
+ * stream (no tool calls, no real text) becomes a clean empty completion
+ * (`content:''` + `finish_reason:'stop'`) — Hermes then sees an actual empty
+ * response and its own empty-response recovery nudges the model.
+ *
+ * Returns the sanitized chunks, or `null` when there is nothing to sanitize.
+ */
+export function sanitizePlaceholderStream(
+  chunks: Buffer[],
+  completionText: string,
+  model: string,
+): Buffer[] | null {
+  // Trigger when there is ANY placeholder token to strip (whole-content OR
+  // embedded/suffixed, e.g. `...narration\n response\n\n[no visible text]`).
+  // Empty/whitespace-only content (tool-call streams) is left untouched here —
+  // that's normal and must keep its tool_calls.
+  if (stripPlaceholderTokens(completionText) === completionText) return null;
+  if (!chunks.length) return null;
+
+  const created = Math.floor(Date.now() / 1000);
+  let sawToolCalls = false;
+  let finished = false;
+  let usage: { data: string } | null = null;
+  const out: Buffer[] = [];
+
+  const joined = Buffer.concat(chunks).toString('utf8');
+  for (const line of joined.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) continue;
+    const raw = trimmed.slice(5).trim();
+    if (!raw || raw === '[DONE]') continue;
+
+    let parsed: {
+      id?: string;
+      object?: string;
+      model?: string;
+      created?: number;
+      usage?: unknown;
+      choices?: Array<{
+        index?: number;
+        delta?: {
+          role?: string;
+          content?: string;
+          reasoning_content?: unknown;
+          tool_calls?: unknown;
+        };
+        finish_reason?: string | null;
+      }>;
+    };
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      continue;
+    }
+
+    // Preserve the upstream usage frame (stream_options.include_usage).
+    if (parsed.usage && Array.isArray(parsed.choices) && parsed.choices.length === 0) {
+      usage = { data: raw };
+      continue;
+    }
+
+    const choices = parsed.choices ?? [];
+    if (!choices.length) continue;
+
+    const sanitizedChoices = choices.map((choice) => {
+      const delta = choice.delta ?? {};
+      const newDelta: Record<string, unknown> = {};
+      if (typeof delta.role === 'string') newDelta.role = delta.role;
+      if (delta.reasoning_content !== undefined) {
+        newDelta.reasoning_content = delta.reasoning_content;
+      }
+      if (delta.content !== undefined) {
+        // Strip placeholder tokens from ANYWHERE in this delta (whole or
+        // embedded/suffixed), drop the delta entirely if nothing real remains.
+        const cleaned = stripPlaceholderTokens(delta.content);
+        if (cleaned !== '') newDelta.content = cleaned;
+      }
+      if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
+        newDelta.tool_calls = delta.tool_calls;
+        sawToolCalls = true;
+      }
+      if (typeof choice.finish_reason === 'string') finished = true;
+      return {
+        index: choice.index ?? 0,
+        delta: newDelta,
+        ...(typeof choice.finish_reason === 'string'
+          ? { finish_reason: choice.finish_reason }
+          : {}),
+      };
+    });
+
+    out.push(
+      sseFrame({
+        id: parsed.id ?? 'chatcmpl-proxy-sanitized',
+        object: 'chat.completion.chunk',
+        created: parsed.created ?? created,
+        model: parsed.model ?? model,
+        choices: sanitizedChoices,
+      }),
+    );
+  }
+
+  // If the sanitized stream ends without a finish_reason (and carries no tool
+  // calls), close it cleanly so clients see a normal (empty) completion.
+  if (!finished && !sawToolCalls) {
+    out.push(
+      sseFrame({
+        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      }),
+    );
+  }
+
+  if (usage) out.push(Buffer.from(`data: ${usage.data}\n\n`, 'utf8'));
+  out.push(Buffer.from('data: [DONE]\n\n', 'utf8'));
+  return out;
+}
+
+/**
  * Isolate a per-attempt copy of the request, adapted for a specific target
  * model. The original `body` is NEVER mutated — each fallback step starts
  * from the pristine client payload.
@@ -1365,7 +1489,20 @@ async function forwardChatCompletionOnce(
     adapter.config.apiKey,
     adapter.config.extraHeaders,
   );
-  const streaming = Boolean(body.stream);
+  let streaming = Boolean(body.stream);
+
+  // Some provider families (gonka) drop the leading space of tokens in
+  // streaming, producing replies with glued-together words. When the provider
+  // is listed in FORCE_SYNC_PROVIDERS, downgrade the request to non-stream so
+  // upstream returns normal, properly-spaced text.
+  if (
+    streaming &&
+    appConfig.enableForceSync &&
+    appConfig.forceSyncProviders.includes(adapter.id)
+  ) {
+    streaming = false;
+    body.stream = false;
+  }
 
   // Track live request for dashboard
   const reqId = recordRequestStart(
@@ -2086,6 +2223,24 @@ async function forwardChatCompletionOnce(
           )
         : '';
 
+    // Placeholder/blank content collapse (gonka non-stream) — strip the
+    // `[no visible text]`-family tokens from ANYWHERE in the reply (whole or
+    // embedded suffix). Keeps any real narration and tool_calls. If only
+    // placeholders/whitespace were present, content becomes truly empty and
+    // Hermes' empty-response recovery handles it. NOT a fallback trigger.
+    if (!upstreamFailed) {
+      const firstMsg = (upstream.data as unknown as {
+        choices?: Array<{ message?: { content?: string } }>;
+      })?.choices?.[0]?.message;
+      if (firstMsg && typeof firstMsg.content === 'string') {
+        const cleaned = stripPlaceholderTokens(firstMsg.content);
+        if (cleaned !== firstMsg.content) {
+          firstMsg.content = cleaned;
+          completionText = cleaned;
+        }
+      }
+    }
+
     // Garbage detected in non-streaming output — treat as upstream error, try fallback
     if (!upstreamFailed && completionText && isGarbage(completionText)) {
       recordModelResponse(`${adapter.id}:${model}`, 0);
@@ -2372,6 +2527,46 @@ async function forwardStreamWithGarbageProtection(
       });
       flushBufferedChunks(res, chunks, upstreamStatus, upstreamHeaders, markIncomingDone);
     }
+    return;
+  }
+
+  // Placeholder/blank content (gonka text-channel collapse) — do NOT forward
+  // the raw `[no visible text]` and do NOT garbage-fallback: sanitize it to a
+  // real EMPTY completion and pass through, so Hermes' own empty-response
+  // recovery fires and nudges the model.
+  const sanitized = sanitizePlaceholderStream(chunks, completionText, model);
+  if (sanitized) {
+    // The cleaned text is what the client actually received — log THAT, so the
+    // req/ dump doesn't show the raw `[no visible text]` we already stripped.
+    const cleaned = stripPlaceholderTokens(completionText);
+    flushBufferedChunks(res, sanitized, upstreamStatus, upstreamHeaders, markIncomingDone);
+
+    await recordUsage(adapter, model, streamUsage, promptEstimate, cleaned, requestCtx, {
+      requestBody: body,
+      upstreamUrl: url,
+      status: upstreamStatus,
+      stream: true,
+      responseBody: cleaned,
+    }).catch((err) => {
+      console.error('[request-dump] recordUsage failed:', (err as Error)?.message ?? String(err));
+    });
+
+    logResponse({
+      provider: adapter.id,
+      status: upstreamStatus,
+      preview: cleaned || '[placeholder-blanked]',
+      stream: true,
+      endpointPrefix,
+      requestedModel: requestedModelName,
+      effectiveModel: model,
+      fallbackFrom,
+    });
+    recordModelResponse(
+      `${adapter.id}:${model}`,
+      upstreamStatus,
+      throughputMetrics(reqStartedAt, '', streamUsage?.usage.completion_tokens ?? 0),
+    );
+    recordRequestEnd(reqId, upstreamStatus, '');
     return;
   }
 

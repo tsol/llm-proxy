@@ -278,3 +278,67 @@ export function isGarbage(text: string): boolean {
 
   return false;
 }
+
+/**
+ * Placeholder / blank-equivalent output detection.
+ *
+ * Gonka-family models sometimes collapse the text channel of a reply to a
+ * fixed accessibility-snapshot placeholder like `[no visible text]` (or to
+ * whitespace-only). Such a turn looks "non-empty" to a client (e.g. Hermes),
+ * so its empty-response recovery never fires and the session stalls on it.
+ *
+ * We detect these and let the caller normalise them to a REAL empty content,
+ * so the client's own empty-response handling kicks in. This deliberately
+ * matches ONLY the known placeholder family + whitespace — it never flags:
+ *   - legitimate bracketed prose (`[System note: ...]`, `[ok]`, `[изображение]`),
+ *   - empty content produced by tool-call-only streams (those are fine and
+ *     must keep their tool_calls).
+ */
+const PLACEHOLDER_TOKENS = [
+  'no\\s+visible\\s+text',
+  'no\\s+text',
+  'blank',
+  'empty',
+  'none',
+  'image',
+  'no\\s+content',
+  'spinner',
+];
+
+/**
+ * Matches a single placeholder bracket-token ANYWHERE in a string. Anchored to
+ * the exact bracket family above, so it never touches legit bracketed prose
+ * (`[System note: ...]`, `[ok]`, `[изображение]` etc.).
+ */
+const PLACEHOLDER_TOKEN_RE = new RegExp(
+  `\\[\\s*(?:${PLACEHOLDER_TOKENS.join('|')})\\s*\\]`,
+  'ig',
+);
+
+/**
+ * Whole-string check: is the ENTIRE content just the placeholder/blank family
+ * (or empty / whitespace)? Used to decide "this reply collapsed to nothing".
+ * For stripping an embedded placeholder inside a longer reply use
+ * `stripPlaceholderTokens` instead.
+ */
+export function isPlaceholderOrBlank(text: string): boolean {
+  if (typeof text !== 'string' || text.length === 0) return true; // empty is empty
+  if (text.trim().length === 0) return true; // whitespace-only → empty after trim
+  return new RegExp(
+    `^\\s*\\[\\s*(?:${PLACEHOLDER_TOKENS.join('|')})\\s*\\]\\s*$`,
+    'i',
+  ).test(text); // the `[no visible text]` family as the whole reply
+}
+
+/**
+ * Remove placeholder bracket-tokens from ANYWHERE in the content (the common
+ * Gonka collapse is appending `[no visible text]` to the END of a tool-call or
+ * narration reply). Keeps all real text, collapses leftover whitespace and
+ * trims. Returns '' when only placeholders/whitespace were present.
+ */
+export function stripPlaceholderTokens(text: string): string {
+  if (typeof text !== 'string') return '';
+  let out = text.replace(PLACEHOLDER_TOKEN_RE, '');
+  out = out.replace(/\n{3,}/g, '\n\n'); // collapse leftover 3+ blank lines
+  return out.trim();
+}
