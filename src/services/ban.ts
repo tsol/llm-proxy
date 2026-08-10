@@ -15,7 +15,7 @@ import { appConfig } from '../config';
  *   _ZERO_BYTE_SECONDS / _ZERO_BYTE_COUNT
  */
 
-export type BanKind = 'fail' | '429' | 'garbage' | 'zero-byte' | 'timeout';
+export type BanKind = 'fail' | '429' | 'garbage' | 'zero-byte' | 'timeout' | 'truncated';
 
 interface BanState {
   events: Array<{ ts: number; kind: BanKind }>;
@@ -39,12 +39,41 @@ export function banRemainingSec(key: string): number {
   return Math.round((s.banUntil - Date.now()) / 1000);
 }
 
+export interface BanInfo {
+  key: string;
+  banned: boolean;
+  remainingSec: number;
+}
+
+/** Single-key ban info (provider:model) for dashboards/APIs. */
+export function getBanInfo(key: string): BanInfo {
+  const s = banStates.get(key);
+  const banned = !!s && s.banUntil > Date.now();
+  return {
+    key,
+    banned,
+    remainingSec: banned ? Math.round((s.banUntil - Date.now()) / 1000) : 0,
+  };
+}
+
 /** List of currently banned keys (provider:model). */
 export function bannedKeys(): string[] {
   const now = Date.now();
   const out: string[] = [];
   for (const [k, s] of banStates) {
     if (s.banUntil > now) out.push(k);
+  }
+  return out;
+}
+
+/** Detailed list (key + remaining seconds) of currently banned keys. */
+export function bannedDetailed(): BanInfo[] {
+  const now = Date.now();
+  const out: BanInfo[] = [];
+  for (const [k, s] of banStates) {
+    if (s.banUntil > now) {
+      out.push({ key: k, banned: true, remainingSec: Math.round((s.banUntil - now) / 1000) });
+    }
   }
   return out;
 }
@@ -83,6 +112,7 @@ export function recordBanSignal(key: string, kind: BanKind): void {
   if (B.banGarbageCount > 0 && cnt('garbage') >= B.banGarbageCount) reasons.push(`garbage=${cnt('garbage')}`);
   if (B.banTimeoutCount > 0 && cnt('timeout') >= B.banTimeoutCount) reasons.push(`timeout=${cnt('timeout')}`);
   if (B.banZeroByteCount > 0 && cnt('zero-byte') >= B.banZeroByteCount) reasons.push(`zero-byte=${cnt('zero-byte')}`);
+  if (B.banTruncatedCount > 0 && cnt('truncated') >= B.banTruncatedCount) reasons.push(`truncated=${cnt('truncated')}`);
 
   if (reasons.length === 0) return;
   if (s.banUntil <= now) {

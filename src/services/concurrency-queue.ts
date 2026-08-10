@@ -1,6 +1,6 @@
 import type { ProviderAdapter } from '../types';
 import { appConfig } from '../config';
-import { recordBanSignal, isModelBanned } from './ban';
+import { recordBanSignal, isModelBanned, getBanInfo, bannedDetailed } from './ban';
 
 /**
  * Per-key FIFO concurrency limiter.
@@ -670,6 +670,10 @@ export interface ConcurrencySnapshot {
     active: number; limit: number;
     members: Array<{
       provider: string; model: string; active: number; limit: number;
+      /** True when this provider:model is temporarily banned. */
+      banned: boolean;
+      /** Seconds until the ban lifts (0 when not banned). */
+      banRemainingSec: number;
       /** 1-based selection order per the group strategy (1 = chosen first). */
       rank?: number;
       /** Failures in the last hour. */
@@ -682,6 +686,8 @@ export interface ConcurrencySnapshot {
   groupConfig: Array<{ provider: string; model: string; limit: number; group: number; strategy: string }>;
   stats: Record<string, { lastStatus: number; total: number; ok: number; fail: number }>;
   throughput: Record<string, { h1: ThroughputWindow; h24: ThroughputWindow }>;
+  /** Currently banned provider:model keys with remaining seconds. */
+  bans: Array<{ key: string; remainingSec: number }>;
   incoming: Array<{ preview: string; startedAt: number }>;
   active: Array<{ key: string; provider: string; model: string; reqPreview: string; reqSuffix: string; respHint: string; startedAt: number; lastChunkAt: number; bytes: number }>;
   recent: Array<{ key: string; provider: string; model: string; reqPreview: string; respPreview: string; status: number; startedAt: number }>;
@@ -707,11 +713,14 @@ export function concurrencySnapshot(): ConcurrencySnapshot {
       (m): ConcurrencySnapshot['aliasGroups'][number]['members'][number] => {
         const samples = modelThroughput.get(m.key);
         const h1 = samples ? aggregateThroughput(samples, WINDOW_1H) : undefined;
+        const ban = getBanInfo(m.key);
         return {
           provider: m.provider,
           model: m.model,
           active: state ? (state.activeByKey.get(m.key) ?? 0) : 0,
           limit: m.limit,
+          banned: ban.banned,
+          banRemainingSec: ban.remainingSec,
           failH1: memberFailures(m.key),
           tpsH1: h1?.tps ?? 0,
         };
@@ -747,6 +756,7 @@ export function concurrencySnapshot(): ConcurrencySnapshot {
         { h1: aggregateThroughput(arr, WINDOW_1H), h24: aggregateThroughput(arr, WINDOW_24H) },
       ]),
     ),
+    bans: bannedDetailed().map(b => ({ key: b.key, remainingSec: b.remainingSec })),
     incoming: [...incomingRequests.values()].map(ir => ({
       preview: ir.preview, startedAt: ir.startedAt,
     })),

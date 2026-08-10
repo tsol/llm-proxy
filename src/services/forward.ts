@@ -29,7 +29,7 @@ import {
   logResponse,
   truncateMiddle,
 } from '../services/request-logger';
-import { isGarbage, analyzeText, stripPlaceholderTokens } from './garbage-detector';
+import { isGarbage, analyzeText, stripPlaceholderTokens, hasNoRealContent } from './garbage-detector';
 import { trackUpstreamHeaders } from './rate-limit-tracker';
 import { logRateLimit } from './rate-limit-logger';
 import {
@@ -50,7 +50,7 @@ import {
   memberFailures,
   type AliasGroupSpec,
 } from './concurrency-queue';
-import { isModelBanned } from './ban';
+import { isModelBanned, recordBanSignal } from './ban';
 import { allProviders } from '../providers';
 import {
   messageInputModalities,
@@ -71,6 +71,63 @@ const HOP_BY_HOP = new Set([
 
 const OVERWHELMED_MESSAGE =
   'I am a bit overwhelmed. Let me take a deep breath and continue.';
+
+/**
+ * Inspect buffered SSE chunks to learn how the upstream stream ended.
+ * Returns whether a clean `[DONE]` frame was seen, and the last finish_reason.
+ */
+function streamEndInfo(chunks: Buffer[]): { sawDone: boolean; finishReason?: string } {
+  const joined = Buffer.concat(chunks).toString('utf8');
+  const sawDone = joined.includes('[DONE]');
+  let finishReason: string | undefined;
+  const re = /"finish_reason"\s*:\s*"?([a-z_]+)"?/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(joined)) !== null) {
+    finishReason = m[1];
+  }
+  return { sawDone, finishReason };
+}
+
+/**
+ * Decide whether a response looks truncated / unfinished.
+ *  - Explicit finish_reason === 'length' is a reliable truncation signal.
+ *  - A stream that produced content but never closed cleanly ([DONE]) and never
+ *    emitted a terminal finish_reason (stop/tool_calls) was cut mid-generation
+ *    (idle abort / upstream reset) — also truncated.
+ *  - Purposefully conservative: does NOT flag on punctuation/content heuristics,
+ *    so legitimate replies that simply end abruptly are never penalised.
+ */
+function isTruncatedOutput(hasContent: boolean, end: {
+  sawDone?: boolean;
+  finishReason?: string;
+}): boolean {
+  if (end.finishReason === 'length') return true;
+  // Stream-only heuristic: content was produced but the stream never closed
+  // cleanly ([DONE]) and never emitted a terminal finish_reason (stop/tool_calls)
+  // → cut mid-generation. Only fires when sawDone is defined (i.e. real SSe).
+  if (
+    end.sawDone !== undefined &&
+    hasContent &&
+    !end.sawDone &&
+    end.finishReason !== 'stop' &&
+    end.finishReason !== 'tool_calls'
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Feature-gated ban signal for truncated/unfinished responses
+ * (ENABLE_TRUNCATION_BAN). Fires the 'truncated' counter for a provider:model so
+ * that a chronic truncator gets banned from the pool/fallback instead of
+ * monopolising the recovery loop. Independent of HTTP status (truncation is
+ * frequently a 200 with partial content).
+ */
+function flagTruncationIfEnabled(key: string, truncated: boolean): void {
+  if (!truncated || !appConfig.enableTruncationBan) return;
+  recordBanSignal(key, 'truncated');
+}
 
 /**
  * During a fallback-chain walk, skip a candidate provider:model that has
@@ -1103,6 +1160,38 @@ export function rewriteStreamForMiniMax(
 }
 
 /**
+ * Whether a buffered SSE stream carried at least one real `tool_calls` delta.
+ * Used to distinguish a legitimate tool-call-only stream (empty text is normal,
+ * e.g. the model answered with a tool call) from a genuinely collapsed/empty
+ * generation that should be retried on another provider.
+ */
+function streamHasToolCalls(chunks: Buffer[]): boolean {
+  const TOOL_CALLS_RE = /"tool_calls"\s*:\s*\[[^\]]*\{/g;
+  return TOOL_CALLS_RE.test(Buffer.concat(chunks).toString('utf8'));
+}
+
+/** Whether a non-stream assistant message carried tool_calls. */
+function messageHasToolCalls(msg: unknown): boolean {
+  if (!msg || typeof msg !== 'object') return false;
+  const m = msg as { tool_calls?: unknown };
+  return Array.isArray(m.tool_calls) && m.tool_calls.length > 0;
+}
+
+/** A clean, protocol-complete empty SSE completion (last resort when the fallback chain is exhausted). */
+function emptySSEStream(model: string): Buffer[] {
+  return [
+    sseFrame({
+      id: `chatcmpl-proxy-empty-${Date.now()}`,
+      object: 'chat.completion.chunk',
+      created: Math.floor(Date.now() / 1000),
+      model,
+      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+    }),
+    Buffer.from('data: [DONE]\n\n', 'utf8'),
+  ];
+}
+
+/**
  * Sanitize a buffered gonka stream whose aggregated `content` collapsed to a
  * blank/placeholder (e.g. `[no visible text]`).
  *
@@ -1237,7 +1326,34 @@ export function sanitizePlaceholderStream(
  *  - leave `reasoning_content` in place for Moonshot Kimi (needs round-trip);
  *  - apply existing prompt overrides + empty-tool_calls sanitization.
  */
-function adaptForModel(
+/**
+ * Resolve the effective quirk for a model from a per-provider quirk map.
+ * Keys may be exact model ids OR prefix boundaries (e.g. `MiniMaxAI/` matches
+ * every MiniMax model id). All matching keys are merged shortest→longest so a
+ * specific model entry overrides a broad prefix base.
+ */
+function resolveModelQuirk(
+  model: string,
+  modelQuirks?: Record<string, ModelQuirkOverrides>,
+): ModelQuirkOverrides | undefined {
+  if (!modelQuirks) return undefined;
+  const matched = Object.keys(modelQuirks)
+    .filter((key) => {
+      if (model === key) return true;
+      const boundary = key.endsWith('/') ? key : `${key}/`;
+      return model.startsWith(boundary);
+    })
+    .sort((a, b) => a.length - b.length);
+
+  if (matched.length === 0) return undefined;
+  const merged: ModelQuirkOverrides = {};
+  for (const key of matched) {
+    Object.assign(merged, modelQuirks[key]);
+  }
+  return merged;
+}
+
+export function adaptForModel(
   body: ChatCompletionRequest,
   providerId: ProviderId,
   model: string,
@@ -1279,9 +1395,46 @@ function adaptForModel(
 
   // Apply per-model reasoning_effort override from model-metadata.json
   // (e.g. MiniMax inlines <think> in content — lower effort saves output tokens)
-  const quirk = modelQuirks?.[model];
+  const quirk = resolveModelQuirk(model, modelQuirks);
   if (quirk?.reasoningEffort) {
     adapted = { ...adapted, reasoning_effort: quirk.reasoningEffort };
+  }
+
+  // Generation-param overrides: only fill when the client did NOT set the
+  // value explicitly, so we never override an intentional caller choice.
+  if (quirk) {
+    const generation: Array<[keyof ModelQuirkOverrides, string]> = [
+      ['temperature', 'temperature'],
+      ['frequencyPenalty', 'frequency_penalty'],
+      ['presencePenalty', 'presence_penalty'],
+      ['topP', 'top_p'],
+      ['repetitionPenalty', 'repetition_penalty'],
+    ];
+    for (const [quirkKey, bodyKey] of generation) {
+      const val = quirk[quirkKey];
+      if (val !== undefined && (adapted as Record<string, unknown>)[bodyKey] === undefined) {
+        adapted = { ...adapted, [bodyKey]: val };
+      }
+    }
+  }
+
+  // Large-context taming (ENABLE_LARGE_CONTEXT_TAMING): huge sessions (tokens_in
+  // beyond LARGE_CONTEXT_TOKENS) sit at the model's context-window edge, so a
+  // long reasoning pass easily truncates the reply. Clamp reasoning_effort down
+  // (stop burning the output budget on thinking) and cap max_tokens so the reply
+  // is guaranteed to fit and complete instead of running to the edge and cutting
+  // off mid-generation.
+  if (appConfig.enableLargeContextTaming) {
+    const tokensIn = estimateTokensFromMessages(body.messages);
+    if (tokensIn > appConfig.largeContextTokens) {
+      adapted = { ...adapted, reasoning_effort: appConfig.largeContextReasoningEffort };
+      const currentMax =
+        typeof adapted.max_tokens === 'number' ? adapted.max_tokens : undefined;
+      const cap = appConfig.largeContextMaxReplyTokens;
+      if (currentMax === undefined || currentMax > cap) {
+        adapted = { ...adapted, max_tokens: cap };
+      }
+    }
   }
 
   return adapted;
@@ -2227,9 +2380,10 @@ async function forwardChatCompletionOnce(
     // `[no visible text]`-family tokens from ANYWHERE in the reply (whole or
     // embedded suffix). Keeps any real narration and tool_calls. If only
     // placeholders/whitespace were present, content becomes truly empty and
-    // Hermes' empty-response recovery handles it. NOT a fallback trigger.
+    // empty-generation detection (below) routes it to the fallback chain.
+    let firstMsg: { content?: string; tool_calls?: unknown } | undefined;
     if (!upstreamFailed) {
-      const firstMsg = (upstream.data as unknown as {
+      firstMsg = (upstream.data as unknown as {
         choices?: Array<{ message?: { content?: string } }>;
       })?.choices?.[0]?.message;
       if (firstMsg && typeof firstMsg.content === 'string') {
@@ -2239,6 +2393,76 @@ async function forwardChatCompletionOnce(
           completionText = cleaned;
         }
       }
+    }
+
+    // Truncation detection (non-stream): flag chronic truncators for a ban.
+    // finish_reason === 'length' is the reliable signal for a cut-off reply.
+    if (!upstreamFailed) {
+      const fr = (upstream.data as unknown as {
+        choices?: Array<{ finish_reason?: string | null }>;
+      })?.choices?.[0]?.finish_reason;
+      const truncated = isTruncatedOutput(completionText.length > 0, {
+        finishReason: fr ?? undefined,
+      });
+      flagTruncationIfEnabled(`${adapter.id}:${model}`, truncated);
+    }
+
+    // Empty / zero-width / placeholder-only non-stream completion with NO tool
+    // calls — a silent generation. Retry another provider instead of returning
+    // a pathological `200 ""` that stalls the client's own empty-response
+    // recovery.
+    if (!upstreamFailed && hasNoRealContent(completionText) && !messageHasToolCalls(firstMsg)) {
+      recordModelResponse(`${adapter.id}:${model}`, 0);
+      recordRequestEnd(reqId, 0, 'empty-generated');
+      logProxyError({
+        provider: adapter.id,
+        endpointPrefix,
+        requestedModel: requestedModelName,
+        effectiveModel: model,
+        message: 'empty / zero-width completion (no content, no tool_calls), trying fallback chain',
+      });
+      await recordUsage(adapter, model, null, promptEstimate, '', requestCtx, {
+        requestBody: body,
+        upstreamUrl: url,
+        status: 200,
+        stream: false,
+        responseBody: completionText,
+        error: 'empty-generated',
+      }).catch((err) => {
+        console.error('[request-dump] recordUsage failed:', (err as Error)?.message ?? String(err));
+      });
+      const rerouted = await tryFallbackChain(
+        'empty-generated',
+        adapter,
+        model,
+        body,
+        incomingHeaders,
+        res,
+        endpointPrefix,
+      );
+      if (!rerouted) {
+        // Fallback exhausted — return the (empty) completion as before so the
+        // client's own empty-response handling can still act.
+        logResponse({
+          provider: adapter.id,
+          status: upstream.status,
+          preview: completionText,
+          stream: false,
+          detail: errorDetail,
+          endpointPrefix,
+          requestedModel: requestedModelName,
+          effectiveModel: model,
+          fallbackFrom,
+        });
+        recordModelResponse(
+          `${adapter.id}:${model}`,
+          upstream.status,
+          throughputMetrics(reqStartedAt, completionText, parseUsage(upstream.data)?.usage.completion_tokens ?? estimateTokensFromText(completionText)),
+        );
+        recordRequestEnd(reqId, upstream.status, completionText);
+        res.status(upstream.status).json(convertMiniMaxAgenticToolCall(upstream.data));
+      }
+      return;
     }
 
     // Garbage detected in non-streaming output — treat as upstream error, try fallback
@@ -2388,6 +2612,71 @@ async function forwardChatCompletionOnce(
 }
 
 /**
+ * Handle a stream that produced NO real content and NO tool calls (an empty /
+ * zero-width / placeholder-only generation). Instead of silently returning a
+ * pathological `200 ""` that stalls the client (Hermes' empty-response recovery
+ * never fires), immediately retry another provider through the fallback chain.
+ * Only when the chain is exhausted do we return a clean empty completion.
+ */
+async function handleCollapsedEmptyStream(
+  adapter: ProviderAdapter,
+  model: string,
+  body: ChatCompletionRequest,
+  incomingHeaders: IncomingHttpHeaders,
+  res: Response,
+  endpointPrefix: string,
+  fallbackFrom: string | undefined,
+  reqId: string,
+  promptEstimate: number,
+  requestCtx: CompletionRequestContext,
+  url: string,
+  chunks: Buffer[],
+  upstreamStatus: number,
+  upstreamHeaders: Record<string, string>,
+  markIncomingDone: (() => void) | undefined,
+  requestedModelName: string,
+  completionText: string,
+  streamUsage: UsageBreakdown | null,
+): Promise<void> {
+  recordModelResponse(`${adapter.id}:${model}`, 0);
+  recordRequestEnd(reqId, 0, 'empty-generated');
+  const emptyLog = `empty / zero-width stream (no content, no tool_calls), trying fallback chain`;
+  logProxyError({
+    provider: adapter.id,
+    endpointPrefix,
+    requestedModel: requestedModelName,
+    effectiveModel: model,
+    message: emptyLog,
+  });
+
+  await recordUsage(adapter, model, null, promptEstimate, '', requestCtx, {
+    requestBody: body,
+    upstreamUrl: url,
+    status: 200,
+    stream: true,
+    responseBody: completionText,
+    error: 'empty-generated',
+  }).catch((err) => {
+    console.error('[request-dump] recordUsage failed:', (err as Error)?.message ?? String(err));
+  });
+
+  const rerouted = await tryFallbackChain(
+    'empty-generated',
+    adapter,
+    model,
+    body,
+    incomingHeaders,
+    res,
+    endpointPrefix,
+  );
+  if (!rerouted) {
+    // Fallback exhausted — return a protocol-complete empty completion so the
+    // client's own empty-response recovery can still act (prior behaviour).
+    flushBufferedChunks(res, emptySSEStream(model), 200, upstreamHeaders, markIncomingDone);
+  }
+}
+
+/**
  * Gonka streaming with garbage detection.
  *
  * Buffers the complete stream, checks for garbage. If clean — flushes to client.
@@ -2527,6 +2816,43 @@ async function forwardStreamWithGarbageProtection(
       });
       flushBufferedChunks(res, chunks, upstreamStatus, upstreamHeaders, markIncomingDone);
     }
+    return;
+  }
+
+  // Truncation detection (stream): flag chronic truncators for a ban before
+  // deciding how to forward the content. A cut stream (no [DONE], or an explicit
+  // finish_reason='length') is the symptom that designates a model as a chronic
+  // truncator, so the fallback chain moves on instead of looping forever.
+  {
+    const end = streamEndInfo(chunks);
+    const truncated = isTruncatedOutput(completionText.length > 0, end);
+    flagTruncationIfEnabled(`${adapter.id}:${model}`, truncated);
+  }
+
+  // Empty / zero-width / placeholder-only completion with NO tool calls — a
+  // silent generation. Don't hand the client a pathological `200 ""` (it
+  // stalls Hermes' empty-response recovery); retry another provider now.
+  if (hasNoRealContent(completionText) && !streamHasToolCalls(chunks)) {
+    await handleCollapsedEmptyStream(
+      adapter,
+      model,
+      body,
+      incomingHeaders,
+      res,
+      endpointPrefix,
+      fallbackFrom,
+      reqId,
+      promptEstimate,
+      requestCtx,
+      url,
+      chunks,
+      upstreamStatus,
+      upstreamHeaders,
+      markIncomingDone,
+      requestedModelName,
+      completionText,
+      streamUsage,
+    );
     return;
   }
 

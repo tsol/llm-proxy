@@ -296,22 +296,33 @@ export function isGarbage(text: string): boolean {
  */
 const PLACEHOLDER_TOKENS = [
   'no\\s+visible\\s+text',
+  'no\\s+visible',
   'no\\s+text',
+  'no\\s+content',
   'blank',
   'empty',
   'none',
   'image',
-  'no\\s+content',
   'spinner',
 ];
 
 /**
- * Matches a single placeholder bracket-token ANYWHERE in a string. Anchored to
- * the exact bracket family above, so it never touches legit bracketed prose
- * (`[System note: ...]`, `[ok]`, `[изображение]` etc.).
+ * Full bracket form: `[no visible text]`, `[image]`, etc.
+ * Matches ONLY with closing bracket — safe for single-word tokens.
  */
-const PLACEHOLDER_TOKEN_RE = new RegExp(
+const PLACEHOLDER_BRACKET_RE = new RegExp(
   `\\[\\s*(?:${PLACEHOLDER_TOKENS.join('|')})\\s*\\]`,
+  'ig',
+);
+
+/**
+ * Truncated form: `[no visible text`, `[no visible` (missing `]`).
+ * Only the multi-word "no *" patterns — the model commonly truncates these.
+ * Terminates on `]`, whitespace, or end-of-string to avoid false positives
+ * on `[image attached]`-style legitimate text.
+ */
+const PLACEHOLDER_TRUNCATED_RE = new RegExp(
+  `\\[\\s*(?:no\\s+visible\\s+text|no\\s+visible|no\\s+text|no\\s+content)\\s*(?:\\]|\\s|$)`,
   'ig',
 );
 
@@ -327,7 +338,11 @@ export function isPlaceholderOrBlank(text: string): boolean {
   return new RegExp(
     `^\\s*\\[\\s*(?:${PLACEHOLDER_TOKENS.join('|')})\\s*\\]\\s*$`,
     'i',
-  ).test(text); // the `[no visible text]` family as the whole reply
+  ).test(text) ||
+  new RegExp(
+    `^\\s*\\[\\s*(?:no\\s+visible\\s+text|no\\s+visible|no\\s+text|no\\s+content)\\s*(?:\\]|\\s|$)\\s*$`,
+    'i',
+  ).test(text);
 }
 
 /**
@@ -342,8 +357,23 @@ export function isPlaceholderOrBlank(text: string): boolean {
  */
 export function stripPlaceholderTokens(text: string): string {
   if (typeof text !== 'string') return '';
-  let out = text.replace(PLACEHOLDER_TOKEN_RE, '');
+  let out = text.replace(PLACEHOLDER_BRACKET_RE, '').replace(PLACEHOLDER_TRUNCATED_RE, '');
   if (out === text) return text; // No placeholders found — return unchanged (preserve spaces!)
   out = out.replace(/\n{3,}/g, '\n\n'); // collapse leftover 3+ blank lines
   return out.trim();
+}
+
+/**
+ * True when a completion has collapsed to NO real content after stripping
+ * placeholder tokens — empty, whitespace-only, or placeholder-only (e.g.
+ * `[no visible text]`). This is the "model went silent / narrated nothing"
+ * pathological case that stalls the client when returned verbatim as `200 ""`.
+ *
+ * NOTE: tool-call-only responses (empty text, but carrying `tool_calls`) also
+ * return `true` here — callers must separately check whether the response
+ * carried `tool_calls` before treating it as a failed generation.
+ */
+export function hasNoRealContent(text: string): boolean {
+  if (typeof text !== 'string') return true;
+  return stripPlaceholderTokens(text).trim().length === 0;
 }

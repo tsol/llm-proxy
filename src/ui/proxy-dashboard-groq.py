@@ -718,6 +718,26 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     return code ?? '—';
   }
 
+  // ── BAN helpers ──
+  function banInfo(key) {
+    const bans = (data && data.bans) || [];
+    return bans.find(x => x.key === key) || null;
+  }
+
+  function fmtBan(sec) {
+    if (sec == null || isNaN(sec)) return '—';
+    const m = Math.floor(sec / 60);
+    if (m < 60) return m + 'm ' + (sec % 60) + 's';
+    const h = Math.floor(m / 60);
+    return h + 'h ' + (m % 60) + 'm';
+  }
+
+  function banPill(key) {
+    const b = banInfo(key);
+    if (!b) return '';
+    return `<span class="status-pill garbage" title="Temporary BAN · excluded from routing">BAN · ${fmtBan(b.remainingSec)}</span>`;
+  }
+
   function escapeHtml(s) {
     if (s == null) return '';
     return String(s)
@@ -774,6 +794,28 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     return incoming.length + active.length;
   }
 
+  function renderBans() {
+    const bans = data.bans || [];
+    if (!bans.length) return '';
+    let html = `<div class="section-title">── banned (BAN) ──</div>`;
+    bans.forEach(b => {
+      const idx = b.key.indexOf(':');
+      const provider = idx >= 0 ? b.key.slice(0, idx) : '—';
+      const model = idx >= 0 ? b.key.slice(idx + 1) : b.key;
+      html += `
+        <div class="card status-fail">
+          <div class="card-row">
+            <div style="min-width:0">
+              <div class="model-name">${escapeHtml(model)}</div>
+              <div class="provider">${escapeHtml(provider)}</div>
+            </div>
+            <span class="status-pill garbage">BAN · ${fmtBan(b.remainingSec)}</span>
+          </div>
+        </div>`;
+    });
+    return html;
+  }
+
   function renderMain() {
     const stats = data.stats || {};
     const models = Object.entries(stats).sort((a, b) => (b[1].total || 0) - (a[1].total || 0));
@@ -793,6 +835,8 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     const aliases = Object.entries(aliasMap);
 
     let html = '';
+
+    html += renderBans();
 
     html += `<div class="section-title">── models ──</div>`;
     if (!models.length) {
@@ -821,8 +865,9 @@ HTML_CONTENT = r"""<!DOCTYPE html>
               <span>1h: <b style="color:var(--accent2)">${tp ? fmtTps(tp.h1.tps) : '—'}</b> · ${tp ? fmtBytes(tp.h1.bytes) : '—'} · ${tp ? tp.h1.count : 0} req</span>
               <span>24h: <b style="color:var(--accent2)">${tp ? fmtTps(tp.h24.tps) : '—'}</b> · ${tp ? fmtBytes(tp.h24.bytes) : '—'} · ${tp ? tp.h24.count : 0} req</span>
             </div>
-            <div style="margin-top:12px">
+            <div style="margin-top:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
               <span class="status-pill ${st}">${statusLabel(s.lastStatus)}</span>
+              ${banPill(key)}
             </div>
           </div>`;
       });
@@ -952,6 +997,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
                   <div style="display:flex;align-items:center;gap:6px">
                     ${m.rank ? `<span class="rank-badge">#${m.rank}</span>` : ''}
                     <div style="font-weight:600">${escapeHtml(m.model)}</div>
+                    ${m.banned ? `<span class="status-pill garbage" title="Temporary BAN · excluded from routing">BAN · ${fmtBan(m.banRemainingSec)}</span>` : ''}
                   </div>
                   <div class="provider">${escapeHtml(m.provider)}</div>
                 </div>

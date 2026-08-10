@@ -84,6 +84,26 @@ export const appConfig = {
    */
   forceSyncProviders: envList('FORCE_SYNC_PROVIDERS'),
   enableForceSync: env('ENABLE_FORCE_SYNC', 'true').toLowerCase() !== 'false',
+  /** Feature: ban models for unfinished/truncated responses.
+   *  A truncated reply arrives as a 200 with partial content (no [DONE], or
+   *  finish_reason='length'), so the normal fail/garbage ban signals never fire.
+   *  This counts repeated truncations separately and bans the chronic offender
+   *  so the fallback chain moves on to a model that actually completes turns.
+   */
+  enableTruncationBan: env('ENABLE_TRUNCATION_BAN', 'true').toLowerCase() !== 'false',
+  /** Feature: tame huge-context requests so big sessions stop truncating at the
+   *  model's context-window edge. When tokens_in exceeds LARGE_CONTEXT_TOKENS,
+   *  lower reasoning_effort (stop burning the output budget on long thinking)
+   *  and cap max_tokens so the reply is guaranteed to fit and complete. */
+  enableLargeContextTaming: env('ENABLE_LARGE_CONTEXT_TAMING', 'true').toLowerCase() !== 'false',
+  largeContextTokens: envNum('LARGE_CONTEXT_TOKENS', 60000),
+  largeContextMaxReplyTokens: envNum('LARGE_CONTEXT_MAX_REPLY_TOKENS', 16000),
+  largeContextReasoningEffort: env('LARGE_CONTEXT_REASONING_EFFORT', 'low').toLowerCase(),
+  /** Feature: alias /v1/models entries advertise the MINIMUM context_length across
+   *  the alias's whole fallback chain (ENABLE_ALIAS_MIN_CONTEXT). So the client
+   *  compresses against the tightest model that could serve the alias instead of
+   *  the largest, avoiding session blowups when a smaller-window model serves. */
+  enableAliasMinContext: env('ENABLE_ALIAS_MIN_CONTEXT', 'true').toLowerCase() !== 'false',
   fallbackCharsPerToken: envNum('FALLBACK_CHARS_PER_TOKEN', 4),
   fallbackPricing: {
     inputPerMillion: envNum('FALLBACK_INPUT_PRICE_PER_M', 0.3),
@@ -151,6 +171,7 @@ export const appConfig = {
   banTimeoutCount: envNum('BAN_FROM_GROUP_WHEN_TIMEOUT_COUNT', 5),
   banZeroByteSeconds: envNum('BAN_FROM_GROUP_WHEN_ZERO_BYTE_SECONDS', 240),
   banZeroByteCount: envNum('BAN_FROM_GROUP_WHEN_ZERO_BYTE_COUNT', 2),
+  banTruncatedCount: envNum('BAN_FROM_GROUP_WHEN_TRUNCATED_COUNT', 3),
   /** When true, the preferred-group pool picks a random free member
    *  instead of the first one in chain order. Spreads load across all
    *  providers in the pool (e.g. gonka + gonka-dahl) instead of

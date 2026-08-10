@@ -78,6 +78,11 @@
       "moonshotai/Kimi-K2.6": {
         "concurrent": 1
       },
+      "MiniMaxAI/": {
+        "temperature": 0.4,
+        "frequencyPenalty": 0.5,
+        "presencePenalty": 0.3
+      },
       "MiniMaxAI/MiniMax-M2.7": {
         "concurrent": 1,
         "reasoningEffort": "low"
@@ -89,6 +94,11 @@
     "models": {
       "moonshotai/Kimi-K2.6": {
         "concurrent": 1
+      },
+      "MiniMaxAI/": {
+        "temperature": 0.4,
+        "frequencyPenalty": 0.5,
+        "presencePenalty": 0.3
       },
       "MiniMaxAI/MiniMax-M2.7": {
         "concurrent": 1,
@@ -102,6 +112,11 @@
       "moonshotai/Kimi-K2.6": {
         "concurrent": 1
       },
+      "MiniMaxAI/": {
+        "temperature": 0.4,
+        "frequencyPenalty": 0.5,
+        "presencePenalty": 0.3
+      },
       "MiniMaxAI/MiniMax-M2.7": {
         "concurrent": 1,
         "reasoningEffort": "low"
@@ -113,6 +128,11 @@
     "models": {
       "moonshotai/Kimi-K2.6": {
         "concurrent": 1
+      },
+      "MiniMaxAI/": {
+        "temperature": 0.4,
+        "frequencyPenalty": 0.5,
+        "presencePenalty": 0.3
       },
       "MiniMaxAI/MiniMax-M2.7": {
         "concurrent": 1,
@@ -126,6 +146,11 @@
       "moonshotai/Kimi-K2.6": {
         "concurrent": 1
       },
+      "MiniMaxAI/": {
+        "temperature": 0.4,
+        "frequencyPenalty": 0.5,
+        "presencePenalty": 0.3
+      },
       "MiniMaxAI/MiniMax-M2.7": {
         "concurrent": 1,
         "reasoningEffort": "low"
@@ -137,6 +162,11 @@
     "models": {
       "moonshotai/Kimi-K2.6": {
         "concurrent": 1
+      },
+      "MiniMaxAI/": {
+        "temperature": 0.4,
+        "frequencyPenalty": 0.5,
+        "presencePenalty": 0.3
       },
       "MiniMaxAI/MiniMax-M2.7": {
         "concurrent": 1,
@@ -150,6 +180,11 @@
       "moonshotai/Kimi-K2.6": {
         "concurrent": 1
       },
+      "MiniMaxAI/": {
+        "temperature": 0.4,
+        "frequencyPenalty": 0.5,
+        "presencePenalty": 0.3
+      },
       "MiniMaxAI/MiniMax-M2.7": {
         "concurrent": 1,
         "reasoningEffort": "low"
@@ -159,6 +194,11 @@
   "hyperfusion": {
     "rateLimits": {},
     "models": {
+      "MiniMaxAI/": {
+        "temperature": 0.4,
+        "frequencyPenalty": 0.5,
+        "presencePenalty": 0.3
+      },
       "MiniMaxAI/MiniMax-M2.7": {
         "contextLength": 196608,
         "concurrent": 1

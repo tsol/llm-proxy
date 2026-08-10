@@ -11,6 +11,12 @@ interface ModelMeta {
   type?: string;
   concurrent?: number;
   inPreferredGroup?: boolean;
+  reasoningEffort?: string;
+  temperature?: number;
+  frequencyPenalty?: number;
+  presencePenalty?: number;
+  topP?: number;
+  repetitionPenalty?: number;
 }
 
 interface ProviderMeta {
@@ -40,7 +46,8 @@ export function getMetadataRateLimits(providerId: string): ProviderRateLimits {
   return loadMetadata()[providerId]?.rateLimits ?? {};
 }
 
-/** Get model quirks for a provider from the metadata file (key = model id prefix match). */
+/** Get model quirks for a provider from the metadata file (key = exact id OR
+ *  prefix boundary, e.g. `MiniMaxAI/` matches every MiniMax model id). */
 export function getMetadataModelQuirks(providerId: string): Record<string, ModelQuirkOverrides> {
   const models = loadMetadata()[providerId]?.models ?? {};
   const quirks: Record<string, ModelQuirkOverrides> = {};
@@ -50,6 +57,12 @@ export function getMetadataModelQuirks(providerId: string): Record<string, Model
       ...(meta.maxTokens ? { maxTokens: meta.maxTokens } : {}),
       ...(meta.concurrent !== undefined ? { concurrent: meta.concurrent } : {}),
       ...(meta.inPreferredGroup !== undefined ? { inPreferredGroup: meta.inPreferredGroup } : {}),
+      ...(meta.reasoningEffort ? { reasoningEffort: meta.reasoningEffort } : {}),
+      ...(meta.temperature !== undefined ? { temperature: meta.temperature } : {}),
+      ...(meta.frequencyPenalty !== undefined ? { frequencyPenalty: meta.frequencyPenalty } : {}),
+      ...(meta.presencePenalty !== undefined ? { presencePenalty: meta.presencePenalty } : {}),
+      ...(meta.topP !== undefined ? { topP: meta.topP } : {}),
+      ...(meta.repetitionPenalty !== undefined ? { repetitionPenalty: meta.repetitionPenalty } : {}),
     };
   }
   return quirks;

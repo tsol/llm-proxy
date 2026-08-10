@@ -527,6 +527,39 @@ export async function refreshProviderLive(providerId: ProviderId): Promise<void>
   await refreshProvider(providerId, 'live');
 }
 
+/**
+ * Compute the context_length an alias should advertise to clients: the MINIMUM
+ * context across every model in the alias's full fallback chain
+ * (ENABLE_ALIAS_MIN_CONTEXT). A client (e.g. Hermes) schedules context
+ * compression against the advertised context; if the alias advertised the
+ * largest model's window (e.g. Kimi 262K) but a fallback member serves a
+ * smaller-window model (e.g. MiniMax ~180K), the session would blow past the
+ * real model's window before compression fires → truncation/gluing. Advertising
+ * the minimum keeps compression on time for whichever model actually serves.
+ * Returns undefined when no chain entry resolves to a context (client falls back
+ * to its own default).
+ */
+function resolveAliasContextLength(chain: string[]): number | undefined {
+  let min: number | undefined;
+  for (const entry of chain) {
+    const slashIdx = entry.indexOf('/');
+    const provider = slashIdx > 0 ? entry.slice(0, slashIdx) : '';
+    const shortModel = slashIdx > 0 ? entry.slice(slashIdx + 1) : entry;
+    const realEntry = catalogEntries.find(
+      (e) =>
+        e.provider === provider &&
+        (norm(e.upstreamId) === norm(shortModel) ||
+          norm(shortAlias(e.upstreamId)) === norm(shortModel) ||
+          norm(e.upstreamId).endsWith(`/${norm(shortModel)}`)),
+    );
+    const ctx = realEntry?.model?.context_length;
+    if (typeof ctx === 'number' && ctx > 0) {
+      min = min === undefined ? ctx : Math.min(min, ctx);
+    }
+  }
+  return min;
+}
+
 export async function listCatalogModels(opts?: {
   freshLocal?: boolean;
 }): Promise<CatalogModel[]> {
@@ -565,6 +598,13 @@ export async function listCatalogModels(opts?: {
       );
       const upstreamModel = realEntry?.upstreamId ?? shortModel;
 
+      // Advertise the MINIMUM context across the alias's whole fallback chain so
+      // the client compresses in time for the tightest model that could serve it.
+      // Gated by ENABLE_ALIAS_MIN_CONTEXT (default on). Undefined → field omitted.
+      const aliasContextLength = appConfig.enableAliasMinContext
+        ? resolveAliasContextLength(chain)
+        : undefined;
+
       try {
         const adapter = getProvider(provider as ProviderId);
         const pricing = adapter.getPricing(upstreamModel);
@@ -575,6 +615,7 @@ export async function listCatalogModels(opts?: {
           pricing,
           isDefault: alias === activeDefault,
           created: 0,
+          contextLength: aliasContextLength,
         }));
       } catch {
         // Skip if provider unknown

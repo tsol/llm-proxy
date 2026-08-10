@@ -110,6 +110,17 @@ export interface ModelQuirkOverrides {
   /** Force reasoning_effort for models that inline thinking tokens in
    *  output content (e.g. MiniMax <think> blocks). Applied in adaptForModel(). */
   reasoningEffort?: string;
+  /** Generation-param overrides merged into the upstream payload (only applied
+   *  when the client did NOT set the value explicitly). Calms degenerate
+   *  repetition on small/free-tier models (e.g. MiniMax on gonka). Applied in
+   *  adaptForModel(). All fields optional; unset = leave upstream default. */
+  temperature?: number;
+  frequencyPenalty?: number;
+  presencePenalty?: number;
+  topP?: number;
+  /** Non-standard knob some backends accept (vLLM/gonka-adjacent). Omitted by
+   *  default for OpenAI-compatible providers — opt-in only. */
+  repetitionPenalty?: number;
 }
 
 export interface RouterSnapshot {
