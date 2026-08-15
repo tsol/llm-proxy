@@ -7,19 +7,11 @@
           "strategy": "order",
           "members": [
             "gonka/moonshotai/Kimi-K2.6",
-            "gonka-dahl/moonshotai/Kimi-K2.6",
             "gonka-api/moonshotai/Kimi-K2.6",
-            "joingonka/moonshotai/Kimi-K2.6",
-            "gonka-mingles/moonshotai/Kimi-K2.6",
             "gonka-router-io/moonshotai/Kimi-K2.6",
-            "gonkabroker/moonshotai/Kimi-K2.6",
             "gonka/MiniMaxAI/MiniMax-M2.7",
-            "gonka-dahl/MiniMaxAI/MiniMax-M2.7",
             "gonka-api/MiniMaxAI/MiniMax-M2.7",
-            "joingonka/MiniMaxAI/MiniMax-M2.7",
-            "gonka-mingles/MiniMaxAI/MiniMax-M2.7",
             "gonka-router-io/MiniMaxAI/MiniMax-M2.7",
-            "gonkabroker/MiniMaxAI/MiniMax-M2.7",
             "hyperfusion/MiniMaxAI/MiniMax-M2.7"
           ]
         }
@@ -31,20 +23,12 @@
           "strategy": "order",
           "members": [
             "gonka/MiniMaxAI/MiniMax-M2.7",
-            "gonka-dahl/MiniMaxAI/MiniMax-M2.7",
             "gonka-api/MiniMaxAI/MiniMax-M2.7",
-            "joingonka/MiniMaxAI/MiniMax-M2.7",
-            "gonka-mingles/MiniMaxAI/MiniMax-M2.7",
             "gonka-router-io/MiniMaxAI/MiniMax-M2.7",
-            "gonkabroker/MiniMaxAI/MiniMax-M2.7",
             "hyperfusion/MiniMaxAI/MiniMax-M2.7",
             "gonka/moonshotai/Kimi-K2.6",
-            "gonka-dahl/moonshotai/Kimi-K2.6",
             "gonka-api/moonshotai/Kimi-K2.6",
-            "joingonka/moonshotai/Kimi-K2.6",
-            "gonka-mingles/moonshotai/Kimi-K2.6",
-            "gonka-router-io/moonshotai/Kimi-K2.6",
-            "gonkabroker/moonshotai/Kimi-K2.6"
+            "gonka-router-io/moonshotai/Kimi-K2.6"
           ]
         }
       ]

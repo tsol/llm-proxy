@@ -60,6 +60,15 @@ export interface ChatCompletionRequest {
   [key: string]: unknown;
 }
 
+/** Optional adapter override when chat/completions is the wrong upstream shape. */
+export interface PreparedChatRequest {
+  url: string;
+  headers?: Record<string, string>;
+  payload: unknown;
+  /** Image-out models should not SSE; return one JSON completion. */
+  forceSync?: boolean;
+}
+
 export interface TokenUsage {
   prompt_tokens: number;
   completion_tokens: number;
@@ -181,6 +190,18 @@ export interface ProviderAdapter {
   resolveModel(requestedModel?: string): string;
   getPricing(model: string): ProviderPricing;
   chatCompletionsUrl(): string;
+  /**
+   * Rewrite URL / payload for this model. Default OpenAI-compat adapters
+   * inject image-out `modalities` here; Google image models switch to
+   * native generateContent.
+   */
+  prepareChat?(
+    model: string,
+    body: ChatCompletionRequest,
+    defaults: { url: string; headers: Record<string, string> },
+  ): PreparedChatRequest | void;
+  /** Map a non-OpenAI (or OpenRouter `images[]`) payload to chat.completion. */
+  normalizeChatResponse?(raw: unknown, model: string): unknown;
 }
 
 // ─────────────────────────────────────────────────────────────

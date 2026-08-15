@@ -76,7 +76,7 @@
     "rateLimits": {},
     "models": {
       "moonshotai/Kimi-K2.6": {
-        "concurrent": 1
+        "concurrent": 3
       },
       "MiniMaxAI/": {
         "temperature": 0.4,
@@ -84,7 +84,7 @@
         "presencePenalty": 0.3
       },
       "MiniMaxAI/MiniMax-M2.7": {
-        "concurrent": 1,
+        "concurrent": 3,
         "reasoningEffort": "low"
       }
     }
@@ -93,7 +93,7 @@
     "rateLimits": {},
     "models": {
       "moonshotai/Kimi-K2.6": {
-        "concurrent": 1
+        "concurrent": 3
       },
       "MiniMaxAI/": {
         "temperature": 0.4,
@@ -101,7 +101,7 @@
         "presencePenalty": 0.3
       },
       "MiniMaxAI/MiniMax-M2.7": {
-        "concurrent": 1,
+        "concurrent": 3,
         "reasoningEffort": "low"
       }
     }
@@ -110,7 +110,7 @@
     "rateLimits": {},
     "models": {
       "moonshotai/Kimi-K2.6": {
-        "concurrent": 1
+        "concurrent": 3
       },
       "MiniMaxAI/": {
         "temperature": 0.4,
@@ -118,7 +118,7 @@
         "presencePenalty": 0.3
       },
       "MiniMaxAI/MiniMax-M2.7": {
-        "concurrent": 1,
+        "concurrent": 3,
         "reasoningEffort": "low"
       }
     }
@@ -127,7 +127,7 @@
     "rateLimits": {},
     "models": {
       "moonshotai/Kimi-K2.6": {
-        "concurrent": 1
+        "concurrent": 3
       },
       "MiniMaxAI/": {
         "temperature": 0.4,
@@ -135,7 +135,7 @@
         "presencePenalty": 0.3
       },
       "MiniMaxAI/MiniMax-M2.7": {
-        "concurrent": 1,
+        "concurrent": 3,
         "reasoningEffort": "low"
       }
     }
@@ -144,7 +144,7 @@
     "rateLimits": {},
     "models": {
       "moonshotai/Kimi-K2.6": {
-        "concurrent": 1
+        "concurrent": 3
       },
       "MiniMaxAI/": {
         "temperature": 0.4,
@@ -152,7 +152,7 @@
         "presencePenalty": 0.3
       },
       "MiniMaxAI/MiniMax-M2.7": {
-        "concurrent": 1,
+        "concurrent": 3,
         "reasoningEffort": "low"
       }
     }
@@ -161,7 +161,7 @@
     "rateLimits": {},
     "models": {
       "moonshotai/Kimi-K2.6": {
-        "concurrent": 1
+        "concurrent": 3
       },
       "MiniMaxAI/": {
         "temperature": 0.4,
@@ -169,7 +169,7 @@
         "presencePenalty": 0.3
       },
       "MiniMaxAI/MiniMax-M2.7": {
-        "concurrent": 1,
+        "concurrent": 3,
         "reasoningEffort": "low"
       }
     }
@@ -178,7 +178,7 @@
     "rateLimits": {},
     "models": {
       "moonshotai/Kimi-K2.6": {
-        "concurrent": 1
+        "concurrent": 3
       },
       "MiniMaxAI/": {
         "temperature": 0.4,
@@ -186,7 +186,7 @@
         "presencePenalty": 0.3
       },
       "MiniMaxAI/MiniMax-M2.7": {
-        "concurrent": 1,
+        "concurrent": 3,
         "reasoningEffort": "low"
       }
     }
@@ -201,7 +201,7 @@
       },
       "MiniMaxAI/MiniMax-M2.7": {
         "contextLength": 196608,
-        "concurrent": 1
+        "concurrent": 3
       }
     }
   },

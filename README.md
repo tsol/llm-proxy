@@ -38,7 +38,7 @@ Client (OpenAI SDK / curl)
 | **Gonkabroker** | `/gonkabroker/v1/` | Kimi-K2.6, MiniMax-M2.7 — gonka broker gateway |
 | **Hyperfusion** | `/hyperfusion/v1/` | MiniMax-M2.7 — LiteLLM proxy |
 | **DeepSeek** | `/deepseek/v1/` | v4-flash (1M context), v4-pro, cache billing |
-| **Google** | `/google/v1/` | Gemini 2.0/2.5 flash, flash-image, pro |
+| **Google** | `/google/v1/` | Gemini 2.0/2.5/3.x flash+pro; `*-image*` generate/edit via native generateContent |
 | **Cursor** | `/cursor/v1/` | Composer 2.5 via Cursor SDK (200K context) |
 | **Groq** | `/groq/v1/` | Llama-4-Maverick (free tier, fast) |
 | **Cerebras** | `/cerebras/v1/` | GPT-OSS-120B (ultra-fast) |
@@ -212,6 +212,63 @@ Per-provider paths have **no fallback** — they return upstream errors directly
 
 Every failed attempt (429/413/5xx/402/network/garbage) is recorded in per-model `stats`: `fail++` and `lastStatus`. **Garbage is stored as `lastStatus: 0`** (отображается как `000 · garbage` в дашборде) — а не как фейковый `200`.
 
+## Image generation / editing
+
+Hermes and other OpenAI clients keep using **`POST /v1/chat/completions`** (or `/{provider}/v1/chat/completions`). There is no separate `/images` or admin endpoint.
+
+The proxy normalizes every image-out model to the same OpenAI shape:
+
+```json
+{
+  "choices": [{
+    "message": {
+      "role": "assistant",
+      "content": [
+        { "type": "text", "text": "optional caption" },
+        { "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,..." } }
+      ]
+    }
+  }]
+}
+```
+
+**How to call it**
+
+- Model: a Gemini image id (`gemini-3-pro-image`, `gemini-2.5-flash-image`, `gemini-3.1-flash-image`, …) via Google, or the OpenRouter id (`google/gemini-3-pro-image-preview`) via OpenRouter.
+- Input photo (edit): put a data-URI (or https URL) in the user message as an `image_url` part, plus a text instruction.
+- Do **not** send `reasoning_effort` / thinking / tools — the proxy strips them for `*-image*` models (those Gemini variants reject thinking).
+- `stream: true` is forced to a single JSON completion (JPEG does not stream usefully).
+
+```bash
+# Generate or edit via Google (native generateContent under the hood)
+curl -s http://localhost:5001/google/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-2.5-flash-image",
+    "messages": [{
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "Make the sky more dramatic" },
+        { "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,..." } }
+      ]
+    }]
+  }' | jq -r '.choices[0].message.content[] | select(.type=="image_url") | .image_url.url' \
+  | sed 's/^data:image\/[^;]*;base64,//' | base64 -d > out.jpg
+```
+
+Root `/v1/chat/completions` works the same if the requested model resolves to a Google/OpenRouter image id (alias or raw).
+
+**What the proxy does internally (for the next agent)**
+
+| Layer | Behavior |
+|-------|----------|
+| Capabilities | `*-image*` models advertise `output_modalities: ["text","image"]` (vision-in is not the same as image-out). |
+| `adaptForModel` | Strips thinking/tools; OpenRouter gets `modalities: ["image","text"]`. |
+| `ProviderAdapter.prepareChat` | Default OpenAI-compat adapters stay on `/chat/completions`. **Google image models** switch to native `models/{id}:generateContent` with `responseModalities: ["TEXT","IMAGE"]` — Google's OpenAI-compat layer returns `Unhandled generated data mime type: image/jpeg` otherwise. |
+| `normalizeChatResponse` | Gemini `inlineData` and OpenRouter `message.images` become `content[].image_url` data URIs. |
+
+New image-out providers should implement those two adapter hooks instead of adding a Google-only branch in `forward.ts`. Shared helpers live in `src/image-output.ts`.
+
 ### Gonka-family & MiniMax message handling
 
 - **Request normalization**: провайдеры gonka-family требуют `messages[].content` как массив блоков `[{type:"text",text:"…"}]`. Прокси автоматически нормализует строковый `content` в массив блоков и убирает пустой `content` у assistant-сообщений с `tool_calls` (для всех gonka-провайдеров; остальные провайдеры не затрагиваются).
@@ -363,6 +420,14 @@ Direct per-provider routing:
 ```
 
 Available Hermes providers: `proxy`, `proxy-deepseek`, `proxy-openrouter`, `proxy-cerebras`, `proxy-groq`, `proxy-gonka`, `proxy-google`, `proxy-local`, `proxy-cursor`
+
+Image generate/edit (same chat API; save the returned `data:` URL to a file):
+
+```
+/model --provider proxy-google gemini-2.5-flash-image
+```
+
+Then send a user message with the photo as `image_url` (data URI) plus the edit prompt. The assistant `content` array includes `{type:"image_url", image_url:{url:"data:image/jpeg;base64,..."}}`. Write that payload to disk — do not expect a remote http URL. See **Image generation / editing** above.
 
 ## Performance
 

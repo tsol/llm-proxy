@@ -57,6 +57,13 @@ import {
   unsupportedInputModalities,
   resolveModelCapabilities,
 } from '../model-capabilities';
+import {
+  assistantContentHasImage,
+  assistantContentText,
+  isImageOutputModel,
+  stripThinkingParams,
+  withImageModalities,
+} from '../image-output';
 
 const HOP_BY_HOP = new Set([
   'connection',
@@ -1437,6 +1444,17 @@ export function adaptForModel(
     }
   }
 
+  // Image-generation models reject thinking/tools; OpenAI-compat gateways
+  // also need modalities: ["image","text"] (OpenRouter). Applied last so
+  // large-context taming cannot re-inject reasoning_effort.
+  if (isImageOutputModel(model)) {
+    adapted = stripThinkingParams(adapted);
+    if (providerId === 'openrouter') {
+      adapted = withImageModalities(adapted);
+    }
+    if (adapted.stream) adapted = { ...adapted, stream: false };
+  }
+
   return adapted;
 }
 
@@ -1636,8 +1654,8 @@ async function forwardChatCompletionOnce(
   const model = activeModel.trim() || adapter.resolveModel(body.model);
   const requestCtx = captureRequestContext(body.messages);
   const promptEstimate = estimateTokensFromMessages(body.messages);
-  const url = adapter.chatCompletionsUrl();
-  const headers = forwardHeaders(
+  let url = adapter.chatCompletionsUrl();
+  let headers = forwardHeaders(
     incomingHeaders,
     adapter.config.apiKey,
     adapter.config.extraHeaders,
@@ -1693,6 +1711,17 @@ async function forwardChatCompletionOnce(
     ...adaptedBody,
     model,
   });
+  let postBody: unknown = patchedPayload;
+  const prepared = adapter.prepareChat?.(model, patchedPayload, { url, headers });
+  if (prepared) {
+    url = prepared.url;
+    if (prepared.headers) headers = prepared.headers;
+    postBody = prepared.payload;
+    if (prepared.forceSync) {
+      streaming = false;
+      body.stream = false;
+    }
+  }
 
   const requestedModelName = String(body.model ?? '');
 
@@ -2134,7 +2163,7 @@ async function forwardChatCompletionOnce(
 
   // === Non-streaming path ===
   try {
-    const upstream = await resilientPost(url, patchedPayload, {
+    const upstream = await resilientPost(url, postBody, {
       headers,
       validateStatus: () => true,
       signal: upstreamAbort.signal,
@@ -2255,6 +2284,10 @@ async function forwardChatCompletionOnce(
 
     const upstreamFailed = upstream.status >= 400;
 
+    if (!upstreamFailed && adapter.normalizeChatResponse) {
+      upstream.data = adapter.normalizeChatResponse(upstream.data, model);
+    }
+
     // Track live rate-limit headers from upstream
     trackUpstreamHeaders(
       adapter.id,
@@ -2362,29 +2395,28 @@ async function forwardChatCompletionOnce(
     let errorDetail = upstreamFailed
       ? formatUpstreamError(upstream.status, upstream.data)
       : undefined;
-    let completionText =
+    const firstChoiceContent =
       !upstreamFailed &&
       typeof upstream.data === 'object' &&
       upstream.data &&
       'choices' in upstream.data
-        ? String(
-            (
-              upstream.data as {
-                choices?: Array<{ message?: { content?: string } }>;
-              }
-            ).choices?.[0]?.message?.content ?? '',
-          )
-        : '';
+        ? (
+            upstream.data as {
+              choices?: Array<{ message?: { content?: unknown } }>;
+            }
+          ).choices?.[0]?.message?.content
+        : undefined;
+    let completionText = assistantContentText(firstChoiceContent);
 
     // Placeholder/blank content collapse (gonka non-stream) — strip the
     // `[no visible text]`-family tokens from ANYWHERE in the reply (whole or
     // embedded suffix). Keeps any real narration and tool_calls. If only
     // placeholders/whitespace were present, content becomes truly empty and
     // empty-generation detection (below) routes it to the fallback chain.
-    let firstMsg: { content?: string; tool_calls?: unknown } | undefined;
+    let firstMsg: { content?: unknown; tool_calls?: unknown } | undefined;
     if (!upstreamFailed) {
       firstMsg = (upstream.data as unknown as {
-        choices?: Array<{ message?: { content?: string } }>;
+        choices?: Array<{ message?: { content?: unknown } }>;
       })?.choices?.[0]?.message;
       if (firstMsg && typeof firstMsg.content === 'string') {
         const cleaned = stripPlaceholderTokens(firstMsg.content);
@@ -2411,7 +2443,12 @@ async function forwardChatCompletionOnce(
     // calls — a silent generation. Retry another provider instead of returning
     // a pathological `200 ""` that stalls the client's own empty-response
     // recovery.
-    if (!upstreamFailed && hasNoRealContent(completionText) && !messageHasToolCalls(firstMsg)) {
+    if (
+      !upstreamFailed &&
+      hasNoRealContent(completionText) &&
+      !assistantContentHasImage(firstMsg?.content) &&
+      !messageHasToolCalls(firstMsg)
+    ) {
       recordModelResponse(`${adapter.id}:${model}`, 0);
       recordRequestEnd(reqId, 0, 'empty-generated');
       logProxyError({

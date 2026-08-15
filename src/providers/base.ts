@@ -1,7 +1,9 @@
 import axios from 'axios';
 import type {
+  ChatCompletionRequest,
   ModelListResult,
   OpenAIModel,
+  PreparedChatRequest,
   ProviderAdapter,
   ProviderConfig,
   ProviderPricing,
@@ -15,6 +17,17 @@ import {
 } from './deepseek-pricing';
 import { resolveModelCapabilities } from '../model-capabilities';
 import { CursorProvider } from './cursor';
+import {
+  flattenAssistantImages,
+  googleGenerateContentUrl,
+  isGeminiNativeResponse,
+  isImageOutputModel,
+  geminiResponseToOpenAI,
+  openaiChatToGeminiGenerateContent,
+  stripThinkingParams,
+  withImageModalities,
+  VISION_AND_IMAGE_OUT,
+} from '../image-output';
 
 const CONTEXT_LENGTH_KEYS = [
   'context_length',
@@ -86,6 +99,9 @@ const GOOGLE_MODELS: OpenAIModel[] = [
   object: 'model' as const,
   created: 0,
   owned_by: 'google',
+  ...(isImageOutputModel(id)
+    ? { capabilities: VISION_AND_IMAGE_OUT }
+    : {}),
 }));
 
 export abstract class OpenAICompatibleProvider implements ProviderAdapter {
@@ -102,6 +118,32 @@ export abstract class OpenAICompatibleProvider implements ProviderAdapter {
 
   chatCompletionsUrl(): string {
     return `${this.config.baseUrl.replace(/\/$/, '')}/chat/completions`;
+  }
+
+  /**
+   * Default image-out path for OpenAI-compatible upstreams (OpenRouter, etc.):
+   * request image modalities, drop thinking/tools, force a single JSON reply.
+   */
+  prepareChat(
+    model: string,
+    body: ChatCompletionRequest,
+    defaults: { url: string; headers: Record<string, string> },
+  ): PreparedChatRequest | void {
+    if (!isImageOutputModel(model)) return;
+    const payload: ChatCompletionRequest = {
+      ...withImageModalities(stripThinkingParams(body)),
+      stream: false,
+    };
+    return {
+      url: defaults.url,
+      headers: defaults.headers,
+      payload,
+      forceSync: true,
+    };
+  }
+
+  normalizeChatResponse(raw: unknown, _model: string): unknown {
+    return flattenAssistantImages(raw);
   }
 
   resolveModel(requestedModel?: string): string {
@@ -401,6 +443,30 @@ export class GoogleProvider extends OpenAICompatibleProvider {
 
   getPricing(model: string): ProviderPricing {
     return getGoogleModelPricing(model, this.config.pricing);
+  }
+
+  prepareChat(
+    model: string,
+    body: ChatCompletionRequest,
+    defaults: { url: string; headers: Record<string, string> },
+  ): PreparedChatRequest | void {
+    if (!isImageOutputModel(model)) return super.prepareChat(model, body, defaults);
+    return {
+      url: googleGenerateContentUrl(this.config.baseUrl, model),
+      headers: {
+        'content-type': 'application/json',
+        'x-goog-api-key': this.config.apiKey,
+      },
+      payload: openaiChatToGeminiGenerateContent(body, model),
+      forceSync: true,
+    };
+  }
+
+  normalizeChatResponse(raw: unknown, model: string): unknown {
+    if (isGeminiNativeResponse(raw)) {
+      return flattenAssistantImages(geminiResponseToOpenAI(raw, model));
+    }
+    return flattenAssistantImages(raw);
   }
 }
 

@@ -44,6 +44,10 @@ export interface ModelCapabilities {
 
 export const TEXT_ONLY: ModelCapabilities = { input_modalities: ['text'], output_modalities: ['text'] };
 export const TEXT_AND_IMAGE: ModelCapabilities = { input_modalities: ['text', 'image'], output_modalities: ['text'] };
+export const VISION_AND_IMAGE_OUT: ModelCapabilities = {
+  input_modalities: ['text', 'image'],
+  output_modalities: ['text', 'image'],
+};
 
 // ---- Rate limits ----
 export interface ProviderRateLimit {

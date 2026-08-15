@@ -1,10 +1,11 @@
 import type { ChatMessage, ProviderId, ModelCapabilities } from './types';
 import { getProvider } from './providers/registry';
+import { isImageOutputModel, VISION_AND_IMAGE_OUT, VISION_IN } from './image-output';
 
 export type Modality = 'text' | 'image' | 'audio' | 'video';
 
 const TEXT_ONLY: ModelCapabilities = { input_modalities: ['text'], output_modalities: ['text'] };
-const TEXT_AND_IMAGE: ModelCapabilities = { input_modalities: ['text', 'image'], output_modalities: ['text'] };
+const TEXT_AND_IMAGE: ModelCapabilities = VISION_IN;
 
 function contentPartModality(part: unknown): Modality | null {
   if (!part || typeof part !== 'object') return null;
@@ -69,6 +70,7 @@ export function resolveModelCapabilities(
   }
 
   if (provider === 'openrouter') {
+    if (isImageOutputModel(upstreamId)) return VISION_AND_IMAGE_OUT;
     // OpenRouter routes to many models; default to text-only unless hints say otherwise
     if (hints.vision === true) return TEXT_AND_IMAGE;
     return TEXT_ONLY;
@@ -82,6 +84,7 @@ export function resolveModelCapabilities(
 
   if (provider === 'google') {
     const id = upstreamId.replace(/^models\//, '').toLowerCase();
+    if (isImageOutputModel(id)) return VISION_AND_IMAGE_OUT;
     if (/embed|tts|transcribe|imagen|veo|audio|video|live|robotics/.test(id)) return TEXT_ONLY;
     if (/gemini|gemma|antigravity/.test(id)) return TEXT_AND_IMAGE;
     return TEXT_ONLY;
