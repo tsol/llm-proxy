@@ -597,6 +597,11 @@ export async function listCatalogModels(opts?: {
            norm(e.upstreamId).endsWith(`/${norm(shortModel)}`)),
       );
       const upstreamModel = realEntry?.upstreamId ?? shortModel;
+      const capabilities =
+        realEntry?.model.capabilities ??
+        resolveModelCapabilities(provider as ProviderId, upstreamModel, {
+          modelType: realEntry?.model.model_type,
+        });
 
       // Advertise the MINIMUM context across the alias's whole fallback chain so
       // the client compresses in time for the tightest model that could serve it.
@@ -616,6 +621,7 @@ export async function listCatalogModels(opts?: {
           isDefault: alias === activeDefault,
           created: 0,
           contextLength: aliasContextLength,
+          capabilities,
         }));
       } catch {
         // Skip if provider unknown
@@ -683,6 +689,11 @@ function findEntry(requested: string): CatalogEntry | undefined {
            norm(e.upstreamId).endsWith(`/${norm(shortModel)}`)),
       );
       const upstreamModel = realEntry?.upstreamId ?? shortModel;
+      const capabilities =
+        realEntry?.model.capabilities ??
+        resolveModelCapabilities(provider as ProviderId, upstreamModel, {
+          modelType: realEntry?.model.model_type,
+        });
 
       const adapter = getProvider(provider as ProviderId);
       const pricing = adapter.getPricing(upstreamModel);
@@ -696,6 +707,7 @@ function findEntry(requested: string): CatalogEntry | undefined {
           pricing,
           isDefault: false,
           created: 0,
+          capabilities,
         }),
       };
     }

@@ -79,6 +79,7 @@ export function resolveModelCapabilities(
   if (provider === 'local') {
     if (hints.vision === true) return TEXT_AND_IMAGE;
     if (hints.modelType?.toLowerCase() === 'vlm') return TEXT_AND_IMAGE;
+    if (/\bvlm\b|-vl\b|vision|qwen2-vl/i.test(upstreamId)) return TEXT_AND_IMAGE;
     return TEXT_ONLY;
   }
 

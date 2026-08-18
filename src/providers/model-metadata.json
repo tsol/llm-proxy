@@ -207,6 +207,13 @@
   },
   "local": {
     "rateLimits": {},
-    "models": {}
+    "models": {
+      "qwen2-vl": {
+        "contextLength": 32768,
+        "contextSteps": [32768, 16384, 8192, 4096],
+        "concurrent": 1,
+        "gpuPrep": { "exclusive": true }
+      }
+    }
   }
 }

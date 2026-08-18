@@ -17,6 +17,8 @@ interface ModelMeta {
   presencePenalty?: number;
   topP?: number;
   repetitionPenalty?: number;
+  contextSteps?: number[];
+  gpuPrep?: { exclusive?: boolean };
 }
 
 interface ProviderMeta {
@@ -63,7 +65,44 @@ export function getMetadataModelQuirks(providerId: string): Record<string, Model
       ...(meta.presencePenalty !== undefined ? { presencePenalty: meta.presencePenalty } : {}),
       ...(meta.topP !== undefined ? { topP: meta.topP } : {}),
       ...(meta.repetitionPenalty !== undefined ? { repetitionPenalty: meta.repetitionPenalty } : {}),
+      ...(meta.contextSteps && meta.contextSteps.length > 0
+        ? { contextSteps: [...meta.contextSteps] }
+        : {}),
+      ...(meta.gpuPrep ? { gpuPrep: { ...meta.gpuPrep } } : {}),
     };
   }
   return quirks;
+}
+
+/**
+ * Resolve the effective quirk for a model. Keys may be exact ids, prefix
+ * boundaries (`MiniMaxAI/`), or substrings (`qwen2-vl` matches
+ * `lmstudio-community/qwen2-vl-7b-instruct`). Matching keys merge
+ * shortest→longest so a specific entry overrides a broad prefix.
+ */
+export function resolveModelQuirk(
+  model: string,
+  modelQuirks?: Record<string, ModelQuirkOverrides>,
+): ModelQuirkOverrides | undefined {
+  if (!modelQuirks) return undefined;
+  const matched = Object.keys(modelQuirks)
+    .filter((key) => quirkKeyMatches(model, key))
+    .sort((a, b) => a.length - b.length);
+
+  if (matched.length === 0) return undefined;
+  const merged: ModelQuirkOverrides = {};
+  for (const key of matched) {
+    Object.assign(merged, modelQuirks[key]);
+  }
+  return merged;
+}
+
+export function quirkKeyMatches(model: string, key: string): boolean {
+  if (!key) return false;
+  if (model === key) return true;
+  if (key.endsWith('/')) return model.startsWith(key);
+  if (model.startsWith(`${key}/`)) return true;
+  const lowerModel = model.toLowerCase();
+  const lowerKey = key.toLowerCase();
+  return lowerModel.includes(lowerKey);
 }

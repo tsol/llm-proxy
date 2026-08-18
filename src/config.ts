@@ -72,6 +72,20 @@ function envRateLimit(prefix: string, defaults: ProviderRateLimits = {}): Provid
 const repoRoot = path.resolve(__dirname, '..', '..', '..', '..');
 const logsDir = path.resolve(repoRoot, env('LOGS_DIR', 'logs'));
 
+function seedEnvAliases(): void {
+  const envMap = new Map<string, string[]>();
+  for (let i = 1; ; i++) {
+    const alias = env(`MODEL${i}_ALIAS`);
+    const tryChain = env(`MODEL${i}_TRY`);
+    if (!alias) break;
+    if (!tryChain) continue;
+    const chain = tryChain.split(',').map((s) => s.trim()).filter(Boolean);
+    if (chain.length > 0) envMap.set(alias, chain);
+  }
+  setEnvAliases(envMap);
+}
+seedEnvAliases();
+
 export const appConfig = {
   port: envNum('PORT', 5001),
   host: env('HOST', '0.0.0.0'),
@@ -123,20 +137,12 @@ export const appConfig = {
    *    .env — MODEL{n}_ALIAS / MODEL{n}_TRY
    *    store/aliases.json — user-managed via /v1/aliases API
    *  On failure, the proxy tries each chain entry in order.
-   *  Per-provider endpoints (/deepseek/v1/...) have no fallback — only the root /v1 does. */
-  modelAliases: (() => {
-    const envMap = new Map<string, string[]>();
-    for (let i = 1; ; i++) {
-      const alias = env(`MODEL${i}_ALIAS`);
-      const tryChain = env(`MODEL${i}_TRY`);
-      if (!alias) break;
-      if (!tryChain) continue;
-      const chain = tryChain.split(',').map((s) => s.trim()).filter(Boolean);
-      if (chain.length > 0) envMap.set(alias, chain);
-    }
-    setEnvAliases(envMap);
+   *  Per-provider endpoints (/deepseek/v1/...) have no fallback — only the root /v1 does.
+   *  Getter (not a startup snapshot): POST /v1/aliases must be visible to
+   *  /v1/models and /v1/chat/completions without a proxy restart. */
+  get modelAliases(): Map<string, string[]> {
     return getMergedAliases();
-  })(),
+  },
   /** Backward-compat: global fallback chain for any model not in modelAliases above. */
   modelFallbackChain: env('MODEL_FALLBACK_CHAIN')
     .split(',')
@@ -245,7 +251,7 @@ export const providerConfigs: Record<ProviderId, ProviderConfig> = {
     pricing: buildPricing('LOCAL', { inputPerMillion: 0, outputPerMillion: 0 }),
     ownedBy: 'lm-studio',
     defaultContextLength: 128_000,
-    modelQuirks: {},
+    modelQuirks: { ...metaModelQuirks.local },
   },
 
   gonka: {

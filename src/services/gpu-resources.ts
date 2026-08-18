@@ -3,6 +3,7 @@ import { execFile } from 'child_process';
 import fs from 'fs/promises';
 import { promisify } from 'util';
 import { appConfig, providerConfigs } from '../config';
+import { resolveModelQuirk } from '../providers/metadata';
 
 const execFileAsync = promisify(execFile);
 
@@ -139,6 +140,38 @@ export function isModelLoaded(
   return status.loaded.some((instance) =>
     modelKeysMatch(requested, instance.model_key),
   );
+}
+
+function loadedContextLength(
+  requested: string,
+  status: LmStudioStatus,
+): number {
+  let max = 0;
+  for (const instance of status.loaded) {
+    if (!modelKeysMatch(requested, instance.model_key)) continue;
+    max = Math.max(max, instance.context_length ?? 0);
+  }
+  return max;
+}
+
+function otherLoadedModels(
+  requested: string,
+  status: LmStudioStatus,
+): LmStudioInstance[] {
+  return status.loaded.filter(
+    (instance) => !modelKeysMatch(requested, instance.model_key),
+  );
+}
+
+let gpuPrepChain: Promise<void> = Promise.resolve();
+
+function withGpuPrepLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = gpuPrepChain.then(fn, fn);
+  gpuPrepChain = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
 }
 
 function lmHeaders(): Record<string, string> {
@@ -591,23 +624,67 @@ export interface EnsureLocalModelResult {
 export async function ensureLocalModelReady(opts: {
   model: string;
   context_length?: number;
+  exclusive?: boolean;
+  contextSteps?: number[];
+}): Promise<EnsureLocalModelResult> {
+  return withGpuPrepLock(() => ensureLocalModelReadyUnlocked(opts));
+}
+
+/** Resolve gpuPrep/contextSteps from local model quirks, then ensure ready. */
+export async function ensureLocalUpstreamReady(
+  model: string,
+): Promise<EnsureLocalModelResult> {
+  const quirk = resolveModelQuirk(model, providerConfigs.local.modelQuirks);
+  return ensureLocalModelReady({
+    model,
+    context_length: quirk?.contextLength,
+    contextSteps: quirk?.contextSteps,
+    exclusive: quirk?.gpuPrep?.exclusive === true,
+  });
+}
+
+async function ensureLocalModelReadyUnlocked(opts: {
+  model: string;
+  context_length?: number;
+  exclusive?: boolean;
+  contextSteps?: number[];
 }): Promise<EnsureLocalModelResult> {
   const model = opts.model.trim();
   if (!model) {
     throw new Error('No local model specified');
   }
 
+  const exclusive = opts.exclusive === true;
+  const preferCtx = opts.context_length;
+  const steps = normalizeContextSteps(opts.contextSteps, preferCtx);
+
   const actions: string[] = [];
   let lm = await getLmStudioStatus();
+  let comfy = exclusive ? await getComfyStatus() : undefined;
 
-  if (lm.server === 'up' && isModelLoaded(model, lm)) {
+  if (isLocalModelReady(model, lm, preferCtx, exclusive, comfy)) {
     const status = await getGpuStatus();
     return { skipped: true, actions: ['already_ready'], status };
   }
 
   console.log(
-    `[${ts()}] gpu: preparing local model "${model}" (server=${lm.server}, loaded=${lm.loaded_count})`,
+    `[${ts()}] gpu: preparing local model "${model}" (server=${lm.server}, loaded=${lm.loaded_count}, exclusive=${exclusive})`,
   );
+
+  if (exclusive && comfy?.running) {
+    setTransition('stopping_comfy', `Stopping ComfyUI so "${model}" can own VRAM...`);
+    const stopResult = await stopComfy(true);
+    actions.push(`stopped_comfy${stopResult.was_queued ? '_after_queue_drain' : ''}`);
+    comfy = await getComfyStatus();
+    lm = await getLmStudioStatus();
+  }
+
+  if (isLocalModelReady(model, lm, preferCtx, exclusive, comfy)) {
+    clearTransition();
+    const status = await getGpuStatus();
+    console.log(`[${ts()}] gpu: local prep done (${actions.join(', ') || 'no-op'})`);
+    return { skipped: false, actions, status };
+  }
 
   setTransition('starting_lmstudio', `Ensuring LM Studio is running and model "${model}" is loaded...`);
 
@@ -618,24 +695,25 @@ export async function ensureLocalModelReady(opts: {
     updateTransitionDetail('LM Studio server is up, checking model...');
   }
 
-  if (!isModelLoaded(model, lm)) {
-    if (lm.loaded_count > 0) {
-      setTransition('unloading_lmstudio', `Unloading ${lm.loaded_count} existing model(s) before loading new one...`);
-      const unloaded = await unloadLmStudio();
-      if (unloaded.unloaded.length > 0) {
-        actions.push(`unloaded_lmstudio:${unloaded.unloaded.join(',')}`);
-      }
+  const loadedCtx = loadedContextLength(model, lm);
+  const others = otherLoadedModels(model, lm);
+  const mustReloadSelf = loadedCtx > 0 && preferCtx !== undefined && loadedCtx < preferCtx;
+  if (others.length > 0 || mustReloadSelf) {
+    setTransition(
+      'unloading_lmstudio',
+      mustReloadSelf
+        ? `Unloading models before reload of "${model}" at ctx=${preferCtx}...`
+        : `Unloading ${others.length} other model(s) before loading "${model}"...`,
+    );
+    const unloaded = await unloadLmStudio();
+    if (unloaded.unloaded.length > 0) {
+      actions.push(`unloaded_lmstudio:${unloaded.unloaded.join(',')}`);
     }
+    lm = await getLmStudioStatus();
+  }
 
-    setTransition('loading_lmstudio', `Loading model "${model}"...`);
-    const loaded = await loadLmStudio({
-      model,
-      ...(opts.context_length !== undefined
-        ? { context_length: opts.context_length }
-        : {}),
-    });
-    actions.push(`loaded_lmstudio:${loaded.model}`);
-
+  if (!isModelLoaded(model, lm) || mustReloadSelf) {
+    await loadLocalModelWithSteps(model, steps, preferCtx, actions);
     lm = await getLmStudioStatus();
     if (!isModelLoaded(model, lm)) {
       clearTransition();
@@ -648,6 +726,77 @@ export async function ensureLocalModelReady(opts: {
   const status = await getGpuStatus();
   console.log(`[${ts()}] gpu: local prep done (${actions.join(', ') || 'no-op'})`);
   return { skipped: false, actions, status };
+}
+
+function isLocalModelReady(
+  model: string,
+  lm: LmStudioStatus,
+  preferCtx: number | undefined,
+  exclusive: boolean,
+  comfy: ComfyStatus | undefined,
+): boolean {
+  if (lm.server !== 'up') return false;
+  if (exclusive && comfy?.running) return false;
+  const loadedCtx = loadedContextLength(model, lm);
+  if (preferCtx !== undefined && preferCtx > 0) {
+    return loadedCtx >= preferCtx;
+  }
+  return isModelLoaded(model, lm);
+}
+
+function normalizeContextSteps(
+  contextSteps: number[] | undefined,
+  preferCtx: number | undefined,
+): number[] {
+  const raw = (contextSteps ?? []).filter((n) => Number.isFinite(n) && n > 0);
+  const unique = [...new Set(raw)].sort((a, b) => b - a);
+  const capped =
+    preferCtx !== undefined && preferCtx > 0
+      ? unique.filter((n) => n <= preferCtx)
+      : unique;
+  if (capped.length > 0) return capped;
+  if (preferCtx !== undefined && preferCtx > 0) return [preferCtx];
+  return [];
+}
+
+async function loadLocalModelWithSteps(
+  model: string,
+  steps: number[],
+  preferCtx: number | undefined,
+  actions: string[],
+): Promise<void> {
+  const attempts = steps.length > 0 ? steps : [preferCtx];
+  let lastError: unknown;
+
+  for (const ctx of attempts) {
+    const label = ctx !== undefined ? `ctx=${ctx}` : 'default ctx';
+    setTransition('loading_lmstudio', `Loading model "${model}" (${label})...`);
+    try {
+      const loaded = await loadLmStudio({
+        model,
+        ...(ctx !== undefined ? { context_length: ctx } : {}),
+      });
+      actions.push(`loaded_lmstudio:${loaded.model}${ctx !== undefined ? `@${ctx}` : ''}`);
+      const lm = await getLmStudioStatus();
+      if (isModelLoaded(model, lm)) return;
+      lastError = new Error('load reported success but model not in loaded list');
+    } catch (err) {
+      lastError = err;
+      console.log(
+        `[${ts()}] gpu: load "${model}" ${label} failed: ${err instanceof Error ? err.message : 'error'}`,
+      );
+    }
+
+    try {
+      await unloadLmStudio();
+    } catch {
+      // ignore — next attempt still needs a clean slate
+    }
+    await sleep(1_000);
+  }
+
+  const detail = lastError instanceof Error ? lastError.message : 'unknown error';
+  throw new Error(`Failed to load "${model}" at any context step: ${detail}`);
 }
 
 // ============================================================

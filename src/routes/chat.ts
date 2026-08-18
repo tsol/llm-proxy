@@ -1,7 +1,7 @@
 import { Router, type Request, type Response } from 'express';
 import type { ChatCompletionRequest, ProviderId } from '../types';
 import { resolveModelRoute, refreshProviderLive, supportedModelIds } from '../catalog';
-import { ensureLocalModelReady } from '../services/gpu-resources';
+import { ensureLocalUpstreamReady } from '../services/gpu-resources';
 import { getProvider, allProviders, getProviderIds } from '../providers';
 import { forwardChatCompletion } from '../services/forward';
 import { forwardCursorChatCompletion } from '../services/cursor-forward';
@@ -74,7 +74,7 @@ chatRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
   if (route.provider === 'local') {
     try {
-      await ensureLocalModelReady({ model: route.upstreamModel });
+      await ensureLocalUpstreamReady(route.upstreamModel);
       await refreshProviderLive('local');
     } catch (err) {
       const message =
@@ -145,6 +145,23 @@ perProviderRouter.post('/chat/completions', async (req: Request, res: Response) 
     endpointPrefix: provider,
     requestedModel: String(body.model ?? ''),
   });
+
+  if (provider === 'local') {
+    try {
+      await ensureLocalUpstreamReady(model);
+      await refreshProviderLive('local');
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'local model GPU prep failed';
+      logProxyError({
+        provider,
+        endpointPrefix: provider,
+        requestedModel: String(body.model ?? ''),
+        effectiveModel: model,
+        message,
+      });
+    }
+  }
 
   await forwardChatCompletion(adapter, model, body, req.headers, res, provider);
 });

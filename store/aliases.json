@@ -42,6 +42,26 @@
           ]
         }
       ]
+    },
+    "qwen2-vl": {
+      "groups": [
+        {
+          "strategy": "order",
+          "members": [
+            "local/lmstudio-community/qwen2-vl-7b-instruct"
+          ]
+        }
+      ]
+    },
+    "vision": {
+      "groups": [
+        {
+          "strategy": "order",
+          "members": [
+            "local/lmstudio-community/qwen2-vl-7b-instruct"
+          ]
+        }
+      ]
     }
   }
 }

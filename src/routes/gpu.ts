@@ -1,5 +1,6 @@
 import { Router, type Request, type Response } from 'express';
 import { providerConfigs } from '../config';
+import { resolveModelQuirk } from '../providers/metadata';
 import {
   ensureLocalModelReady,
   getGpuStatus,
@@ -100,11 +101,26 @@ gpuRouter.post('/gpu/local/ensure', async (req: Request, res: Response) => {
     const model =
       String(req.body?.model ?? '').trim() || providerConfigs.local.defaultModel;
     const contextLength = Number(req.body?.context_length);
+    const rawSteps = req.body?.context_steps;
+    const contextSteps = Array.isArray(rawSteps)
+      ? rawSteps.map(Number).filter((n) => Number.isFinite(n) && n > 0)
+      : undefined;
+    const exclusive =
+      req.body?.exclusive === true
+        ? true
+        : req.body?.exclusive === false
+          ? false
+          : undefined;
+    const quirk = resolveModelQuirk(model, providerConfigs.local.modelQuirks);
     const result = await ensureLocalModelReady({
       model,
       context_length: Number.isFinite(contextLength)
         ? contextLength
-        : undefined,
+        : quirk?.contextLength,
+      contextSteps: contextSteps && contextSteps.length > 0
+        ? contextSteps
+        : quirk?.contextSteps,
+      exclusive: exclusive ?? quirk?.gpuPrep?.exclusive === true,
     });
     res.json({ ok: true, ...result });
   } catch (err) {

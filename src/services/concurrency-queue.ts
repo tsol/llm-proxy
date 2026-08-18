@@ -1,6 +1,7 @@
 import type { ProviderAdapter } from '../types';
 import { appConfig } from '../config';
 import { recordBanSignal, isModelBanned, getBanInfo, bannedDetailed } from './ban';
+import { resolveModelQuirk } from '../providers/metadata';
 
 /**
  * Per-key FIFO concurrency limiter.
@@ -395,15 +396,9 @@ export function resolveConcurrentLimit(
   adapter: ProviderAdapter,
   upstreamModel: string,
 ): number | undefined {
-  const quirks = adapter.config.modelQuirks;
-  if (!quirks) return undefined;
-  const lower = upstreamModel.toLowerCase();
-  for (const [key, quirk] of Object.entries(quirks)) {
-    if (upstreamModel === key || lower.startsWith(key.toLowerCase())) {
-      if (quirk.concurrent !== undefined && quirk.concurrent > 0) {
-        return quirk.concurrent;
-      }
-    }
+  const quirk = resolveModelQuirk(upstreamModel, adapter.config.modelQuirks);
+  if (quirk?.concurrent !== undefined && quirk.concurrent > 0) {
+    return quirk.concurrent;
   }
   return undefined;
 }
@@ -490,9 +485,14 @@ function findFreeAliasGroupMember(
   state: AliasGroupState,
   strategy: 'random' | 'order' | 'fastest',
 ): AliasGroupMember | null {
-  const free = state.members.filter(
-    (m) => (state.activeByKey.get(m.key) ?? 0) < m.limit && !isModelBanned(m.key),
-  );
+  const free = state.members.filter((m) => {
+    if (isModelBanned(m.key)) return false;
+    // limit <= 0 means unlimited — same contract as acquireSlot().
+    // Store aliases whose members have no modelQuirks.concurrent were
+    // treated as capacity 0 and immediately returned "all-busy".
+    if (m.limit <= 0) return true;
+    return (state.activeByKey.get(m.key) ?? 0) < m.limit;
+  });
   if (free.length === 0) return null;
   if (strategy === 'random') return free[Math.floor(Math.random() * free.length)];
   if (strategy === 'fastest') {
@@ -604,20 +604,12 @@ export function buildAliasGroupSpecs(
       if (parts.length < 2) continue;
       const provider = parts[0];
       const model = parts.slice(1).join('/');
-      let limit = 0;
       const quirks = adapters.find(a => a.id === provider)?.config.modelQuirks ?? {};
-      const exact = quirks[model];
-      if (exact?.concurrent !== undefined && exact.concurrent > 0) {
-        limit = exact.concurrent;
-      } else {
-        const shortModel = model.split('/').pop()!;
-        for (const [qk, qv] of Object.entries(quirks)) {
-          if (qk.endsWith('/' + shortModel) && qv.concurrent !== undefined && qv.concurrent > 0) {
-            limit = qv.concurrent;
-            break;
-          }
-        }
-      }
+      const quirk = resolveModelQuirk(model, quirks);
+      const limit =
+        quirk?.concurrent !== undefined && quirk.concurrent > 0
+          ? quirk.concurrent
+          : 0;
       members.push({ provider, model, limit, key: `${provider}:${model}` });
     }
     specs.push({ key: `${alias}:g${gi}`, alias, strategy, members });

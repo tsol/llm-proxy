@@ -130,6 +130,14 @@ export interface ModelQuirkOverrides {
   /** Non-standard knob some backends accept (vLLM/gonka-adjacent). Omitted by
    *  default for OpenAI-compatible providers — opt-in only. */
   repetitionPenalty?: number;
+  /** Decreasing LM Studio context lengths to try if the preferred window
+   *  does not fit in VRAM (e.g. 32768 → 16384 → 8192 → 4096). */
+  contextSteps?: number[];
+  /** GPU pre-hook before forwarding a local (LM Studio) chat request. */
+  gpuPrep?: {
+    /** Stop ComfyUI and unload other LM Studio models so this one owns VRAM. */
+    exclusive?: boolean;
+  };
 }
 
 export interface RouterSnapshot {

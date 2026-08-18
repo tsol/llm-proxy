@@ -10,6 +10,7 @@ import type {
   TokenUsage,
 } from '../types';
 import { appConfig } from '../config';
+import { resolveModelQuirk } from '../providers/metadata';
 import { getAliasGroups } from '../services/alias-store';
 import { resilientPost } from './resilient-http';
 import {
@@ -19,7 +20,7 @@ import {
   estimateTokensFromText,
   logCost,
 } from '../services/cost-logger';
-import { resolveModelRoute } from '../catalog';
+import { resolveModelRoute, refreshProviderLive } from '../catalog';
 import { getProvider } from '../providers';
 import { logRequestDump } from '../services/request-dump-logger';
 import {
@@ -51,6 +52,7 @@ import {
   type AliasGroupSpec,
 } from './concurrency-queue';
 import { isModelBanned, recordBanSignal } from './ban';
+import { ensureLocalUpstreamReady } from './gpu-resources';
 import { allProviders } from '../providers';
 import {
   messageInputModalities,
@@ -1333,33 +1335,6 @@ export function sanitizePlaceholderStream(
  *  - leave `reasoning_content` in place for Moonshot Kimi (needs round-trip);
  *  - apply existing prompt overrides + empty-tool_calls sanitization.
  */
-/**
- * Resolve the effective quirk for a model from a per-provider quirk map.
- * Keys may be exact model ids OR prefix boundaries (e.g. `MiniMaxAI/` matches
- * every MiniMax model id). All matching keys are merged shortest→longest so a
- * specific model entry overrides a broad prefix base.
- */
-function resolveModelQuirk(
-  model: string,
-  modelQuirks?: Record<string, ModelQuirkOverrides>,
-): ModelQuirkOverrides | undefined {
-  if (!modelQuirks) return undefined;
-  const matched = Object.keys(modelQuirks)
-    .filter((key) => {
-      if (model === key) return true;
-      const boundary = key.endsWith('/') ? key : `${key}/`;
-      return model.startsWith(boundary);
-    })
-    .sort((a, b) => a.length - b.length);
-
-  if (matched.length === 0) return undefined;
-  const merged: ModelQuirkOverrides = {};
-  for (const key of matched) {
-    Object.assign(merged, modelQuirks[key]);
-  }
-  return merged;
-}
-
 export function adaptForModel(
   body: ChatCompletionRequest,
   providerId: ProviderId,
@@ -1652,6 +1627,23 @@ async function forwardChatCompletionOnce(
   markIncomingDone?: () => void,
 ): Promise<void> {
   const model = activeModel.trim() || adapter.resolveModel(body.model);
+
+  if (adapter.id === 'local') {
+    try {
+      await ensureLocalUpstreamReady(model);
+      await refreshProviderLive('local');
+    } catch (err) {
+      logProxyError({
+        provider: adapter.id,
+        endpointPrefix,
+        requestedModel: String(body.model ?? ''),
+        effectiveModel: model,
+        message:
+          err instanceof Error ? err.message : 'local model GPU prep failed',
+      });
+    }
+  }
+
   const requestCtx = captureRequestContext(body.messages);
   const promptEstimate = estimateTokensFromMessages(body.messages);
   let url = adapter.chatCompletionsUrl();
