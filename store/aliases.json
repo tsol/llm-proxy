@@ -62,6 +62,18 @@
           ]
         }
       ]
+    },
+    "deepseek-flash": {
+      "groups": [
+        {
+          "strategy": "order",
+          "members": [
+            "gonka/deepseek-ai/DeepSeek-V4-Flash-0731",
+            "gonka-api/deepseek-ai/DeepSeek-V4-Flash-0731",
+            "gonka-router-io/deepseek-ai/DeepSeek-V4-Flash-0731"
+          ]
+        }
+      ]
     }
   }
 }

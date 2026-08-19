@@ -86,6 +86,9 @@
       "MiniMaxAI/MiniMax-M2.7": {
         "concurrent": 3,
         "reasoningEffort": "low"
+      },
+      "deepseek-ai/DeepSeek-V4-Flash-0731": {
+        "concurrent": 3
       }
     }
   },
@@ -103,6 +106,9 @@
       "MiniMaxAI/MiniMax-M2.7": {
         "concurrent": 3,
         "reasoningEffort": "low"
+      },
+      "deepseek-ai/DeepSeek-V4-Flash-0731": {
+        "concurrent": 3
       }
     }
   },
@@ -120,6 +126,9 @@
       "MiniMaxAI/MiniMax-M2.7": {
         "concurrent": 3,
         "reasoningEffort": "low"
+      },
+      "deepseek-ai/DeepSeek-V4-Flash-0731": {
+        "concurrent": 3
       }
     }
   },
@@ -137,6 +146,9 @@
       "MiniMaxAI/MiniMax-M2.7": {
         "concurrent": 3,
         "reasoningEffort": "low"
+      },
+      "deepseek-ai/DeepSeek-V4-Flash-0731": {
+        "concurrent": 3
       }
     }
   },
@@ -154,6 +166,9 @@
       "MiniMaxAI/MiniMax-M2.7": {
         "concurrent": 3,
         "reasoningEffort": "low"
+      },
+      "deepseek-ai/DeepSeek-V4-Flash-0731": {
+        "concurrent": 3
       }
     }
   },
@@ -171,6 +186,9 @@
       "MiniMaxAI/MiniMax-M2.7": {
         "concurrent": 3,
         "reasoningEffort": "low"
+      },
+      "deepseek-ai/DeepSeek-V4-Flash-0731": {
+        "concurrent": 3
       }
     }
   },
@@ -188,6 +206,9 @@
       "MiniMaxAI/MiniMax-M2.7": {
         "concurrent": 3,
         "reasoningEffort": "low"
+      },
+      "deepseek-ai/DeepSeek-V4-Flash-0731": {
+        "concurrent": 3
       }
     }
   },
