@@ -44,7 +44,7 @@ function preview(first, last) {
 function stat(k, stats) {
   const s = stats[k];
   if (!s || !s.total) return '';
-  const cls = s.lastStatus < 400 ? 'ok' : 'err';
+  const cls = (s.lastStatus >= 200 && s.lastStatus < 400) ? 'ok' : 'err';
   return '<span class="' + cls + '"> ok=' + s.ok + ' fail=' + s.fail + ' last=' + s.lastStatus + ' total=' + s.total + '</span>';
 }
 
@@ -69,7 +69,8 @@ async function tick() {
         const cls = s.lastStatus < 400 ? 'ok' : 'err';
         let line = '<span class="item ' + cls + '">' + esc(k) + '  ok=' + s.ok + ' fail=' + s.fail + ' last=' + s.lastStatus + ' total=' + s.total;
         if (lastR) {
-          line += '  ' + preview(lastR.reqPreview, lastR.respPreview);
+          line += '  ' + preview(lastR.reqPreview, lastR.reqSuffix);
+          if (lastR.respPreview) line += '  →  ' + esc(lastR.respPreview);
         }
         line += '</span>';
         lines.push(line);
@@ -91,7 +92,7 @@ async function tick() {
       }
       for (const gk of Object.keys(byGroup).sort()) {
         const grp = byGroup[gk];
-        const isGroup = grp.strategy === 'random';
+        const isGroup = grp.strategy === 'random' || grp.strategy === 'fastest' || grp.strategy === 'safest';
         lines.push('<span class="dim">  ' + grp.strategy + ' (' + grp.members.length + ')' + (isGroup ? ' [G]' : '') + '</span>');
         for (const m of grp.members) {
           const k = m.provider + ':' + m.model;
@@ -121,7 +122,12 @@ async function tick() {
       for (const a of incoming) {
         const dur = Math.round((Date.now() - a.startedAt) / 1000);
         const cls = dur > 60 ? 'stale' : '';
-        lines.push('<span class="item ' + cls + '">  ' + dur + 's  ' + esc(a.preview) + '</span>');
+        lines.push('<span class="item ' + cls + '">  #' + esc(a.id || '?')
+          + '  ' + dur + 's  msgs=' + (a.msgCount || '?')
+          + '  ' + preview(a.preview, '') + '</span>');
+        if (a.lastClip) {
+          lines.push('<span class="item dim">      last ' + esc(a.lastRole || '') + '  ' + esc(a.lastClip) + '</span>');
+        }
       }
     } else {
       lines.push('<span class="dim">  incoming (0)</span>');
@@ -148,7 +154,9 @@ async function tick() {
         const stale = dur > 60 ? ' stale' : '';
         lines.push('<span class="item ' + cls + stale + '">' + esc(r.provider + '/' + r.model)
           + '  ' + r.status + '  ' + dur + 's  '
-          + preview(r.reqPreview, r.respPreview) + '</span>');
+          + preview(r.reqPreview, r.reqSuffix)
+          + (r.respPreview ? '  →  ' + esc(r.respPreview) : '')
+          + '</span>');
       }
     }
 

@@ -1,34 +1,100 @@
 {
   "version": 2,
   "aliases": {
-    "kimi": {
+    "pers": {
+      "groups": [
+        {
+          "strategy": "safest",
+          "members": [
+            "gonka/deepseek-ai/DeepSeek-V4-Flash-0731",
+            "gonka-api/deepseek-ai/DeepSeek-V4-Flash-0731",
+            "gonka-router-io/deepseek-ai/DeepSeek-V4-Flash-0731",
+            "gonka/MiniMaxAI/MiniMax-M2.7",
+            "gonka-api/MiniMaxAI/MiniMax-M2.7",
+            "gonka-router-io/MiniMaxAI/MiniMax-M2.7",
+            "hyperfusion/MiniMaxAI/MiniMax-M2.7",
+            "gonka/zai-org/GLM-5.3-Flash",
+            "gonka-api/zai-org/GLM-5.3-Flash",
+            "gonka-router-io/zai-org/GLM-5.3-Flash",
+            "openrouter/openrouter/free"
+          ],
+          "nodata_try_parallel": {
+            "on_sec": 30,
+            "additional_requests": 1
+          }
+        }
+      ]
+    },
+    "gdeep": {
+      "groups": [
+        {
+          "strategy": "safest",
+          "members": [
+            "gonka/deepseek-ai/DeepSeek-V4-Flash-0731",
+            "gonka-api/deepseek-ai/DeepSeek-V4-Flash-0731",
+            "gonka-router-io/deepseek-ai/DeepSeek-V4-Flash-0731",
+          ],
+          "nodata_try_parallel": {
+            "on_sec": 30,
+            "additional_requests": 1
+          }
+        }
+      ]
+    },
+    "gmain": {
+      "groups": [
+        {
+          "strategy": "safest",
+          "members": [
+            "gonka/deepseek-ai/DeepSeek-V4-Flash-0731",
+            "gonka-api/deepseek-ai/DeepSeek-V4-Flash-0731",
+            "gonka-router-io/deepseek-ai/DeepSeek-V4-Flash-0731",
+          ],
+          "nodata_try_parallel": {
+            "on_sec": 30,
+            "additional_requests": 1
+          }
+        }
+      ]
+    },
+    "gglm": {
       "groups": [
         {
           "strategy": "order",
           "members": [
-            "gonka/moonshotai/Kimi-K2.6",
-            "gonka-api/moonshotai/Kimi-K2.6",
-            "gonka-router-io/moonshotai/Kimi-K2.6",
+            "gonka/zai-org/GLM-5.3-Flash",
+            "gonka-api/zai-org/GLM-5.3-Flash",
+            "gonka-router-io/zai-org/GLM-5.3-Flash",
+          ]
+        }
+      ]
+    },
+    "gmmax": {
+      "groups": [
+        {
+          "strategy": "safest",
+          "members": [
             "gonka/MiniMaxAI/MiniMax-M2.7",
             "gonka-api/MiniMaxAI/MiniMax-M2.7",
             "gonka-router-io/MiniMaxAI/MiniMax-M2.7",
             "hyperfusion/MiniMaxAI/MiniMax-M2.7"
-          ]
+          ],
+          "nodata_try_parallel": {
+            "on_sec": 30,
+            "additional_requests": 1
+          }
         }
       ]
     },
     "minimax": {
       "groups": [
         {
-          "strategy": "order",
+          "strategy": "safest",
           "members": [
             "gonka/MiniMaxAI/MiniMax-M2.7",
             "gonka-api/MiniMaxAI/MiniMax-M2.7",
             "gonka-router-io/MiniMaxAI/MiniMax-M2.7",
-            "hyperfusion/MiniMaxAI/MiniMax-M2.7",
-            "gonka/moonshotai/Kimi-K2.6",
-            "gonka-api/moonshotai/Kimi-K2.6",
-            "gonka-router-io/moonshotai/Kimi-K2.6"
+            "hyperfusion/MiniMaxAI/MiniMax-M2.7"
           ]
         }
       ]
@@ -70,7 +136,18 @@
           "members": [
             "gonka/deepseek-ai/DeepSeek-V4-Flash-0731",
             "gonka-api/deepseek-ai/DeepSeek-V4-Flash-0731",
-            "gonka-router-io/deepseek-ai/DeepSeek-V4-Flash-0731"
+            "gonka-router-io/deepseek-ai/DeepSeek-V4-Flash-0731",
+            "gonka-dahl/deepseek-ai/DeepSeek-V4-Flash-0731"
+          ]
+        }
+      ]
+    },
+    "muse": {
+      "groups": [
+        {
+          "strategy": "order",
+          "members": [
+            "openrouter/meta/muse-spark-1.3-contributor"
           ]
         }
       ]

@@ -136,4 +136,48 @@ const chunks = [
   console.log('PASS  non-minimax plain stream passes through untouched');
 }
 
+const {
+  splitMiniMaxThink,
+  rewriteStreamForMiniMaxThink,
+} = require('../dist/services/forward.js');
+
+{
+  const closed = splitMiniMaxThink('<think>plan</think>\nПривет');
+  assert.ok(closed);
+  assert.strictEqual(closed.reasoning.trim(), 'plan');
+  assert.strictEqual(closed.content, 'Привет');
+  const noOpen = splitMiniMaxThink('plan</think>\nПривет');
+  assert.ok(noOpen);
+  assert.strictEqual(noOpen.content, 'Привет');
+  const unclosed = splitMiniMaxThink('<think>still thinking about the user');
+  assert.ok(unclosed);
+  assert.strictEqual(unclosed.content, '');
+  assert.strictEqual(splitMiniMaxThink('просто текст'), null);
+  console.log('PASS  splitMiniMaxThink closed / no-open / unclosed');
+}
+
+{
+  const text = '<think>I should greet</think>\nПривет';
+  const src = [
+    Buffer.from(
+      'data: {"choices":[{"index":0,"delta":{"content":"<think>I should greet</think>\\nПривет"},"finish_reason":null}]}\n\n',
+    ),
+    Buffer.from('data: [DONE]\n\n'),
+  ];
+  const out = rewriteStreamForMiniMaxThink(src, text, 'MiniMaxAI/MiniMax-M2.7');
+  const joined = Buffer.concat(out).toString('utf8');
+  assert.ok(joined.includes('"content":"Привет"'), 'visible reply in content');
+  assert.ok(joined.includes('reasoning_content'), 'reasoning peeled out');
+  assert.ok(!joined.includes('<think>'), 'raw think tag not forwarded in content');
+  console.log('PASS  rewriteStreamForMiniMaxThink peels think into reasoning_content');
+}
+
+{
+  const text = '<think>truncated thinking with no answer';
+  const src = [Buffer.from('data: {"choices":[{"index":0,"delta":{"content":"<think>truncated thinking with no answer"},"finish_reason":"length"}]}\n\n')];
+  const out = rewriteStreamForMiniMaxThink(src, text, 'MiniMaxAI/MiniMax-M2.7');
+  assert.strictEqual(Buffer.concat(out).toString('utf8'), Buffer.concat(src).toString('utf8'));
+  console.log('PASS  think-only stream left untouched for empty/fallback path');
+}
+
 console.log('\nAll minimax streaming-conversion tests passed.');

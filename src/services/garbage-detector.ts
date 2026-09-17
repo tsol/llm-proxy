@@ -373,7 +373,137 @@ export function stripPlaceholderTokens(text: string): string {
  * return `true` here — callers must separately check whether the response
  * carried `tool_calls` before treating it as a failed generation.
  */
+/**
+ * Strip inline `<think>…</think>` (and unclosed `<think>…`) so "visible"
+ * content is what a client with hidden reasoning actually sees.
+ *
+ * MiniMax on gonka often dumps the whole reply inside an unclosed `<think>`
+ * block. Hermes then reports thinking-only / empty and never sends a Telegram
+ * reply even though the proxy logged a 200.
+ */
+export function stripThinkBlocks(text: string): string {
+  if (typeof text !== 'string' || !text) return '';
+  let s = text.replace(/<think\b[^>]*>[\s\S]*?<\/think>/gi, '');
+  const unclosed = s.search(/<think\b/i);
+  if (unclosed !== -1) s = s.slice(0, unclosed);
+  return s;
+}
+
 export function hasNoRealContent(text: string): boolean {
   if (typeof text !== 'string') return true;
-  return stripPlaceholderTokens(text).trim().length === 0;
+  return stripPlaceholderTokens(stripThinkBlocks(text)).trim().length === 0;
+}
+
+/** `lastStatus` for text/CJK/digit garbage (dashboard: `000 · garbage`). */
+export const GARBAGE_STATUS_TEXT = 0;
+/**
+ * `lastStatus` for truncated / schema-broken `tool_calls` (dashboard: `001 · garbage`).
+ * Same fallback+ban treatment as text garbage — different code so the two are distinguishable.
+ */
+export const GARBAGE_STATUS_MALFORMED_TOOL_CALLS = 1;
+
+export type MalformedToolCallReason =
+  | 'tool_calls_null'
+  | 'tool_calls_not_array'
+  | 'missing_name'
+  | 'null_arguments'
+  | 'invalid_arguments_json';
+
+/**
+ * Detects OpenAI-shaped `tool_calls` that will crash strict clients (`len(None)`
+ * on `function.name` / `arguments`) or cannot be executed.
+ *
+ * Seen from Gonka/Kimi as HTTP 200 `finish_reason: "tool_calls"` with e.g.:
+ *   - `"arguments": "command\\": \\"...run-approval.sh\\"} "`  (JSON chopped, no leading `{`)
+ *   - a second entry `{ "function": { "arguments": " {\\"" }, "index": 0 }` (no `name`)
+ *
+ * Not the same as {@link isGarbage} (CJK / tokenizer storms in `content`).
+ *
+ * @returns a reason tag, or `null` when `toolCalls` is absent or well-formed.
+ */
+export function malformedToolCallReason(toolCalls: unknown): MalformedToolCallReason | null {
+  if (toolCalls === undefined) return null;
+  if (toolCalls === null) return 'tool_calls_null';
+  if (!Array.isArray(toolCalls)) return 'tool_calls_not_array';
+  if (toolCalls.length === 0) return null;
+
+  for (const raw of toolCalls) {
+    if (!raw || typeof raw !== 'object') return 'missing_name';
+    const fn = (raw as { function?: unknown }).function;
+    if (!fn || typeof fn !== 'object') return 'missing_name';
+    const name = (fn as { name?: unknown }).name;
+    if (typeof name !== 'string' || name.trim().length === 0) return 'missing_name';
+    const args = (fn as { arguments?: unknown }).arguments;
+    if (args === null) return 'null_arguments';
+    if (args === undefined) continue;
+    if (typeof args === 'object') continue; // already-parsed object/array
+    if (typeof args !== 'string') return 'invalid_arguments_json';
+    const trimmed = args.trim();
+    if (trimmed.length === 0) continue;
+    try {
+      JSON.parse(trimmed);
+    } catch {
+      return 'invalid_arguments_json';
+    }
+  }
+  return null;
+}
+
+export function isMalformedToolCalls(toolCalls: unknown): boolean {
+  return malformedToolCallReason(toolCalls) !== null;
+}
+
+/**
+ * Reconstruct `tool_calls` from a buffered OpenAI SSE body (delta merge by `index`).
+ * Returns `undefined` when the stream never emitted a `tool_calls` array.
+ */
+export function collectToolCallsFromSseText(sseText: string): unknown[] | undefined {
+  const byIndex = new Map<number, { id?: string; type?: string; function: { name?: string; arguments: string } }>();
+  let saw = false;
+
+  for (const line of sseText.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) continue;
+    const raw = trimmed.slice(5).trim();
+    if (!raw || raw === '[DONE]') continue;
+    let parsed: {
+      choices?: Array<{ delta?: { tool_calls?: unknown }; message?: { tool_calls?: unknown } }>;
+    };
+    try {
+      parsed = JSON.parse(raw) as typeof parsed;
+    } catch {
+      continue;
+    }
+    const choice = parsed.choices?.[0];
+    const deltaCalls = choice?.delta?.tool_calls ?? choice?.message?.tool_calls;
+    if (!Array.isArray(deltaCalls) || deltaCalls.length === 0) continue;
+    saw = true;
+    for (const item of deltaCalls) {
+      if (!item || typeof item !== 'object') continue;
+      const rec = item as {
+        index?: number;
+        id?: string;
+        type?: string;
+        function?: { name?: unknown; arguments?: unknown };
+      };
+      const idx = typeof rec.index === 'number' ? rec.index : 0;
+      let acc = byIndex.get(idx);
+      if (!acc) {
+        acc = { function: { arguments: '' } };
+        byIndex.set(idx, acc);
+      }
+      if (typeof rec.id === 'string' && rec.id) acc.id = rec.id;
+      if (typeof rec.type === 'string' && rec.type) acc.type = rec.type;
+      if (typeof rec.function?.name === 'string' && rec.function.name) {
+        acc.function.name = rec.function.name;
+      }
+      const piece = rec.function?.arguments;
+      if (typeof piece === 'string') acc.function.arguments += piece;
+    }
+  }
+
+  if (!saw) return undefined;
+  return [...byIndex.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([, v]) => v);
 }

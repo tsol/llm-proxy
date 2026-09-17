@@ -131,7 +131,7 @@ export const appConfig = {
   reqOldDir: path.join(logsDir, 'req-old'),
   modelAllow: loadModelAllowPatterns(),
   rateLimitFallbackModel: env('RATE_LIMIT_FALLBACK_MODEL'),
-  generalFallbackModel: env('GENERAL_FALLBACK_MODEL', 'gonka/Kimi-K2.6'),
+  generalFallbackModel: env('GENERAL_FALLBACK_MODEL', 'gonka/deepseek-ai/DeepSeek-V4-Flash-0731'),
   /** Named model aliases with fallback chains.
    *  Sources (merged, env overrides store):
    *    .env — MODEL{n}_ALIAS / MODEL{n}_TRY
@@ -159,11 +159,10 @@ export const appConfig = {
    *  "too many concurrent requests" 429 before giving up. After the
    *  last attempt it proceeds to the normal fallback/429 path. */
   retryLoopCounter: envNum('RETRY_LOOP_COUNTER', 1),
-  /** Max seconds of upstream SILENCE (no stream bytes / no response) before the
-   *  proxy force-aborts an in-flight request and falls back. Active streams
-   *  reset this timer on every chunk, so only silent hangs are killed early.
-   *  0 disables. Set via STREAM_IDLE_TIMEOUT_MS (default 120s). */
-  streamIdleTimeoutMs: envNum('STREAM_IDLE_TIMEOUT_MS', 120) * 1000,
+  /** Max seconds with no upstream *payload* (SSE comments/headers ignored)
+   *  before aborting the outgoing request. After first payload byte, the
+   *  per-chunk idle watchdog applies. 0 disables. STREAM_IDLE_TIMEOUT (seconds). */
+  streamIdleTimeoutMs: envNum('STREAM_IDLE_TIMEOUT', 120) * 1000,
   /** Temporary ban of misbehaving providers/models. When a model trips any
    *  BAN_FROM_GROUP_WHEN_* criterion within a BAN_WINDOW_MINUTES sliding window,
    *  it is excluded from the preferred-group pool and the fallback walk for

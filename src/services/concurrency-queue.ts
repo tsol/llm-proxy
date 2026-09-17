@@ -2,10 +2,20 @@ import type { ProviderAdapter } from '../types';
 import { appConfig } from '../config';
 import { recordBanSignal, isModelBanned, getBanInfo, bannedDetailed } from './ban';
 import { resolveModelQuirk } from '../providers/metadata';
+import type { AliasGroupDef, NodataTryParallel } from './alias-store';
+import { parseNodataTryParallel } from './alias-store';
 
 /**
  * Per-key FIFO concurrency limiter.
  */
+
+/** First N … last N chars. Middle dropped so two long strings with the same
+ *  prefix (same last user message) still show a distinct tail. */
+export function clipEnds(s: string, n = 40): string {
+  const clean = (s || '').replace(/\s+/g, ' ').trim();
+  if (clean.length <= n * 2 + 3) return clean;
+  return `${clean.slice(0, n)} … ${clean.slice(-n)}`;
+}
 
 interface Waiter {
   resolve: (result: AcquireResult) => void;
@@ -61,9 +71,36 @@ interface ThroughputWindow {
 }
 const modelThroughput = new Map<string, ThroughputSample[]>();
 
-// Rolling failure timestamps per model key — used by the "fastest" group
-// strategy to deprioritise members that failed recently (last hour).
+// Rolling outcome timestamps per model key — used by "fastest" (failures)
+// and "safest" (ok vs fail ratio) over the last hour.
 const modelFailures = new Map<string, number[]>();
+const modelSuccesses = new Map<string, number[]>();
+
+function pushHourly(map: Map<string, number[]>, key: string, ts = Date.now()): void {
+  let arr = map.get(key);
+  if (!arr) {
+    arr = [];
+    map.set(key, arr);
+  }
+  arr.push(ts);
+  const cutoff = ts - WINDOW_1H;
+  if (arr.length > 1 && arr[0] < cutoff) {
+    let i = 0;
+    while (i < arr.length && arr[i] < cutoff) i++;
+    if (i > 0) arr.splice(0, i);
+  }
+}
+
+function countHourly(map: Map<string, number[]>, key: string): number {
+  const arr = map.get(key);
+  if (!arr || arr.length === 0) return 0;
+  const cutoff = Date.now() - WINDOW_1H;
+  let count = 0;
+  for (const ts of arr) {
+    if (ts >= cutoff) count++;
+  }
+  return count;
+}
 
 function pushThroughput(key: string, sample: ThroughputSample): void {
   let arr = modelThroughput.get(key);
@@ -102,35 +139,56 @@ function aggregateThroughput(arr: ThroughputSample[], windowMs: number): Through
 }
 
 function recordFailure(key: string, ts = Date.now()): void {
-  let arr = modelFailures.get(key);
-  if (!arr) {
-    arr = [];
-    modelFailures.set(key, arr);
-  }
-  arr.push(ts);
-  // Prune failures older than 1h to bound memory.
-  const cutoff = ts - WINDOW_1H;
-  if (arr.length > 1 && arr[0] < cutoff) {
-    let i = 0;
-    while (i < arr.length && arr[i] < cutoff) i++;
-    if (i > 0) arr.splice(0, i);
-  }
+  pushHourly(modelFailures, key, ts);
 }
 
-/** Count of failures for a model key in the last hour (for the fastest strategy). */
+function recordSuccess(key: string, ts = Date.now()): void {
+  pushHourly(modelSuccesses, key, ts);
+}
+
+/** Count of failures for a model key in the last hour (for fastest / safest). */
 export function memberFailures(key: string): number {
-  const arr = modelFailures.get(key);
-  if (!arr || arr.length === 0) return 0;
-  const cutoff = Date.now() - WINDOW_1H;
-  let count = 0;
-  for (const ts of arr) {
-    if (ts >= cutoff) count++;
-  }
-  return count;
+  return countHourly(modelFailures, key);
+}
+
+/** Count of successful completions in the last hour (for the safest strategy). */
+export function memberSuccesses(key: string): number {
+  return countHourly(modelSuccesses, key);
+}
+
+/** ok / (ok + fail) over the last hour, or -1 when there are no completions. */
+export function memberStability(key: string): number {
+  const ok = memberSuccesses(key);
+  const fail = memberFailures(key);
+  const total = ok + fail;
+  return total > 0 ? ok / total : -1;
+}
+
+interface SafestScore {
+  /** 0 = proven no-fail, 1 = untried, 2 = has at least one fail. */
+  tier: number;
+  ratio: number;
+  n: number;
+}
+
+function safestScoreFromCounts(ok: number, fail: number): SafestScore {
+  const n = ok + fail;
+  if (n === 0) return { tier: 1, ratio: 0, n: 0 };
+  if (fail === 0) return { tier: 0, ratio: 1, n };
+  return { tier: 2, ratio: ok / n, n };
+}
+
+function safestScore(key: string): SafestScore {
+  return safestScoreFromCounts(memberSuccesses(key), memberFailures(key));
+}
+
+function compareSafestScore(a: SafestScore, b: SafestScore): number {
+  return a.tier - b.tier || b.ratio - a.ratio || b.n - a.n;
 }
 
 // Live request tracking
 interface LiveRequest {
+  id: string;
   key: string;
   provider: string;
   model: string;
@@ -146,10 +204,16 @@ interface LiveRequest {
   /** Rolling tail of the provider's response so far (last ~80 chars) — lets
    *  the dashboard show live streaming progress (not the user prompt). */
   respHint: string;
+  /** Path basename under logs/req — inspector reads the file, not RAM. */
+  dumpFile?: string;
 }
 
 interface IncomingRequest {
+  id: string;
   preview: string;
+  lastRole: string;
+  lastClip: string;
+  msgCount: number;
   startedAt: number;
 }
 
@@ -168,6 +232,8 @@ interface ReapableRequest {
   kind: 'incoming' | 'outgoing';
   startedAt: number;
   destroy?: () => void;
+  /** Concurrency slot release — must run even if the request never completes. */
+  release?: () => void;
 }
 const reapable = new Map<string, ReapableRequest>();
 
@@ -177,6 +243,12 @@ export function registerReapable(req: ReapableRequest): void {
 
 export function unregisterReapable(id: string): void {
   reapable.delete(id);
+}
+
+export function bindReapableRelease(id: string, release?: () => void): void {
+  const req = reapable.get(id);
+  if (!req) return;
+  req.release = release;
 }
 
 let reaperStarted = false;
@@ -206,8 +278,9 @@ export function startZombieReaper(): void {
     for (const [id, req] of [...reapable.entries()]) {
       if (now - req.startedAt <= ZOMBIE_MAX_AGE_MS) continue;
       try { req.destroy?.(); } catch { /* ignore */ }
+      try { req.release?.(); } catch { /* ignore */ }
       if (req.kind === 'incoming') incomingRequests.delete(id);
-      else liveRequests.delete(id);
+      else finishLiveRequest(id, 0, 'zombie-reaped');
       reapable.delete(id);
       cleaned++;
     }
@@ -218,9 +291,21 @@ export function startZombieReaper(): void {
   reaperStarted = true;
 }
 
-export function recordIncomingStart(preview: string): string {
+export function recordIncomingStart(info: {
+  preview: string;
+  lastRole?: string;
+  lastClip?: string;
+  msgCount?: number;
+}): string {
   const id = String(++_incomingSeq);
-  incomingRequests.set(id, { preview: preview.slice(0, 60), startedAt: Date.now() });
+  incomingRequests.set(id, {
+    id,
+    preview: clipEnds(info.preview, 40),
+    lastRole: info.lastRole || '',
+    lastClip: clipEnds(info.lastClip || '', 40),
+    msgCount: info.msgCount ?? 0,
+    startedAt: Date.now(),
+  });
   return id;
 }
 
@@ -229,13 +314,20 @@ export function recordIncomingEnd(id: string): void {
   unregisterReapable(id);
 }
 
-export function recordRequestStart(key: string, provider: string, model: string, preview: string): string {
+export function recordRequestStart(
+  key: string,
+  provider: string,
+  model: string,
+  preview: string,
+): string {
   const id = Math.random().toString(36).slice(2, 10);
-  const clean = preview.replace(/\s+/g, ' ').trim();
+  const clipped = clipEnds(preview, 40);
+  const splitAt = clipped.indexOf(' … ');
   const lr: LiveRequest = {
+    id,
     key, provider, model,
-    reqPreview: clean.slice(0, 40),
-    reqSuffix: clean.length > 40 ? clean.slice(-40) : '',
+    reqPreview: splitAt >= 0 ? clipped.slice(0, splitAt) : clipped,
+    reqSuffix: splitAt >= 0 ? clipped.slice(splitAt + 3) : '',
     respPreview: '',
     startedAt: Date.now(),
     lastChunkAt: Date.now(),
@@ -273,12 +365,53 @@ export function recordRequestEnd(id: string, status: number, respPreview: string
   const lr = liveRequests.get(id);
   if (!lr) return;
   lr.status = status;
-  const clean = respPreview.replace(/\s+/g, ' ').trim();
-  lr.respPreview = clean;
+  lr.respPreview = clipEnds(respPreview, 40);
   liveRequests.delete(id);
   recentRequests.unshift(lr);
   if (recentRequests.length > MAX_RECENT) recentRequests.length = MAX_RECENT;
   unregisterReapable(id);
+}
+
+export function attachDumpFile(id: string, filename: string): void {
+  if (!id || !filename) return;
+  const live = liveRequests.get(id);
+  if (live) {
+    live.dumpFile = filename;
+    return;
+  }
+  const recent = recentRequests.find((r) => r.id === id);
+  if (recent) recent.dumpFile = filename;
+}
+
+export function getRecentRecord(id: string): {
+  id: string;
+  provider: string;
+  model: string;
+  status: number;
+  startedAt: number;
+  dumpFile?: string;
+} | undefined {
+  const lr = recentRequests.find((r) => r.id === id);
+  if (!lr) return undefined;
+  return {
+    id: lr.id,
+    provider: lr.provider,
+    model: lr.model,
+    status: lr.status ?? 0,
+    startedAt: lr.startedAt,
+    dumpFile: lr.dumpFile,
+  };
+}
+
+/** Move a live row to recent if it is still open. Idempotent. */
+export function finishLiveRequest(id: string, status?: number, respPreview?: string): void {
+  const lr = liveRequests.get(id);
+  if (!lr) return;
+  recordRequestEnd(
+    id,
+    status ?? lr.status ?? 0,
+    respPreview || lr.respHint || lr.respPreview || 'ended',
+  );
 }
 
 export function recordModelResponse(
@@ -293,13 +426,15 @@ export function recordModelResponse(
   }
   s.lastStatus = status;
   s.total++;
-  // status 0 = garbage; anything not 2xx-3xx is a failure.
+  // status 0 = text garbage; 1 = malformed tool_calls; anything not 2xx-3xx is a failure.
   const ok = status >= 200 && status < 400;
-  if (ok) s.ok++;
-  else {
+  if (ok) {
+    s.ok++;
+    recordSuccess(key);
+  } else {
     s.fail++;
     recordFailure(key);
-    const kind = status === 429 ? '429' : (status === 0 ? 'garbage' : 'fail');
+    const kind = status === 429 ? '429' : (status === 0 || status === 1 ? 'garbage' : 'fail');
     recordBanSignal(key, kind);
   }
   // Rolling throughput windows: only measurable successful replies count.
@@ -428,11 +563,24 @@ export interface AliasGroupMember {
   key: string;
 }
 
+export type GroupStrategy = 'random' | 'order' | 'fastest' | 'safest';
+
 export interface AliasGroupSpec {
   key: string;
   alias: string;
-  strategy: 'random' | 'order' | 'fastest';
+  strategy: GroupStrategy;
   members: AliasGroupMember[];
+  nodataTryParallel?: NodataTryParallel;
+}
+
+export interface OccupyExclude {
+  providers?: Set<string>;
+  keys?: Set<string>;
+}
+
+function parseGroupStrategy(s: string): GroupStrategy {
+  if (s === 'order' || s === 'fastest' || s === 'safest') return s;
+  return 'random';
 }
 
 export type AliasGroupAcquireResult =
@@ -483,9 +631,12 @@ function memberTps(m: AliasGroupMember): number {
 
 function findFreeAliasGroupMember(
   state: AliasGroupState,
-  strategy: 'random' | 'order' | 'fastest',
+  strategy: GroupStrategy,
+  exclude?: OccupyExclude,
 ): AliasGroupMember | null {
   const free = state.members.filter((m) => {
+    if (exclude?.providers?.has(m.provider)) return false;
+    if (exclude?.keys?.has(m.key)) return false;
     if (isModelBanned(m.key)) return false;
     // limit <= 0 means unlimited — same contract as acquireSlot().
     // Store aliases whose members have no modelQuirks.concurrent were
@@ -509,6 +660,16 @@ function findFreeAliasGroupMember(
     }
     return healthy[Math.floor(Math.random() * healthy.length)];
   }
+  if (strategy === 'safest') {
+    // Untried (0 completions) ranks above anyone with a fail. Proven
+    // fail=0 still beats untried. Failing members sort by ok/(ok+fail),
+    // then more samples, then random.
+    const scored = free.map(m => ({ m, ...safestScore(m.key) }));
+    scored.sort((a, b) => compareSafestScore(a, b));
+    const best = scored[0];
+    const tied = scored.filter(s => compareSafestScore(s, best) === 0);
+    return tied[Math.floor(Math.random() * tied.length)].m;
+  }
   return free[0];
 }
 
@@ -517,7 +678,7 @@ function occupyAliasGroupMember(state: AliasGroupState, member: AliasGroupMember
   state.totalActive++;
 }
 
-function dispatchAliasGroupWaiters(state: AliasGroupState, groupKey: string, strategy: 'random' | 'order' | 'fastest'): void {
+function dispatchAliasGroupWaiters(state: AliasGroupState, groupKey: string, strategy: GroupStrategy): void {
   while (state.waiters.length > 0) {
     const free = findFreeAliasGroupMember(state, strategy);
     if (!free) break;
@@ -538,6 +699,50 @@ function dispatchAliasGroupWaiters(state: AliasGroupState, groupKey: string, str
     };
     waiter.resolve({ ok: true, provider: free.provider, model: free.model, handle: { release } });
   }
+}
+
+function occupyAndHandle(
+  spec: AliasGroupSpec,
+  state: AliasGroupState,
+  member: AliasGroupMember,
+): Extract<AliasGroupAcquireResult, { ok: true }> {
+  occupyAliasGroupMember(state, member);
+  let released = false;
+  const key = member.key;
+  const release = (): void => {
+    if (released) return;
+    released = true;
+    state.activeByKey.set(key, Math.max(0, (state.activeByKey.get(key) ?? 0) - 1));
+    state.totalActive = Math.max(0, state.totalActive - 1);
+    if (spec.strategy !== 'order') {
+      dispatchAliasGroupWaiters(state, spec.key, spec.strategy);
+    }
+  };
+  return { ok: true, provider: member.provider, model: member.model, handle: { release } };
+}
+
+/** Fail-fast occupy (no waiter queue). Used by nodata hedge extras. */
+export function tryOccupyAliasGroupMemberNow(
+  spec: AliasGroupSpec,
+  exclude?: OccupyExclude,
+): AliasGroupAcquireResult {
+  const state = aliasGroupStateFor(spec);
+  const free = findFreeAliasGroupMember(state, spec.strategy, exclude);
+  if (!free) return { ok: false, reason: 'all-busy' };
+  return occupyAndHandle(spec, state, free);
+}
+
+/** Walk groups from startIdx; first free eligible member wins. No queue wait. */
+export function tryOccupyHedgeSlot(
+  groups: AliasGroupSpec[],
+  startIdx: number,
+  exclude: OccupyExclude,
+): { groupIdx: number; acquired: Extract<AliasGroupAcquireResult, { ok: true }> } | null {
+  for (let i = Math.max(0, startIdx); i < groups.length; i++) {
+    const acquired = tryOccupyAliasGroupMemberNow(groups[i], exclude);
+    if (acquired.ok) return { groupIdx: i, acquired };
+  }
+  return null;
 }
 
 export function acquireAliasGroupSlot(
@@ -590,14 +795,14 @@ export function acquireAliasGroupSlot(
 }
 
 export function buildAliasGroupSpecs(
-  groups: Array<{ strategy: string; members: string[] }>,
+  groups: AliasGroupDef[],
   adapters: Array<{ id: string; config: { modelQuirks?: Record<string, { concurrent?: number }> } }>,
   alias: string,
 ): AliasGroupSpec[] {
   const specs: AliasGroupSpec[] = [];
   for (let gi = 0; gi < groups.length; gi++) {
     const g = groups[gi];
-    const strategy = g.strategy === 'order' ? 'order' as const : (g.strategy === 'fastest' ? 'fastest' as const : 'random' as const);
+    const strategy = parseGroupStrategy(g.strategy);
     const members: AliasGroupMember[] = [];
     for (const entry of g.members) {
       const parts = entry.split('/');
@@ -612,7 +817,8 @@ export function buildAliasGroupSpecs(
           : 0;
       members.push({ provider, model, limit, key: `${provider}:${model}` });
     }
-    specs.push({ key: `${alias}:g${gi}`, alias, strategy, members });
+    const nodataTryParallel = parseNodataTryParallel(g.nodata_try_parallel);
+    specs.push({ key: `${alias}:g${gi}`, alias, strategy, members, nodataTryParallel });
   }
   return specs;
 }
@@ -623,7 +829,7 @@ let cachedAliasGroupSpecs: AliasGroupSpec[] = [];
 let cachedAliasChain: Array<{ provider: string; model: string; limit: number; group: number; strategy: string }> = [];
 
 export function updateAliasChainConfig(
-  aliasGroups: Array<{ alias: string; groups: Array<{ strategy: string; members: string[] }> }>,
+  aliasGroups: Array<{ alias: string; groups: AliasGroupDef[] }>,
   adapters: Array<{ id: string; config: { modelQuirks?: Record<string, { concurrent?: number }> } }>,
 ): void {
   const specs: AliasGroupSpec[] = [];
@@ -659,6 +865,7 @@ export interface ConcurrencySnapshot {
   }>;
   aliasGroups: Array<{
     key: string; alias: string; strategy: string;
+    nodataTryParallel?: NodataTryParallel;
     active: number; limit: number;
     members: Array<{
       provider: string; model: string; active: number; limit: number;
@@ -670,6 +877,10 @@ export interface ConcurrencySnapshot {
       rank?: number;
       /** Failures in the last hour. */
       failH1?: number;
+      /** Successful completions in the last hour. */
+      okH1?: number;
+      /** ok / (ok + fail) over the last hour; 0 when no completions. */
+      stabilityH1?: number;
       /** Measured tokens/sec over the last hour. */
       tpsH1?: number;
     }>;
@@ -680,7 +891,14 @@ export interface ConcurrencySnapshot {
   throughput: Record<string, { h1: ThroughputWindow; h24: ThroughputWindow }>;
   /** Currently banned provider:model keys with remaining seconds. */
   bans: Array<{ key: string; remainingSec: number }>;
-  incoming: Array<{ preview: string; startedAt: number }>;
+  incoming: Array<{
+    id: string;
+    preview: string;
+    lastRole: string;
+    lastClip: string;
+    msgCount: number;
+    startedAt: number;
+  }>;
   active: Array<{ key: string; provider: string; model: string; reqPreview: string; reqSuffix: string; respHint: string; startedAt: number; lastChunkAt: number; bytes: number }>;
   recent: Array<{ key: string; provider: string; model: string; reqPreview: string; respPreview: string; status: number; startedAt: number }>;
 }
@@ -714,6 +932,8 @@ export function concurrencySnapshot(): ConcurrencySnapshot {
           banned: ban.banned,
           banRemainingSec: ban.remainingSec,
           failH1: memberFailures(m.key),
+          okH1: memberSuccesses(m.key),
+          stabilityH1: Math.max(0, memberStability(m.key)),
           tpsH1: h1?.tps ?? 0,
         };
       });
@@ -724,6 +944,15 @@ export function concurrencySnapshot(): ConcurrencySnapshot {
       const rankByIdx = new Map<number, number>();
       ranked.forEach((m, i) => rankByIdx.set(members.indexOf(m), i + 1));
       members.forEach((m, i) => { m.rank = rankByIdx.get(i)!; });
+    } else if (spec.strategy === 'safest') {
+      const ranked = [...members].sort((a, b) =>
+        compareSafestScore(
+          safestScoreFromCounts(a.okH1 ?? 0, a.failH1 ?? 0),
+          safestScoreFromCounts(b.okH1 ?? 0, b.failH1 ?? 0),
+        ));
+      const rankByIdx = new Map<number, number>();
+      ranked.forEach((m, i) => rankByIdx.set(members.indexOf(m), i + 1));
+      members.forEach((m, i) => { m.rank = rankByIdx.get(i)!; });
     } else {
       members.forEach((m, i) => { m.rank = i + 1; });
     }
@@ -731,6 +960,7 @@ export function concurrencySnapshot(): ConcurrencySnapshot {
       key: spec.key,
       alias: spec.alias,
       strategy: spec.strategy,
+      nodataTryParallel: spec.nodataTryParallel,
       active: state?.totalActive ?? 0,
       limit: state?.totalLimit ?? spec.members.reduce((s, m) => s + m.limit, 0),
       members,
@@ -750,7 +980,12 @@ export function concurrencySnapshot(): ConcurrencySnapshot {
     ),
     bans: bannedDetailed().map(b => ({ key: b.key, remainingSec: b.remainingSec })),
     incoming: [...incomingRequests.values()].map(ir => ({
-      preview: ir.preview, startedAt: ir.startedAt,
+      id: ir.id,
+      preview: ir.preview,
+      lastRole: ir.lastRole,
+      lastClip: ir.lastClip,
+      msgCount: ir.msgCount,
+      startedAt: ir.startedAt,
     })),
     active: [...liveRequests.values()].map(lr => ({
       key: lr.key, provider: lr.provider, model: lr.model,
@@ -761,8 +996,10 @@ export function concurrencySnapshot(): ConcurrencySnapshot {
     recent: [...recentRequests]
       .sort((a, b) => b.startedAt - a.startedAt)
       .map(lr => ({
+        id: lr.id,
         key: lr.key, provider: lr.provider, model: lr.model,
-        reqPreview: lr.reqPreview, respPreview: lr.respPreview,
+        reqPreview: lr.reqPreview, reqSuffix: lr.reqSuffix,
+        respPreview: lr.respPreview,
         status: lr.status ?? 0, startedAt: lr.startedAt,
       })),
   };

@@ -76,7 +76,7 @@
     "rateLimits": {},
     "models": {
       "moonshotai/Kimi-K2.6": {
-        "concurrent": 3
+        "concurrent": 1
       },
       "MiniMaxAI/": {
         "temperature": 0.4,
@@ -89,6 +89,10 @@
       },
       "deepseek-ai/DeepSeek-V4-Flash-0731": {
         "concurrent": 3
+      },
+      "zai-org/GLM-5.3-Flash": {
+        "concurrent": 3,
+        "contextLength": 400000
       }
     }
   },
@@ -109,6 +113,10 @@
       },
       "deepseek-ai/DeepSeek-V4-Flash-0731": {
         "concurrent": 3
+      },
+      "zai-org/GLM-5.3-Flash": {
+        "concurrent": 3,
+        "contextLength": 400000
       }
     }
   },
@@ -129,6 +137,10 @@
       },
       "deepseek-ai/DeepSeek-V4-Flash-0731": {
         "concurrent": 3
+      },
+      "zai-org/GLM-5.3-Flash": {
+        "concurrent": 3,
+        "contextLength": 400000
       }
     }
   },
@@ -149,6 +161,10 @@
       },
       "deepseek-ai/DeepSeek-V4-Flash-0731": {
         "concurrent": 3
+      },
+      "zai-org/GLM-5.3-Flash": {
+        "concurrent": 3,
+        "contextLength": 400000
       }
     }
   },
@@ -169,6 +185,10 @@
       },
       "deepseek-ai/DeepSeek-V4-Flash-0731": {
         "concurrent": 3
+      },
+      "zai-org/GLM-5.3-Flash": {
+        "concurrent": 3,
+        "contextLength": 400000
       }
     }
   },
@@ -189,6 +209,10 @@
       },
       "deepseek-ai/DeepSeek-V4-Flash-0731": {
         "concurrent": 3
+      },
+      "zai-org/GLM-5.3-Flash": {
+        "concurrent": 3,
+        "contextLength": 400000
       }
     }
   },
@@ -209,6 +233,10 @@
       },
       "deepseek-ai/DeepSeek-V4-Flash-0731": {
         "concurrent": 3
+      },
+      "zai-org/GLM-5.3-Flash": {
+        "concurrent": 3,
+        "contextLength": 400000
       }
     }
   },
@@ -231,9 +259,16 @@
     "models": {
       "qwen2-vl": {
         "contextLength": 32768,
-        "contextSteps": [32768, 16384, 8192, 4096],
+        "contextSteps": [
+          32768,
+          16384,
+          8192,
+          4096
+        ],
         "concurrent": 1,
-        "gpuPrep": { "exclusive": true }
+        "gpuPrep": {
+          "exclusive": true
+        }
       }
     }
   }

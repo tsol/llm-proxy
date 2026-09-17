@@ -142,9 +142,9 @@ Returns live snapshot of all queues, active requests, per-model statistics, and 
 ```
 
 - `perModel` — per-model concurrency queues (waiters in FIFO).
-- `aliasGroups` — per-alias group pools: `strategy` = `random` (random free member), `order` (sequential), или `fastest` (самый быстрый свободный member по tokens/sec).
+- `aliasGroups` — per-alias group pools: `strategy` = `random` (random free member), `order` (sequential), `fastest` (самый быстрый свободный member по tokens/sec), или `safest` (лучший `ok/(ok+fail)` за последний час).
 - `groupConfig` — статическая конфигурация групп алиаса (для дашборда).
-- `stats` — cumulative since proxy start. `lastStatus` = последний HTTP-код; **`0` = garbage**; 429/413/5xx/garbage учитываются в `fail`.
+- `stats` — cumulative since proxy start. `lastStatus` = последний HTTP-код; **`0` = garbage (текст/CJK)**; **`1` = garbage (битые `tool_calls`)**; 429/413/5xx/garbage учитываются в `fail`.
 - `throughput` — rolling-окна 1h/24h: `count`, суммарное время ответа `durMs`, отданные байты `bytes`, `tokensOut`, и `tps` (tokens/sec = tokens÷сек, либо bytes÷сек при отсутствии токенов). Записываются только успешные (2xx-3xx) ответы.
 - `incoming` — client→proxy connections currently open. `startedAt` is unix ms.
 - `active` — proxy→upstream requests in-flight, `reqPreview`/`reqSuffix` = first/last 40 chars.
@@ -153,7 +153,7 @@ Returns live snapshot of all queues, active requests, per-model statistics, and 
 
 ### HTML Dashboard (`src/ui/proxy-dashboard-groq.py`)
 
-Отдельный самодостаточный HTML-дашборд (Python `http.server` на `:8080`, автообновление 1s). Показывает: группы/алиасы целиком (даже с нулевыми счётчиками), модели со счётчиками success/fail и статусом (`000` = garbage), throughput 1h/24h (`tok/s`), живые/queued запросы, recent-лог. Запуск:
+Отдельный самодостаточный HTML-дашборд (Python `http.server` на `:8080`, автообновление 1s). Показывает: группы/алиасы целиком (даже с нулевыми счётчиками), модели со счётчиками success/fail и статусом (`000` = garbage текст, `001` = garbage tool_calls), throughput 1h/24h (`tok/s`), живые/queued запросы, recent-лог. Запуск:
 
 ```bash
 PROXY_ENV_FILE=~/.env-proxy python3 src/ui/proxy-dashboard-groq.py
@@ -205,12 +205,12 @@ Locked aliases (from `.env`) show `"locked": true` — cannot be modified via AP
 | **429 / 413** (rate limit) | Falls back to next alias chain entry |
 | **5xx / timeout / network** | Falls back to next alias chain entry |
 | **402** (insufficient credits) | Auto-caps `max_tokens`, retries same provider |
-| **Gonka garbage** | Detected client-side on streaming output → fallback |
+| **Gonka garbage** | Текст/CJK (`000`) или битые `tool_calls` (`001`) → fallback |
 | **All fallbacks exhausted** | Returns 502 with error |
 
 Per-provider paths have **no fallback** — they return upstream errors directly.
 
-Every failed attempt (429/413/5xx/402/network/garbage) is recorded in per-model `stats`: `fail++` and `lastStatus`. **Garbage is stored as `lastStatus: 0`** (отображается как `000 · garbage` в дашборде) — а не как фейковый `200`.
+Every failed attempt (429/413/5xx/402/network/garbage) is recorded in per-model `stats`: `fail++` and `lastStatus`. **Text garbage is `lastStatus: 0`** (`000 · garbage`). **Malformed `tool_calls` (missing `name`, truncated/null `arguments`) is `lastStatus: 1`** (`001 · garbage (tool_calls)`). Neither is stored as a fake `200`.
 
 ## Image generation / editing
 
@@ -362,10 +362,11 @@ anything/Kimi-K2.6               # any prefix, suffix match
      }
    }
    ```
-   `strategy` per group: `random` | `order` | `fastest`.
+   `strategy` per group: `random` | `order` | `fastest` | `safest`.
    - `random` — случайный свободный member.
    - `order` — первый свободный member.
    - `fastest` — свободный member с максимальным `tps` (1h window, fallback 24h; неизмеренные — последними, ties random). Питается из `throughput` в `/v1/router/queue`.
+   - `safest` — свободный member с максимальным `ok/(ok+fail)` за час: сначала fail=0, затем неизмеренные (0 total) выше любой модели с fail≥1, затем по коэффициенту / числу наблюдений, затем random.
 
 **Alias API examples:**
 ```bash

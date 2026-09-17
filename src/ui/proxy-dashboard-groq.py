@@ -5,12 +5,17 @@ Live monitoring for LLM proxy (queues, model stats, active connections).
 """
 
 import http.server
+import mimetypes
 import socketserver
 import webbrowser
 import threading
 import time
+from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 PORT = 8080
+UI_DIR = Path(__file__).resolve().parent
+SESSION_VIEW_DIR = UI_DIR / "session-view"
 
 HTML_CONTENT = r"""<!DOCTYPE html>
 <html lang="ru">
@@ -18,6 +23,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>Proxy Dashboard</title>
+<link rel="stylesheet" href="/session-view/session-view.css">
 <style>
   :root {
     --bg: #0f1419;
@@ -142,12 +148,9 @@ HTML_CONTENT = r"""<!DOCTYPE html>
   .tabs {
     display: flex;
     gap: 2px;
-    overflow-x: auto;
-    scrollbar-width: none;
-    -ms-overflow-style: none;
+    overflow: visible;
     padding-bottom: 0;
   }
-  .tabs::-webkit-scrollbar { display: none; }
 
   .tab {
     flex: 0 0 auto;
@@ -185,6 +188,66 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     background: rgba(77, 159, 255, 0.25);
     color: var(--accent);
   }
+
+  .tab-dropdown {
+    position: relative;
+    flex: 0 0 auto;
+  }
+  .tab-dropdown .tab {
+    display: inline-flex;
+    align-items: center;
+  }
+  .tab-dropdown .chevron {
+    display: inline-block;
+    font-size: 10px;
+    margin-left: 4px;
+    opacity: 0.75;
+    transition: transform 0.15s;
+  }
+  .tab-dropdown.open .chevron { transform: rotate(180deg); }
+  .tab-menu {
+    display: none;
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 0;
+    min-width: 200px;
+    max-width: min(320px, 80vw);
+    max-height: min(70vh, 440px);
+    overflow-y: auto;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 6px;
+    z-index: 50;
+    box-shadow: 0 16px 40px rgba(0,0,0,0.45);
+  }
+  .tab-dropdown.open .tab-menu { display: block; }
+  .tab-menu-item {
+    display: block;
+    width: 100%;
+    border: none;
+    background: transparent;
+    color: var(--text);
+    text-align: left;
+    padding: 9px 12px;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .tab-menu-item:hover { background: var(--bg3); }
+  .tab-menu-item.active {
+    background: rgba(77, 159, 255, 0.18);
+    color: var(--accent);
+  }
+  .tab-menu-empty {
+    padding: 10px 12px;
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .card.clickable { cursor: pointer; }
+  .card.clickable:hover { border-color: var(--accent); }
 
   /* Main */
   main {
@@ -468,6 +531,62 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     border-color: var(--fail-border);
   }
   .recent-item.stale { opacity: 0.65; }
+  .recent-item.clickable {
+    cursor: pointer;
+  }
+  .recent-item.clickable:hover {
+    border-color: var(--accent);
+    filter: brightness(1.08);
+  }
+  .recent-item .open-hint {
+    margin-left: auto;
+    font-size: 12px;
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  .inspect {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 80;
+    background: rgba(6, 8, 12, 0.92);
+    flex-direction: column;
+  }
+  .inspect.open { display: flex; }
+  .inspect-bar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg2);
+    flex-shrink: 0;
+  }
+  .inspect-bar .title {
+    font-weight: 700;
+    font-size: 14px;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .inspect-bar button {
+    margin-left: auto;
+    background: var(--bg3);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 12px;
+    font: inherit;
+    cursor: pointer;
+  }
+  .inspect-session {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
 
   .recent-top {
     display: flex;
@@ -656,9 +775,18 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 </footer>
 </div>
 
+<div class="inspect" id="inspect">
+  <div class="inspect-bar">
+    <div class="title" id="inspectTitle">Recent</div>
+    <button type="button" id="inspectClose">Close</button>
+  </div>
+  <div class="inspect-session" id="inspectSession"></div>
+</div>
+
 <script>
 (() => {
   const API = 'http://127.0.0.1:5001/v1/router/queue';
+  const DETAIL_API = 'http://127.0.0.1:5001/v1/router/recent/';
   const POLL_MS = 1000;
   const STALE_MS = 60_000;
   const ZOMBIE_MS = 10 * 60_000;
@@ -668,6 +796,8 @@ HTML_CONTENT = r"""<!DOCTYPE html>
   let activeTab = 'main';
   let showZombies = false;
   let aliasTabs = [];
+  let aliasMenuOpen = false;
+  let lastTabsSig = '';
 
   const $ = (sel, el = document) => el.querySelector(sel);
 
@@ -696,6 +826,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
   function statusClass(code) {
     if (code === 0) return 'garbage';
+    if (code === 1) return 'garbage';
     if (code >= 200 && code < 300) return 'ok';
     if (code >= 400) return 'fail';
     return 'neutral';
@@ -703,8 +834,9 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
   function fmtBytes(b) {
     if (b == null || isNaN(b)) return '—';
+    if (b < 1024) return Math.round(b) + ' B';
     const kb = b / 1024;
-    if (kb < 1024) return kb.toFixed(0) + ' KB';
+    if (kb < 1024) return kb.toFixed(1) + ' KB';
     return (kb / 1024).toFixed(1) + ' MB';
   }
 
@@ -715,6 +847,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
   function statusLabel(code) {
     if (code === 0) return '000 · garbage';
+    if (code === 1) return '001 · garbage (tool_calls)';
     return code ?? '—';
   }
 
@@ -747,10 +880,11 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       .replace(/"/g, '&quot;');
   }
 
-  function truncate(s, n = 60) {
-    if (!s) return '';
-    s = String(s);
-    return s.length > n ? s.slice(0, n) + '…' : s;
+  function clipEnds(s, n = 40) {
+    if (s == null) return '';
+    s = String(s).replace(/\s+/g, ' ').trim();
+    if (s.length <= n * 2 + 3) return s;
+    return s.slice(0, n) + ' … ' + s.slice(-n);
   }
 
   function renderTabs() {
@@ -760,23 +894,57 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       : [];
     aliasTabs = aliases;
 
-    const items = [
-      { id: 'main', label: 'Models' },
-      { id: 'live', label: 'Live', badge: liveCount() },
-      ...aliases.map(a => ({ id: 'alias:' + a, label: a })),
-      { id: 'recent', label: 'Recent', badge: (data && data.recent) ? data.recent.length : 0 },
-    ];
+    const aliasActive = activeTab.startsWith('alias:');
+    const currentAlias = aliasActive ? activeTab.slice(6) : '';
+    const aliasLabel = currentAlias || 'Aliases';
+    const live = liveCount();
+    const recentN = (data && data.recent) ? data.recent.length : 0;
+    const sig = [aliases.join(','), live, recentN, activeTab, aliasMenuOpen ? '1' : '0'].join('|');
+    if (sig === lastTabsSig && tabsEl.children.length) return;
+    lastTabsSig = sig;
 
-    tabsEl.innerHTML = items.map(t => `
-      <button class="tab ${activeTab === t.id ? 'active' : ''}" data-tab="${t.id}">
-        ${escapeHtml(t.label)}
-        ${t.badge != null ? `<span class="badge">${t.badge}</span>` : ''}
-      </button>
-    `).join('');
+    const badge = (n) => `<span class="badge">${n}</span>`;
+    tabsEl.innerHTML = `
+      <button class="tab ${activeTab === 'main' ? 'active' : ''}" data-tab="main">Models</button>
+      <button class="tab ${activeTab === 'live' ? 'active' : ''}" data-tab="live">Live ${badge(live)}</button>
+      <div class="tab-dropdown ${aliasMenuOpen ? 'open' : ''}" id="aliasDrop">
+        <button class="tab ${aliasActive ? 'active' : ''}" data-tab="aliases-menu" type="button">
+          ${escapeHtml(aliasLabel)}
+          ${badge(aliases.length)}
+          <span class="chevron">▾</span>
+        </button>
+        <div class="tab-menu" role="menu">
+          ${aliases.length
+            ? aliases.map(a => `
+              <button type="button" class="tab-menu-item ${currentAlias === a ? 'active' : ''}" data-alias="${escapeHtml(a)}" role="menuitem">
+                ${escapeHtml(a)}
+              </button>`).join('')
+            : '<div class="tab-menu-empty">Нет алиасов</div>'}
+        </div>
+      </div>
+      <button class="tab ${activeTab === 'recent' ? 'active' : ''}" data-tab="recent">Recent ${badge(recentN)}</button>
+    `;
 
-    tabsEl.querySelectorAll('.tab').forEach(btn => {
-      btn.onclick = () => {
-        activeTab = btn.dataset.tab;
+    tabsEl.querySelectorAll('.tab[data-tab]').forEach(btn => {
+      btn.onclick = (e) => {
+        const id = btn.dataset.tab;
+        if (id === 'aliases-menu') {
+          e.stopPropagation();
+          aliasMenuOpen = !aliasMenuOpen;
+          renderTabs();
+          return;
+        }
+        aliasMenuOpen = false;
+        activeTab = id;
+        renderTabs();
+        renderPanel();
+      };
+    });
+    tabsEl.querySelectorAll('[data-alias]').forEach(btn => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        aliasMenuOpen = false;
+        activeTab = 'alias:' + btn.dataset.alias;
         renderTabs();
         renderPanel();
       };
@@ -881,7 +1049,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         const pct = a.limit ? Math.min(100, (a.active / a.limit) * 100) : 0;
         const full = a.limit > 0 && a.active >= a.limit;
         html += `
-          <div class="card">
+          <div class="card clickable" data-open-alias="${escapeHtml(name)}">
             <div class="card-row">
               <div>
                 <div class="alias-name">${escapeHtml(name)}</div>
@@ -930,10 +1098,16 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     const a = age(item.startedAt);
     const stale = isStale(item.startedAt);
     const zombie = isZombie(item.startedAt);
+    const lastLine = item.lastClip
+      ? `${item.lastRole || 'last'}: ${clipEnds(item.lastClip, 36)}`
+      : '';
     return `
       <div class="req-item ${stale ? 'stale' : ''} ${zombie ? 'zombie' : ''}">
-        <div class="req-preview">${escapeHtml(truncate(item.preview, 100))}</div>
+        <div class="req-preview">${escapeHtml(clipEnds(item.preview, 40))}</div>
+        ${lastLine ? `<div class="resp-hint">${escapeHtml(lastLine)}</div>` : ''}
         <div class="req-meta">
+          ${item.id ? `<span>#${escapeHtml(item.id)}</span>` : ''}
+          ${item.msgCount ? `<span>${item.msgCount} msgs</span>` : ''}
           <span>${fmtDur(a)}</span>
           ${stale ? '<span>stale</span>' : ''}
           ${zombie ? '<span>zombie</span>' : ''}
@@ -946,15 +1120,17 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     const idle = item.lastChunkAt ? Date.now() - item.lastChunkAt : a;
     const stale = isStale(item.startedAt);
     const zombie = isZombie(item.startedAt);
-    const preview = (item.reqPreview || '') + (item.reqSuffix ? ' … ' + item.reqSuffix : '');
+    const preview = item.reqSuffix
+      ? `${item.reqPreview || ''} … ${item.reqSuffix}`
+      : clipEnds(item.reqPreview || '', 40);
     const hint = item.respHint || '';
     const bytes = item.bytes || 0;
     // "Streaming" = we've received bytes, or last byte was recent (<60s).
     const streaming = bytes > 0 || idle < STALE_MS;
     return `
       <div class="req-item ${stale ? 'stale' : ''} ${zombie ? 'zombie' : ''}">
-        <div class="req-preview"><span class="stream-dots"></span>${escapeHtml(truncate(preview, 90))}</div>
-        ${hint ? `<div class="resp-hint">… ${escapeHtml(truncate(hint, 120))}</div>` : ''}
+        <div class="req-preview"><span class="stream-dots"></span>${escapeHtml(preview)}</div>
+        ${hint ? `<div class="resp-hint">${escapeHtml(clipEnds(hint, 40))}</div>` : ''}
         <div class="req-meta">
           <span>${escapeHtml(item.provider)}/${escapeHtml(item.model)}</span>
           <span>start ${fmtDur(a)}</span>
@@ -980,6 +1156,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
           <div class="group-header">
             <div class="group-key">${escapeHtml(g.key)}</div>
             <span class="strategy">${escapeHtml(g.strategy || '—')} (${g.limit || 0})</span>
+            ${g.nodataTryParallel ? `<span class="strategy" title="nodata_try_parallel">nodata ${g.nodataTryParallel.on_sec}s+${g.nodataTryParallel.additional_requests}</span>` : ''}
           </div>
           <div class="slots" style="margin-bottom:8px">${g.active || 0} / ${g.limit || 0} slots</div>
           <div class="bar-wrap"><div class="bar ${full ? 'full' : ''}" style="width:${pct}%"></div></div>
@@ -991,6 +1168,10 @@ HTML_CONTENT = r"""<!DOCTYPE html>
             const stFail = (s && s.fail) || 0;
             const mtp = (data.throughput || {})[`${m.provider}:${m.model}`];
             const shownFail = (m.failH1 != null) ? m.failH1 : stFail;
+            const shownOkH1 = (m.okH1 != null) ? m.okH1 : null;
+            const stab = (m.stabilityH1 != null && ((m.okH1 || 0) + (m.failH1 || 0) > 0))
+              ? Math.round(m.stabilityH1 * 100) + '%'
+              : null;
             return `
               <div class="member">
                 <div style="min-width:0">
@@ -1009,14 +1190,19 @@ HTML_CONTENT = r"""<!DOCTYPE html>
                 <div style="display:flex;gap:12px;margin-top:10px;font-family:var(--mono);font-size:12px">
                   <span style="color:var(--text)">${stTotal} total</span>
                   <span style="color:var(--ok)">${stOk} ok</span>
+                  ${shownOkH1 != null ? `<span style="color:var(--ok)">${shownOkH1} ok<span style="color:var(--muted)">/h</span></span>` : ''}
                   <span style="color:var(--fail)">${shownFail} fail<span style="color:var(--muted)">/h</span></span>
+                  ${stab ? `<span style="color:var(--accent2)">${stab}</span>` : ''}
                 </div>
               </div>`;
           }).join('')}
           ${(g.waiters && g.waiters.length) ? `
             <div class="waiters">
               <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Waiters (${g.waiters.length})</div>
-              ${g.waiters.map(w => `<div class="waiter">${escapeHtml(typeof w === 'string' ? w : JSON.stringify(w))}</div>`).join('')}
+              ${g.waiters.map(w => {
+                const text = typeof w === 'string' ? w : (w && w.preview) ? w.preview : JSON.stringify(w);
+                return `<div class="waiter">${escapeHtml(clipEnds(text, 40))}</div>`;
+              }).join('')}
             </div>` : ''}
         </div>`;
     });
@@ -1033,14 +1219,15 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       const st = statusClass(r.status);
       const cardStatus = st === 'ok' ? 'status-ok' : (st === 'fail' ? 'status-fail' : '');
       return `
-        <div class="recent-item ${cardStatus} ${stale ? 'stale' : ''}">
+        <div class="recent-item ${cardStatus} ${stale ? 'stale' : ''} ${r.id ? 'clickable' : ''}" ${r.id ? `data-recent-id="${escapeHtml(r.id)}"` : ''}>
           <div class="recent-top">
             <div class="recent-key">${escapeHtml(r.provider)}/${escapeHtml(r.model)}</div>
             <span class="status-pill ${st}">${statusLabel(r.status)}</span>
+            ${r.id ? '<span class="open-hint">open</span>' : ''}
           </div>
           <div class="preview-pair">
-            <span class="req">${escapeHtml(truncate(r.reqPreview, 55))}</span>
-            ${r.respPreview ? ` <span class="resp">→ ${escapeHtml(truncate(r.respPreview, 45))}</span>` : ''}
+            <span class="req">${escapeHtml(r.reqSuffix ? `${r.reqPreview || ''} … ${r.reqSuffix}` : clipEnds(r.reqPreview, 40))}</span>
+            ${r.respPreview ? ` <span class="resp">→ ${escapeHtml(clipEnds(r.respPreview, 40))}</span>` : ''}
           </div>
           <div class="req-meta" style="margin-top:8px">
             <span class="duration">${fmtDur(a)} ago</span>
@@ -1064,6 +1251,18 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     else content = renderMain();
 
     main.innerHTML = `<div class="panel active">${content}</div>`;
+
+    main.querySelectorAll('[data-recent-id]').forEach(el => {
+      el.addEventListener('click', () => openInspect(el.getAttribute('data-recent-id')));
+    });
+    main.querySelectorAll('[data-open-alias]').forEach(el => {
+      el.addEventListener('click', () => {
+        aliasMenuOpen = false;
+        activeTab = 'alias:' + el.getAttribute('data-open-alias');
+        renderTabs();
+        renderPanel();
+      });
+    });
 
     const tog = $('#zombieToggle');
     if (tog) {
@@ -1098,9 +1297,56 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       : '—';
   }
 
+  document.addEventListener('click', (e) => {
+    if (!aliasMenuOpen) return;
+    const drop = $('#aliasDrop');
+    if (drop && drop.contains(e.target)) return;
+    aliasMenuOpen = false;
+    renderTabs();
+  });
+
   poll();
   setInterval(poll, POLL_MS);
   setInterval(updateMeta, 1000);
+
+  const inspectEl = $('#inspect');
+  let sessionView = null;
+  async function ensureSessionView() {
+    if (sessionView) return sessionView;
+    const mod = await import('/session-view/SessionView.js');
+    sessionView = mod.createSessionView($('#inspectSession'));
+    return sessionView;
+  }
+  async function openInspect(id) {
+    if (!id) return;
+    inspectEl.classList.add('open');
+    $('#inspectTitle').textContent = 'Loading…';
+    const sv = await ensureSessionView();
+    sv.render({ requestText: '', responseText: '' });
+    try {
+      const res = await fetch(DETAIL_API + encodeURIComponent(id), { cache: 'no-store' });
+      if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
+      const d = await res.json();
+      $('#inspectTitle').textContent = `${d.provider}/${d.model}  ·  ${d.status}  ·  ${id}${d.error ? '  ·  ' + d.error : ''}`;
+      sv.render({
+        requestText: d.request || '(no logs/req dump yet)',
+        responseText: d.response || '',
+      });
+    } catch (e) {
+      $('#inspectTitle').textContent = 'Failed to load';
+      sv.render({
+        requestText: String(e),
+        responseText: 'Item is only kept for the last 20 completed requests. Restart proxy to enable inspector on new items.',
+      });
+    }
+  }
+  function closeInspect() {
+    inspectEl.classList.remove('open');
+  }
+  $('#inspectClose').onclick = closeInspect;
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && inspectEl.classList.contains('open')) closeInspect();
+  });
 })();
 </script>
 </body>
@@ -1110,6 +1356,32 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
 class DashboardHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
+        parsed = urlparse(self.path)
+        path = unquote(parsed.path)
+        if path.startswith("/session-view/"):
+            rel = path[len("/session-view/") :]
+            try:
+                target = (SESSION_VIEW_DIR / rel).resolve()
+                target.relative_to(SESSION_VIEW_DIR.resolve())
+            except (OSError, ValueError):
+                self.send_error(404)
+                return
+            if not target.is_file():
+                self.send_error(404)
+                return
+            ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+            if target.suffix == ".js":
+                ctype = "text/javascript; charset=utf-8"
+            elif target.suffix == ".css":
+                ctype = "text/css; charset=utf-8"
+            data = target.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-type", ctype)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         self.send_response(200)
         self.send_header("Content-type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")

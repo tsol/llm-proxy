@@ -30,7 +30,17 @@ function retryDelay(attempt: number): number {
   return exp + jitter;
 }
 
+function isCanceled(err: unknown, config?: AxiosRequestConfig): boolean {
+  if (config?.signal?.aborted) return true;
+  if (!axios.isAxiosError(err) && !(err instanceof Error)) return false;
+  const anyErr = err as { code?: string; name?: string; message?: string };
+  if (anyErr.code === 'ERR_CANCELED' || anyErr.name === 'CanceledError') return true;
+  const msg = (anyErr.message || '').toLowerCase();
+  return msg.includes('canceled') || msg.includes('cancelled') || msg.includes('aborted');
+}
+
 export function isTransientHttpError(err: unknown): boolean {
+  if (isCanceled(err)) return false;
   if (!axios.isAxiosError(err)) return false;
 
   if (err.code && TRANSIENT_ERR_CODES.has(err.code)) return true;
@@ -60,6 +70,7 @@ async function resilientRequest<T>(
       return await axios.request<T>(config);
     } catch (err) {
       lastErr = err;
+      if (isCanceled(err, config)) throw err;
       const canRetry = attempt < attempts - 1 && isTransientHttpError(err);
       if (!canRetry) throw err;
       await sleep(retryDelay(attempt));

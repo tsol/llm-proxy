@@ -4,7 +4,8 @@ import { getDefaultSnapshot, setDefault } from '../default-model';
 import { getProvider, providerIds, allProviders } from '../providers';
 import { serializeCatalogModelDetail } from '../model-response';
 import { getLiveQuota } from '../services/rate-limit-tracker';
-import { concurrencySnapshot, updateAliasChainConfig } from '../services/concurrency-queue';
+import { concurrencySnapshot, updateAliasChainConfig, getRecentRecord } from '../services/concurrency-queue';
+import { readRequestDump } from '../services/request-dump-logger';
 import { getAliasGroups, listAliases } from '../services/alias-store';
 
 export const adminRouter = Router();
@@ -28,6 +29,26 @@ adminRouter.get('/router/queue', (_req: Request, res: Response) => {
     updateAliasChainConfig(aliasGroups, allProviders());
   }
   res.json(concurrencySnapshot());
+});
+
+adminRouter.get('/router/recent/:id', async (req: Request, res: Response) => {
+  const rec = getRecentRecord(String(req.params.id || ''));
+  if (!rec) {
+    res.status(404).json({ error: { message: 'recent item not found', type: 'not_found' } });
+    return;
+  }
+  const dump = rec.dumpFile ? await readRequestDump(rec.dumpFile) : null;
+  res.json({
+    id: rec.id,
+    provider: rec.provider,
+    model: rec.model,
+    status: rec.status,
+    startedAt: rec.startedAt,
+    dumpFile: rec.dumpFile || '',
+    error: dump?.error || '',
+    request: dump?.request || '',
+    response: dump?.response || '',
+  });
 });
 
 adminRouter.get('/router/providers', (_req: Request, res: Response) => {

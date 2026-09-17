@@ -45,16 +45,22 @@ export function extractLatestUserRequestText(
   return unwrapVoiceMessage(raw);
 }
 
+function clipEnds(s: string, n = 40): string {
+  const clean = (s || '').replace(/\s+/g, ' ').trim();
+  if (clean.length <= n * 2 + 3) return clean;
+  return `${clean.slice(0, n)} … ${clean.slice(-n)}`;
+}
+
 export function captureRequestContext(
   messages: ChatMessage[] | undefined,
-  previewLen = 75,
+  previewLen = 40,
 ): CompletionRequestContext {
   const userRequestText = extractLatestUserRequestText(messages);
   const sanitized = sanitizeLogText(userRequestText);
 
   return {
     userRequestText,
-    userRequestPreview: sanitized.slice(0, previewLen),
+    userRequestPreview: clipEnds(sanitized, previewLen),
     requestKb: Buffer.byteLength(userRequestText, 'utf8') / 1024,
   };
 }

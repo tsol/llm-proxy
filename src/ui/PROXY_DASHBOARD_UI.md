@@ -51,7 +51,7 @@
 | Поле | Тип | Значение |
 |------|-----|----------|
 | ключ | string | `provider:model` |
-| `lastStatus` | int | Последний HTTP-код upstream (200=ок, 402/502=ошибка) |
+| `lastStatus` | int | Последний код: 200=ок, **0**=garbage текст, **1**=garbage tool_calls, 402/502=ошибка |
 | `total` | int | Всего запросов |
 | `ok` | int | Успешных (2xx) |
 | `fail` | int | Ошибок (4xx/5xx) |
@@ -79,7 +79,7 @@
 | `model` | string | Модель |
 | `limit` | int | Max параллельных (concurrent=1 обычно) |
 | `group` | int | Индекс группы (0 = первая) |
-| `strategy` | string | `random` (пул с очередью) или `order` (последовательно) |
+| `strategy` | string | `random` / `fastest` / `safest` (пул с очередью) или `order` (последовательно) |
 
 **`aliasGroups`** — актуальная занятость групп (живые слоты):
 
@@ -102,13 +102,13 @@
 |------|-----|----------|
 | `key` | string | `alias:g<индекс>` |
 | `alias` | string | Имя алиаса |
-| `strategy` | string | `random` / `order` |
+| `strategy` | string | `random` / `order` / `fastest` / `safest` |
 | `active` | int | Всего занятых слотов в группе |
 | `limit` | int | Всего слотов в группе |
 | `members` | array | По модели: активные/лимит |
 | `waiters` | array | Запросы в очереди группы |
 
-**UI**: `random (6) [G]` — модели с барами `[█░] active/limit`. `order (4)` — модели без баров (последовательный перебор).
+**UI**: `random` / `fastest` / `safest` `(6) [G]` — модели с барами `[█░] active/limit`. `order (4)` — модели без баров (последовательный перебор).
 
 ---
 

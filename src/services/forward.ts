@@ -22,7 +22,7 @@ import {
 } from '../services/cost-logger';
 import { resolveModelRoute, refreshProviderLive } from '../catalog';
 import { getProvider } from '../providers';
-import { logRequestDump } from '../services/request-dump-logger';
+import { logRequestDump, dumpLiveAls } from '../services/request-dump-logger';
 import {
   formatUpstreamError,
   logOutgoing,
@@ -30,26 +30,40 @@ import {
   logResponse,
   truncateMiddle,
 } from '../services/request-logger';
-import { isGarbage, analyzeText, stripPlaceholderTokens, hasNoRealContent } from './garbage-detector';
+import {
+  isGarbage,
+  analyzeText,
+  stripPlaceholderTokens,
+  hasNoRealContent,
+  malformedToolCallReason,
+  collectToolCallsFromSseText,
+  GARBAGE_STATUS_TEXT,
+  GARBAGE_STATUS_MALFORMED_TOOL_CALLS,
+} from './garbage-detector';
 import { trackUpstreamHeaders } from './rate-limit-tracker';
 import { logRateLimit } from './rate-limit-logger';
 import {
   acquireSlot,
   acquireAliasGroupSlot,
+  tryOccupyHedgeSlot,
   buildAliasGroupSpecs,
   resolveConcurrentLimit,
   isTooManyConcurrentRequests,
   recordModelResponse,
   recordRequestStart,
   recordRequestEnd,
+  finishLiveRequest,
   recordIncomingStart,
+  clipEnds,
   recordIncomingEnd,
   touchLiveResponse,
   registerReapable,
   unregisterReapable,
+  bindReapableRelease,
   startZombieReaper,
   memberFailures,
   type AliasGroupSpec,
+  type AliasGroupAcquireResult,
 } from './concurrency-queue';
 import { isModelBanned, recordBanSignal } from './ban';
 import { ensureLocalUpstreamReady } from './gpu-resources';
@@ -126,6 +140,44 @@ function isTruncatedOutput(hasContent: boolean, end: {
   return false;
 }
 
+/** Store the real upstream body for Recent RAW inspect, not just a label. */
+function garbageInspect(kind: string, raw: unknown): string {
+  let body = '';
+  if (typeof raw === 'string') body = raw;
+  else if (Array.isArray(raw) && raw.length && Buffer.isBuffer(raw[0])) {
+    body = Buffer.concat(raw as Buffer[]).toString('utf8');
+  } else if (raw != null) {
+    try {
+      body = JSON.stringify(raw, null, 2);
+    } catch {
+      body = String(raw);
+    }
+  }
+  return `// ${kind}\n${body || '(empty body)'}`;
+}
+
+function asDumpBody(raw: unknown): unknown {
+  if (Array.isArray(raw) && raw.length && Buffer.isBuffer((raw as Buffer[])[0])) {
+    return Buffer.concat(raw as Buffer[]).toString('utf8');
+  }
+  return raw ?? '';
+}
+
+function garbageError(kind: string, text?: string, extra?: string): string {
+  const bits = [kind];
+  if (extra) bits.push(extra);
+  if (text) {
+    const m = analyzeText(text);
+    bits.push(
+      `cjks=${m.maxCJK}`,
+      `digits=${m.maxDigits}`,
+      `artifacts=${m.artifactWords}`,
+      `ratio=${m.garbageRatio.toFixed(3)}`,
+    );
+  }
+  return bits.join(' ');
+}
+
 /**
  * Feature-gated ban signal for truncated/unfinished responses
  * (ENABLE_TRUNCATION_BAN). Fires the 'truncated' counter for a provider:model so
@@ -149,35 +201,56 @@ function flagTruncationIfEnabled(key: string, truncated: boolean): void {
 const FALLBACK_SKIP_FAIL_THRESHOLD = 3;
 
 /**
- * AbortController + "no response yet" deadline. If the upstream hasn't sent an
- * HTTP response (headers/status) within `ms`, the signal is aborted — this
- * covers connections that hang BEFORE any stream bytes arrive (the phase my
- * per-chunk idle timer can't see). Call `.ok()` once the upstream has
- * responded so long-but-active streams are never affected. `ms <= 0` disables.
+ * True when a stream chunk is real model payload, not HTTP/SSE keep-alive.
+ * Gonka often sends `: ping` / blank SSE frames — those display as "0 KB"
+ * (UI used to round <1KiB down) but still reset the idle timer, so a
+ * 0-payload outgoing never died.
+ */
+function isUpstreamPayloadChunk(chunk: Buffer): boolean {
+  if (!chunk || chunk.length === 0) return false;
+  const text = chunk.toString('utf8');
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
+  if (lines.length === 0) return false;
+  if (lines.every((l) => l.startsWith(':'))) return false;
+  return true;
+}
+
+/**
+ * AbortController + deadline until the first *payload* byte (not headers,
+ * not SSE comments). After payload starts, `.ok()` and the per-chunk idle
+ * watchdog take over. `ms <= 0` disables.
  */
 function makeUpstreamAbort(
   ms: number,
   label: string,
-): { signal: AbortSignal; ok(): void; abort(): void } {
+): { signal: AbortSignal; ok(): void; abort(): void; bindStream(s: { destroy?: () => void } | null): void } {
   const ctrl = new AbortController();
   let timer: NodeJS.Timeout | null = null;
+  let stream: { destroy?: () => void } | null = null;
+  const fire = (why: string): void => {
+    if (ctrl.signal.aborted) {
+      try { stream?.destroy?.(); } catch { /* ignore */ }
+      return;
+    }
+    console.log(`[upstream] ${why}`);
+    ctrl.abort();
+    try { stream?.destroy?.(); } catch { /* ignore */ }
+  };
   if (ms > 0) {
     timer = setTimeout(() => {
-      if (!ctrl.signal.aborted) {
-        console.log(
-          `[upstream] no response in ${Math.round(ms / 1000)}s, aborting ${label}`,
-        );
-        ctrl.abort();
-      }
+      fire(`no payload bytes in ${Math.round(ms / 1000)}s, aborting ${label}`);
     }, ms);
   }
   return {
     signal: ctrl.signal,
+    bindStream(s) {
+      stream = s;
+    },
     ok() {
       if (timer) { clearTimeout(timer); timer = null; }
     },
     abort() {
-      if (!ctrl.signal.aborted) ctrl.abort();
+      fire(`abort ${label}`);
     },
   };
 }
@@ -189,6 +262,70 @@ function makeUpstreamAbort(
  * forwardChatCompletion catches it and re-queues.
  */
 class QueueRetry429 extends Error {}
+
+/** Client gone / zombie-reaped — do not fallback, just drop the slot. */
+class ClientClosedError extends Error {
+  constructor(message = 'client-closed') {
+    super(message);
+    this.name = 'ClientClosedError';
+  }
+}
+
+/** One hedge attempt lost the race or failed while suppressFallback is on. */
+class HedgeAttemptFailed extends Error {
+  constructor(message = 'hedge-attempt-failed') {
+    super(message);
+    this.name = 'HedgeAttemptFailed';
+  }
+}
+
+interface OnceOpts {
+  suppressFallback?: boolean;
+  /** First body byte: return true if this attempt should continue to the client. */
+  onFirstByte?: () => boolean;
+  attachAbort?: (abort: () => void) => void;
+}
+
+async function tryFallbackChainUnless(
+  suppress: boolean | undefined,
+  label: string,
+  originalAdapter: ProviderAdapter,
+  originalModel: string,
+  body: ChatCompletionRequest,
+  incomingHeaders: IncomingHttpHeaders,
+  res: Response,
+  endpointPrefix: string,
+  skipGroupMembers: string[] = [],
+): Promise<boolean> {
+  if (suppress) return false;
+  return tryFallbackChain(
+    label,
+    originalAdapter,
+    originalModel,
+    body,
+    incomingHeaders,
+    res,
+    endpointPrefix,
+    skipGroupMembers,
+  );
+}
+
+function throwIfHedgeSuppressed(suppress: boolean | undefined, message: string): void {
+  if (suppress) throw new HedgeAttemptFailed(message);
+}
+
+function isClientGone(res: Response): boolean {
+  return Boolean(res.destroyed || res.writableEnded);
+}
+
+function throwIfNoFallback(err: unknown, res: Response, endLive?: () => void): void {
+  if (err instanceof QueueRetry429) return;
+  if (err instanceof HedgeAttemptFailed) throw err;
+  if (err instanceof ClientClosedError || isClientGone(res)) {
+    try { endLive?.(); } catch { /* ignore */ }
+    throw err instanceof ClientClosedError ? err : new ClientClosedError();
+  }
+}
 
 function forwardHeaders(
   incoming: IncomingHttpHeaders,
@@ -459,8 +596,9 @@ async function bufferedStreamRequest(
   url: string,
   payload: ChatCompletionRequest,
   headers: Record<string, string>,
-  upstreamAbort?: { signal: AbortSignal; ok(): void; abort(): void },
+  upstreamAbort?: { signal: AbortSignal; ok(): void; abort(): void; bindStream?(s: { destroy?: () => void } | null): void },
   liveReqId?: string,
+  onFirstByte?: () => boolean,
 ): Promise<{
   completionText: string;
   streamUsage: UsageBreakdown | null;
@@ -475,9 +613,12 @@ async function bufferedStreamRequest(
     validateStatus: () => true,
     signal: upstreamAbort?.signal,
   });
-  // Response (headers) received — the pre-response deadline is done; the
-  // buffered per-chunk idle watchdog handles the streaming phase from here.
-  upstreamAbort?.ok();
+  // Headers do NOT count as payload. Keep the 0-byte deadline armed until
+  // the first real SSE/data chunk; bind the body so abort can destroy it
+  // (axios unsubscribes from AbortSignal once headers arrive).
+  upstreamAbort?.bindStream?.(
+    upstream.data as NodeJS.ReadableStream & { destroy?: () => void },
+  );
 
   const upstreamFailed = upstream.status >= 400;
   const upstreamHeaders: Record<string, string> = {};
@@ -492,56 +633,96 @@ async function bufferedStreamRequest(
   let streamUsage: UsageBreakdown | null = null;
   const chunks: Buffer[] = [];
 
+  const aborted = (): boolean => Boolean(upstreamAbort?.signal.aborted);
+
   // For error responses, don't wait for stream end — close after 5s max
   if (upstreamFailed) {
     await new Promise<void>((resolve) => {
       const stream = upstream.data as NodeJS.ReadableStream & { destroy?: () => void };
-      const timer = setTimeout(() => { stream.destroy?.(); resolve(); }, 5000);
+      let settled = false;
+      const done = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        upstreamAbort?.signal.removeEventListener('abort', onAbort);
+        resolve();
+      };
+      const onAbort = (): void => { stream.destroy?.(); done(); };
+      const timer = setTimeout(() => { stream.destroy?.(); done(); }, 5000);
+      if (aborted()) { onAbort(); return; }
+      upstreamAbort?.signal.addEventListener('abort', onAbort, { once: true });
       stream.on('data', (chunk: Buffer) => { rawErrorBody += chunk.toString('utf8'); });
-      stream.on('end', () => { clearTimeout(timer); resolve(); });
-      stream.on('error', () => { clearTimeout(timer); stream.destroy?.(); resolve(); });
+      stream.on('end', done);
+      stream.on('error', () => { stream.destroy?.(); done(); });
     });
   } else {
-    // Success stream: inactivity timeout (no bytes for STREAM_IDLE_TIMEOUT_MS)
-    // to catch silently-hung upstreams early. Reset on every data chunk.
-    const STREAM_IDLE_MS =
-      appConfig.streamIdleTimeoutMs > 0
-        ? appConfig.streamIdleTimeoutMs
-        : 300_000;
+    // Success stream: inactivity timeout on the *upstream* only
+    // (STREAM_IDLE_TIMEOUT). Reset on every data chunk. 0 disables.
+    const idleMs = appConfig.streamIdleTimeoutMs;
     await new Promise<void>((resolve, reject) => {
       const stream = upstream.data as NodeJS.ReadableStream & { destroy?: () => void };
-      const idleS = Math.round(STREAM_IDLE_MS / 1000);
-      let timer = setTimeout(() => {
+      const idleS = Math.round(idleMs / 1000);
+      let settled = false;
+      let timer: NodeJS.Timeout | null = null;
+      const finish = (fn: () => void): void => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        timer = null;
+        upstreamAbort?.signal.removeEventListener('abort', onAbort);
+        fn();
+      };
+      const onAbort = (): void => {
         stream.destroy?.();
-        console.log(
-          `[stream] abort (buffered) idle=${idleS}s (STREAM_IDLE_TIMEOUT_MS)`,
-        );
-        reject(new Error(`stream idle timeout after ${idleS}s (no upstream data)`));
-      }, STREAM_IDLE_MS);
-      stream.on('data', (chunk: Buffer) => {
-        clearTimeout(timer);
+        finish(() => reject(new ClientClosedError('upstream aborted')));
+      };
+      const armIdle = (): void => {
+        if (idleMs <= 0) return;
+        if (timer) clearTimeout(timer);
         timer = setTimeout(() => {
           stream.destroy?.();
           console.log(
-            `[stream] abort (buffered) idle=${idleS}s (STREAM_IDLE_TIMEOUT_MS)`,
+            `[stream] abort (buffered) idle=${idleS}s (STREAM_IDLE_TIMEOUT)`,
           );
-          reject(new Error(`stream idle timeout after ${idleS}s (no upstream data)`));
-        }, STREAM_IDLE_MS);
+          finish(() => reject(new Error(`stream idle timeout after ${idleS}s (no upstream data)`)));
+        }, idleMs);
+      };
+      let claimed = false;
+      armIdle();
+      if (aborted()) { onAbort(); return; }
+      upstreamAbort?.signal.addEventListener('abort', onAbort, { once: true });
+      stream.on('data', (chunk: Buffer) => {
+        if (settled) return;
+        const payload = isUpstreamPayloadChunk(chunk);
+        if (payload) {
+          armIdle();
+          upstreamAbort?.ok();
+        }
+        if (!claimed && payload) {
+          claimed = true;
+          if (onFirstByte && !onFirstByte()) {
+            stream.destroy?.();
+            finish(() => reject(new HedgeAttemptFailed('lost-race')));
+            return;
+          }
+        }
         chunks.push(chunk);
         const text = chunk.toString('utf8');
-        if (liveReqId) touchLiveResponse(liveReqId, text, chunk.length);
+        if (liveReqId && payload) touchLiveResponse(liveReqId, text, chunk.length);
         completionText += extractStreamText(text);
         streamUsage = collectStreamUsage(text, streamUsage);
       });
-      stream.on('end', () => {
-        clearTimeout(timer);
+      stream.on('aborted', () => {
         stream.destroy?.();
-        resolve();
+        finish(() => reject(new Error('upstream stream aborted')));
+      });
+      stream.on('end', () => {
+        stream.destroy?.();
+        finish(() => resolve());
       });
       stream.on('error', (err) => {
-        clearTimeout(timer);
         stream.destroy?.();
-        reject(err);
+        finish(() => reject(aborted() ? new ClientClosedError('upstream aborted') : err));
       });
     });
   }
@@ -1035,9 +1216,118 @@ function convertMiniMaxAgenticToolCall(body: unknown): unknown {
   return body;
 }
 
+function normalizeMiniMaxResponse(body: unknown): unknown {
+  convertMiniMaxThink(body);
+  return convertMiniMaxAgenticToolCall(body);
+}
+
 /** True when the effective model string looks like a MiniMax (M2/agentic) model. */
 export function isMiniMaxModel(model: string): boolean {
   return /minimax/i.test(model);
+}
+
+/**
+ * MiniMax M2 on gonka/vLLM often emits reasoning as inline tags in `content`
+ * instead of OpenAI `reasoning_content`. vLLM's minimax_m2 parser: everything
+ * before `</think>` is reasoning, everything after is the user-visible reply.
+ * The model may omit the opening `<think>`.
+ *
+ * Returns null when there is nothing to split. Empty `content` means think-only
+ * (truncated / never closed) — caller should treat that as no visible reply.
+ */
+export function splitMiniMaxThink(text: string): { reasoning: string; content: string } | null {
+  if (typeof text !== 'string' || !text) return null;
+  if (text.indexOf('<think') === -1 && text.indexOf('</think>') === -1) return null;
+  const endMatch = text.match(/<\/think>/i);
+  if (!endMatch || endMatch.index == null) {
+    const reasoning = text.replace(/^\s*<think\b[^>]*>/i, '');
+    return { reasoning, content: '' };
+  }
+  let reasoning = text.slice(0, endMatch.index);
+  reasoning = reasoning.replace(/^\s*<think\b[^>]*>/i, '');
+  const content = text.slice(endMatch.index + endMatch[0].length).replace(/^\s+/, '');
+  return { reasoning, content };
+}
+
+function convertMiniMaxThink(body: unknown): unknown {
+  const root = body as {
+    choices?: Array<{
+      message?: {
+        role?: string;
+        content?: unknown;
+        reasoning_content?: unknown;
+      };
+    }>;
+  };
+  if (!root || !Array.isArray(root.choices)) return body;
+  for (const choice of root.choices) {
+    const msg = choice?.message;
+    if (!msg || msg.role !== 'assistant') continue;
+    if (typeof msg.content !== 'string') continue;
+    const split = splitMiniMaxThink(msg.content);
+    if (!split) continue;
+    if (split.reasoning) msg.reasoning_content = split.reasoning;
+    msg.content = split.content;
+  }
+  return body;
+}
+
+/**
+ * Re-emit a buffered MiniMax stream with think tags split into
+ * `reasoning_content` + visible `content` (Hermes hides reasoning).
+ * Unchanged when there is no think markup, or when there is no visible tail
+ * (think-only is handled as empty generation / fallback).
+ */
+export function rewriteStreamForMiniMaxThink(
+  chunks: Buffer[],
+  completionText: string,
+  model: string,
+): Buffer[] {
+  if (!isMiniMaxModel(model) && completionText.indexOf('<think') === -1 && completionText.indexOf('</think>') === -1) {
+    return chunks;
+  }
+  const split = splitMiniMaxThink(completionText);
+  if (!split || !split.content) return chunks;
+
+  const created = Math.floor(Date.now() / 1000);
+  const out: Buffer[] = [];
+  const delta: { role: string; content: string; reasoning_content?: string } = {
+    role: 'assistant',
+    content: split.content,
+  };
+  if (split.reasoning) delta.reasoning_content = split.reasoning;
+  out.push(
+    sseFrame({
+      id: 'chatcmpl-minimax-think-proxy',
+      object: 'chat.completion.chunk',
+      created,
+      model,
+      choices: [{ index: 0, delta, finish_reason: null }],
+    }),
+  );
+  out.push(
+    sseFrame({
+      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+    }),
+  );
+  const joined = Buffer.concat(chunks).toString('utf8');
+  for (const line of joined.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) continue;
+    const data = trimmed.slice(5).trim();
+    if (!data || data === '[DONE]') continue;
+    try {
+      const parsed = JSON.parse(data) as { usage?: unknown; choices?: unknown[] };
+      if (parsed.usage && Array.isArray(parsed.choices) && parsed.choices.length === 0) {
+        out.push(Buffer.from(`data: ${data}\n\n`, 'utf8'));
+        break;
+      }
+    } catch {
+      // ignore malformed SSE lines
+    }
+  }
+  out.push(Buffer.from('data: [DONE]\n\n', 'utf8'));
+  return out;
 }
 
 /**
@@ -1184,6 +1474,11 @@ function messageHasToolCalls(msg: unknown): boolean {
   if (!msg || typeof msg !== 'object') return false;
   const m = msg as { tool_calls?: unknown };
   return Array.isArray(m.tool_calls) && m.tool_calls.length > 0;
+}
+
+function messageToolCalls(msg: unknown): unknown {
+  if (!msg || typeof msg !== 'object') return undefined;
+  return (msg as { tool_calls?: unknown }).tool_calls;
 }
 
 /** A clean, protocol-complete empty SSE completion (last resort when the fallback chain is exhausted). */
@@ -1381,6 +1676,10 @@ export function adaptForModel(
   if (quirk?.reasoningEffort) {
     adapted = { ...adapted, reasoning_effort: quirk.reasoningEffort };
   }
+  // Official MiniMax + some vLLM gateways: peel reasoning out of `content`.
+  if (isMiniMaxModel(model) && adapted.reasoning_split === undefined) {
+    adapted = { ...adapted, reasoning_split: true };
+  }
 
   // Generation-param overrides: only fill when the client did NOT set the
   // value explicitly, so we never override an intentional caller choice.
@@ -1500,27 +1799,42 @@ export async function forwardChatCompletion(
   let groupIdx = 0;
 
   // Track incoming connection for dashboard
-  const incPreview = (() => {
-    const msgs = body.messages ?? [];
-    const lastUser = [...msgs].reverse().find((m: any) => m.role === 'user');
-    return typeof lastUser?.content === 'string' ? lastUser.content.replace(/\s+/g, ' ').trim().slice(0, 60) : '';
-  })();
-  const incId = recordIncomingStart(incPreview);
+  const msgs = body.messages ?? [];
+  const flattenContent = (content: unknown): string => {
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) {
+      return content.map((p) => (
+        typeof p === 'string' ? p : (p && typeof p === 'object' && 'text' in p ? String((p as { text?: unknown }).text ?? '') : JSON.stringify(p))
+      )).join(' ');
+    }
+    if (content == null) return '';
+    return JSON.stringify(content);
+  };
+  const lastUser = [...msgs].reverse().find((m: { role?: string }) => m.role === 'user') as { content?: unknown } | undefined;
+  const lastMsg = msgs.length ? msgs[msgs.length - 1] as {
+    role?: string; content?: unknown; name?: string;
+    tool_calls?: Array<{ function?: { name?: string } }>;
+  } : undefined;
+  const toolNames = (lastMsg?.tool_calls || []).map((t) => t.function?.name).filter(Boolean).join(',');
+  const incId = recordIncomingStart({
+    preview: flattenContent(lastUser?.content),
+    lastRole: lastMsg?.name ? `tool:${lastMsg.name}` : (lastMsg?.role || ''),
+    lastClip: flattenContent(lastMsg?.content) || (toolNames ? `tool_calls:${toolNames}` : ''),
+    msgCount: msgs.length,
+  });
   const markIncomingDone = () => recordIncomingEnd(incId);
   // Reaper: kill incoming connection if client stream hangs > limit
   registerReapable({ id: incId, kind: 'incoming', startedAt: Date.now(), destroy: () => res.destroy?.() });
   const doneIncoming = () => { unregisterReapable(incId); markIncomingDone(); };
-  // Safety net: guaranteed cleanup when response fully sent to client
+  // Safety net: finish (normal) OR close (client abort / reaper destroy)
   res.on('finish', doneIncoming);
+  res.on('close', doneIncoming);
 
-  // Preview for queue dashboard: last user message, ~60 chars
+  // Preview for the concurrency waiters list (first … last of last user).
   const userMsg = (body.messages ?? [])
-    .filter((m: any) => m.role === 'user')
-    .pop();
-  const queuePreview: string =
-    typeof userMsg?.content === 'string'
-      ? userMsg.content.replace(/\s+/g, ' ').trim().slice(0, 60)
-      : '';
+    .filter((m: { role?: string }) => m.role === 'user')
+    .pop() as { content?: unknown } | undefined;
+  const queuePreview = clipEnds(flattenContent(userMsg?.content), 40);
 
   while (true) {
     const waitMs = appConfig.retryQueueWaitTimeout * 1000;
@@ -1533,15 +1847,38 @@ export async function forwardChatCompletion(
       if (gAcquired.ok) {
         const grpAdapter = getProvider(gAcquired.provider as ProviderId);
         const { release } = gAcquired.handle;
+        bindReapableRelease(incId, release);
         try {
+          if (g.nodataTryParallel) {
+            const outcome = await runNodataHedge({
+              groups,
+              groupIdx,
+              primary: gAcquired,
+              extra: g.nodataTryParallel,
+              body,
+              incomingHeaders,
+              res,
+              endpointPrefix,
+              fallbackFrom,
+              canRetry: attemptsLeft > 0,
+              markIncomingDone: doneIncoming,
+            });
+            if (outcome.kind === 'ok') return;
+            if (outcome.kind === 'client-closed') return;
+            if (outcome.kind === 'retry-429') { attemptsLeft--; continue; }
+            for (const k of outcome.exhausted) groupExhausted.add(k);
+            continue;
+          }
           await forwardChatCompletionOnce(grpAdapter, gAcquired.model, body, incomingHeaders, res, endpointPrefix, fallbackFrom, attemptsLeft > 0, doneIncoming);
           return;
         } catch (err) {
           if (err instanceof QueueRetry429 && attemptsLeft > 0) { attemptsLeft--; continue; }
+          if (err instanceof ClientClosedError) return;
           release();
           groupExhausted.add(`${gAcquired.provider}:${gAcquired.model}`);
           continue;
         } finally {
+          bindReapableRelease(incId, undefined);
           release();
         }
       }
@@ -1587,6 +1924,7 @@ export async function forwardChatCompletion(
     }
 
     const { release } = acquired.handle;
+    bindReapableRelease(incId, release);
     try {
       await forwardChatCompletionOnce(
         adapter,
@@ -1606,10 +1944,161 @@ export async function forwardChatCompletion(
         console.log(`[queue] ${queueKey} upstream 429 "too many concurrent requests", re-queuing (${attemptsLeft} left)`);
         continue;
       }
+      if (err instanceof ClientClosedError) return;
       throw err;
     } finally {
+      bindReapableRelease(incId, undefined);
       release();
     }
+  }
+}
+
+type HedgeOutcome =
+  | { kind: 'ok' }
+  | { kind: 'client-closed' }
+  | { kind: 'retry-429' }
+  | { kind: 'fail'; exhausted: string[] };
+
+async function runNodataHedge(args: {
+  groups: AliasGroupSpec[];
+  groupIdx: number;
+  primary: Extract<AliasGroupAcquireResult, { ok: true }>;
+  extra: { on_sec: number; additional_requests: number };
+  body: ChatCompletionRequest;
+  incomingHeaders: IncomingHttpHeaders;
+  res: Response;
+  endpointPrefix: string;
+  fallbackFrom?: string;
+  canRetry: boolean;
+  markIncomingDone?: () => void;
+}): Promise<HedgeOutcome> {
+  const {
+    groups, groupIdx, primary, extra, body, incomingHeaders, res,
+    endpointPrefix, fallbackFrom, canRetry, markIncomingDone,
+  } = args;
+
+  type Attempt = {
+    id: number;
+    provider: string;
+    model: string;
+    abort: () => void;
+    settled: boolean;
+    ok: boolean;
+    promise: Promise<void>;
+  };
+
+  const attempts: Attempt[] = [];
+  let winnerId: number | null = null;
+  let retry429 = false;
+  let clientClosed = false;
+
+  const claim = (id: number): boolean => {
+    if (winnerId === null) {
+      winnerId = id;
+      const w = attempts[id];
+      console.log(
+        `[nodata-hedge] winner ${w.provider}/${w.model} (attempt ${id + 1}/${attempts.length})`,
+      );
+      for (const a of attempts) {
+        if (a.id !== id) a.abort();
+      }
+      return true;
+    }
+    return winnerId === id;
+  };
+
+  const startAttempt = (provider: string, model: string, release: () => void): void => {
+    const id = attempts.length;
+    const rec: Attempt = {
+      id, provider, model, abort: () => {}, settled: false, ok: false, promise: Promise.resolve(),
+    };
+    rec.promise = (async () => {
+      try {
+        const adapter = getProvider(provider as ProviderId);
+        await forwardChatCompletionOnce(
+          adapter,
+          model,
+          body,
+          incomingHeaders,
+          res,
+          endpointPrefix,
+          fallbackFrom,
+          canRetry,
+          markIncomingDone,
+          {
+            suppressFallback: true,
+            onFirstByte: () => claim(id),
+            attachAbort: (fn) => { rec.abort = fn; },
+          },
+        );
+        rec.ok = true;
+      } catch (err) {
+        if (err instanceof QueueRetry429) retry429 = true;
+        if (err instanceof ClientClosedError) clientClosed = true;
+        rec.ok = false;
+      } finally {
+        rec.settled = true;
+        release();
+      }
+    })();
+    attempts.push(rec);
+  };
+
+  startAttempt(primary.provider, primary.model, primary.handle.release);
+
+  const hedgeTimer = setTimeout(() => {
+    if (winnerId !== null || isClientGone(res)) return;
+    const excludeProviders = new Set(attempts.map((a) => a.provider));
+    const excludeKeys = new Set(attempts.map((a) => `${a.provider}:${a.model}`));
+    let spawned = 0;
+    for (let n = 0; n < extra.additional_requests; n++) {
+      const slot = tryOccupyHedgeSlot(groups, groupIdx, {
+        providers: excludeProviders,
+        keys: excludeKeys,
+      });
+      if (!slot) break;
+      const { acquired } = slot;
+      excludeProviders.add(acquired.provider);
+      excludeKeys.add(`${acquired.provider}:${acquired.model}`);
+      console.log(
+        `[nodata-hedge] spawn extra ${acquired.provider}/${acquired.model} after ${extra.on_sec}s silence`,
+      );
+      startAttempt(acquired.provider, acquired.model, acquired.handle.release);
+      spawned++;
+    }
+    if (spawned === 0) {
+      console.log(`[nodata-hedge] no free other-provider slot after ${extra.on_sec}s`);
+    }
+  }, extra.on_sec * 1000);
+
+  try {
+    while (true) {
+      if (clientClosed) return { kind: 'client-closed' };
+      if (retry429) return { kind: 'retry-429' };
+      if (winnerId !== null) {
+        const w = attempts[winnerId];
+        await w.promise;
+        for (const a of attempts) a.abort();
+        await Promise.allSettled(attempts.map((a) => a.promise));
+        if (w.ok) return { kind: 'ok' };
+        return {
+          kind: 'fail',
+          exhausted: attempts.map((a) => `${a.provider}:${a.model}`),
+        };
+      }
+      const live = attempts.filter((a) => !a.settled);
+      if (live.length === 0) {
+        return {
+          kind: 'fail',
+          exhausted: attempts.map((a) => `${a.provider}:${a.model}`),
+        };
+      }
+      await Promise.race(live.map((a) => a.promise));
+    }
+  } finally {
+    clearTimeout(hedgeTimer);
+    for (const a of attempts) a.abort();
+    await Promise.allSettled(attempts.map((a) => a.promise));
   }
 }
 
@@ -1625,6 +2114,7 @@ async function forwardChatCompletionOnce(
   /** Whether a QueueRetry429 re-queue is still available (RETRY_LOOP_COUNTER). */
   canRetry = true,
   markIncomingDone?: () => void,
+  onceOpts?: OnceOpts,
 ): Promise<void> {
   const model = activeModel.trim() || adapter.resolveModel(body.model);
 
@@ -1670,21 +2160,24 @@ async function forwardChatCompletionOnce(
   // Track live request for dashboard
   const reqId = recordRequestStart(
     `${adapter.id}:${model}`, adapter.id, model,
-    requestCtx.userRequestPreview,
+    requestCtx.userRequestText,
   );
-  // Reaper: kill upstream request if it hangs (no response / no bytes) beyond
-  // limits. __abortOutbound actually aborts the pending upstream HTTP request,
-  // and the client socket is destroyed so Hermes learns immediately instead of
-  // waiting for its own 900s reconnect.
+  // STREAM_IDLE_TIMEOUT aborts only the pending *upstream* request
+  // (AbortController). The 10-min zombie reaper still force-cleans leftovers.
   const reqStartedAt = Date.now();
   const upstreamAbort = makeUpstreamAbort(
     appConfig.streamIdleTimeoutMs,
     `${adapter.id}/${model}`,
   );
+  onceOpts?.attachAbort?.(() => upstreamAbort.abort());
   const outboundAbort = { aborted: false };
   // Real abort hook for the zombie reaper (and any internal kill): abort the
   // pending upstream HTTP request via its AbortController.
   (res as any).__abortOutbound = (): void => upstreamAbort.abort();
+  res.once('close', () => {
+    outboundAbort.aborted = true;
+    upstreamAbort.abort();
+  });
   registerReapable({
     id: reqId, kind: 'outgoing', startedAt: reqStartedAt,
     destroy: () => {
@@ -1694,6 +2187,8 @@ async function forwardChatCompletionOnce(
     },
   });
 
+  return dumpLiveAls.run(reqId, async () => {
+  try {
   // Isolate a per-attempt copy of the request adapted for this model.
   // The original `body` is never mutated — every fallback step starts
   // from the pristine client payload (covers reasoning_content stripping,
@@ -1748,6 +2243,7 @@ async function forwardChatCompletionOnce(
         reqId,
         markIncomingDone,
         upstreamAbort,
+        onceOpts,
       );
       return;
     }
@@ -1769,9 +2265,10 @@ async function forwardChatCompletionOnce(
           signal: upstreamAbort.signal,
         },
       );
-      // Response (headers) received — the pre-response deadline is done;
-      // the per-chunk idle watchdog handles the streaming phase from here.
-      upstreamAbort.ok();
+      // Headers are not payload — keep the 0-byte deadline until first data chunk.
+      upstreamAbort.bindStream(
+        upstream.data as NodeJS.ReadableStream & { destroy?: () => void },
+      );
       const upstreamStatus = upstream.status;
       const upstreamFailed = upstreamStatus >= 400;
 
@@ -1845,6 +2342,7 @@ async function forwardChatCompletionOnce(
         // If configured, don't fallback on 429 — pass it through to the client
         // so Hermes can honor Retry-After and back off without failing the task.
         if (appConfig.doNotFallbackOn429 && upstreamStatus === 429) {
+          throwIfHedgeSuppressed(onceOpts?.suppressFallback, '429');
           console.log(
             `[429] DO_NOT_FALLBACK_ON_429: passing ${adapter.id}/${model} 429 through to client`,
           );
@@ -1872,7 +2370,7 @@ async function forwardChatCompletionOnce(
 
         // Try fallback chain for rate-limit
         const label = upstreamStatus === 413 ? '413 (TPM exceeded)' : '429';
-        const rerouted = await tryFallbackChain(
+        const rerouted = await tryFallbackChainUnless(onceOpts?.suppressFallback, 
           label,
           adapter,
           model,
@@ -1882,6 +2380,7 @@ async function forwardChatCompletionOnce(
           endpointPrefix,
         );
         if (rerouted) return;
+        throwIfHedgeSuppressed(onceOpts?.suppressFallback, 'fallback-exhausted');
         // No fallback — return rate-limit error to client as JSON
         if (!res.headersSent) {
           res.status(upstreamStatus).json(parsedError);
@@ -1942,7 +2441,7 @@ async function forwardChatCompletionOnce(
           console.error('[request-dump] logRequestDump failed:', (err as Error)?.message ?? String(err));
         });
 
-        const rerouted = await tryFallbackChain(
+        const rerouted = await tryFallbackChainUnless(onceOpts?.suppressFallback, 
           `upstream-${upstreamStatus}`,
           adapter,
           model,
@@ -1952,6 +2451,7 @@ async function forwardChatCompletionOnce(
           endpointPrefix,
         );
         if (rerouted) return;
+        throwIfHedgeSuppressed(onceOpts?.suppressFallback, 'fallback-exhausted');
         // No fallback — return upstream error to client as JSON
         if (!res.headersSent) {
           res.status(upstreamStatus).json(parsedError);
@@ -1970,26 +2470,36 @@ async function forwardChatCompletionOnce(
         return;
       }
 
-      res.status(upstreamStatus);
-      res.setHeader('X-Accel-Buffering', 'no');
-      res.setHeader('Cache-Control', 'no-cache, no-transform');
-      for (const [key, value] of Object.entries(upstream.headers)) {
-        if (value && !HOP_BY_HOP.has(key.toLowerCase())) {
-          res.setHeader(key, value as string | string[]);
+      const raceMode = Boolean(onceOpts?.onFirstByte);
+      if (!raceMode) {
+        res.status(upstreamStatus);
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.setHeader('Cache-Control', 'no-cache, no-transform');
+        for (const [key, value] of Object.entries(upstream.headers)) {
+          if (value && !HOP_BY_HOP.has(key.toLowerCase())) {
+            res.setHeader(key, value as string | string[]);
+          }
         }
-      }
-      if (typeof res.flushHeaders === 'function') {
-        res.flushHeaders();
+        if (typeof res.flushHeaders === 'function') {
+          res.flushHeaders();
+        }
       }
 
       await new Promise<void>((resolve, reject) => {
-        // Idle watchdog: if the upstream sends NO bytes for
-        // STREAM_IDLE_TIMEOUT_MS, the connection is silently hung — abort it
-        // and fall back rather than waiting for the 10-min zombie reaper.
-        // Active streams reset the timer on every chunk.
+        // Idle watchdog: if the *upstream* sends NO bytes for
+        // STREAM_IDLE_TIMEOUT, abort the outgoing stream and fall back on the
+        // same client connection. Do not destroy the Hermes socket.
         const idleMs = appConfig.streamIdleTimeoutMs;
         let idleTimer: NodeJS.Timeout | null = null;
         let liveBytes = 0;
+        let settled = false;
+        let clientCommitted = !raceMode;
+        const settle = (fn: () => void): void => {
+          if (settled) return;
+          settled = true;
+          clearIdle();
+          fn();
+        };
         const clearIdle = (): void => {
           if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
         };
@@ -1997,30 +2507,58 @@ async function forwardChatCompletionOnce(
           if (idleMs <= 0) return;
           clearIdle();
           idleTimer = setTimeout(() => {
-            clearIdle();
             const idleS = Math.round(idleMs / 1000);
             console.log(
-              `[stream] abort ${adapter.id}/${model} idle=${idleS}s bytes=${liveBytes} (STREAM_IDLE_TIMEOUT_MS)`,
+              `[stream] abort ${adapter.id}/${model} idle=${idleS}s bytes=${liveBytes} (STREAM_IDLE_TIMEOUT)`,
             );
             (
               upstream?.data as NodeJS.ReadableStream & { destroy?: () => void }
             )?.destroy?.();
-            if (!res.writableEnded && !res.destroyed) res.destroy();
-            markIncomingDone?.();
-            reject(new Error(`stream idle timeout after ${idleS}s (no upstream data)`));
+            settle(() => reject(new Error(`stream idle timeout after ${idleS}s (no upstream data)`)));
           }, idleMs);
+        };
+        const commitClient = (): boolean => {
+          if (clientCommitted) return true;
+          if (onceOpts?.onFirstByte && !onceOpts.onFirstByte()) return false;
+          res.status(upstreamStatus);
+          res.setHeader('X-Accel-Buffering', 'no');
+          res.setHeader('Cache-Control', 'no-cache, no-transform');
+          for (const [key, value] of Object.entries(upstream!.headers)) {
+            if (value && !HOP_BY_HOP.has(key.toLowerCase())) {
+              res.setHeader(key, value as string | string[]);
+            }
+          }
+          if (typeof res.flushHeaders === 'function') {
+            res.flushHeaders();
+          }
+          clientCommitted = true;
+          return true;
         };
 
         upstream!.data.on('data', (chunk: Buffer) => {
+          const payload = isUpstreamPayloadChunk(chunk);
           const text = chunk.toString('utf8');
-          touchLiveResponse(reqId, text, chunk.length);
-          liveBytes += chunk.length;
+          if (payload) {
+            touchLiveResponse(reqId, text, chunk.length);
+            liveBytes += chunk.length;
+            upstreamAbort.ok();
+          }
           if (upstreamFailed) {
             rawErrorBody += text;
-          } else {
+          } else if (payload) {
             completionText += extractStreamText(text);
             streamUsage = collectStreamUsage(text, streamUsage);
           }
+          if (raceMode && payload && !clientCommitted) {
+            if (!commitClient()) {
+              (
+                upstream?.data as NodeJS.ReadableStream & { destroy?: () => void }
+              )?.destroy?.();
+              settle(() => reject(new HedgeAttemptFailed('lost-race')));
+              return;
+            }
+          }
+          if (!clientCommitted) return;
           res.write(chunk);
           if (
             typeof (res as Response & { flush?: () => void }).flush ===
@@ -2028,25 +2566,27 @@ async function forwardChatCompletionOnce(
           ) {
             (res as Response & { flush?: () => void }).flush?.();
           }
-          armIdle();
+          if (payload) armIdle();
         });
         upstream!.data.on('end', () => {
-          clearIdle();
+          if (raceMode && !clientCommitted) {
+            settle(() => reject(new HedgeAttemptFailed('no-upstream-bytes')));
+            return;
+          }
           res.end();
           markIncomingDone?.();
-          resolve();
+          settle(() => resolve());
         });
         upstream!.data.on('error', (err) => {
-          clearIdle();
-          reject(err);
+          settle(() => reject(outboundAbort.aborted || isClientGone(res) ? new ClientClosedError() : err));
         });
         res.on('close', () => {
-          clearIdle();
           (
             upstream?.data as NodeJS.ReadableStream & {
               destroy?: () => void;
             }
           )?.destroy?.();
+          settle(() => reject(new ClientClosedError()));
         });
         armIdle();
       });
@@ -2093,6 +2633,7 @@ async function forwardChatCompletionOnce(
     } catch (err) {
       // Re-queue signal must propagate to the queue loop, not fallback.
       if (err instanceof QueueRetry429) throw err;
+      throwIfNoFallback(err, res, () => recordRequestEnd(reqId, 0, 'client-closed'));
       // Dump full request + failure info before trying fallback
       const message = describeForwardError(err);
       logProxyError({
@@ -2124,7 +2665,7 @@ async function forwardChatCompletionOnce(
       });
 
       // Try fallback chain before returning 502
-      const rerouted = await tryFallbackChain(
+      const rerouted = await tryFallbackChainUnless(onceOpts?.suppressFallback, 
         message,
         adapter,
         model,
@@ -2134,6 +2675,7 @@ async function forwardChatCompletionOnce(
         endpointPrefix,
       );
       if (!rerouted) {
+        throwIfHedgeSuppressed(onceOpts?.suppressFallback, 'fallback-exhausted');
         await recordUsage(adapter, model, null, promptEstimate, '', requestCtx, {
           requestBody: body,
           upstreamUrl: url,
@@ -2203,6 +2745,7 @@ async function forwardChatCompletionOnce(
       // If configured, don't fallback on 429 — pass it through to the client
       // so Hermes can honor Retry-After and back off without failing the task.
       if (appConfig.doNotFallbackOn429 && upstream.status === 429) {
+        throwIfHedgeSuppressed(onceOpts?.suppressFallback, '429');
         console.log(
           `[429] DO_NOT_FALLBACK_ON_429: passing ${adapter.id}/${model} 429 through to client`,
         );
@@ -2229,7 +2772,7 @@ async function forwardChatCompletionOnce(
       }
 
       const label = upstream.status === 413 ? '413 (TPM exceeded)' : '429';
-      const rerouted = await tryFallbackChain(
+      const rerouted = await tryFallbackChainUnless(onceOpts?.suppressFallback, 
         label,
         adapter,
         model,
@@ -2239,6 +2782,7 @@ async function forwardChatCompletionOnce(
         endpointPrefix,
       );
       if (rerouted) return;
+      throwIfHedgeSuppressed(onceOpts?.suppressFallback, 'fallback-exhausted');
     }
 
     // Upstream 4xx/5xx or 402 — try fallback chain before passing through to client
@@ -2262,7 +2806,7 @@ async function forwardChatCompletionOnce(
         console.error('[request-dump] logRequestDump failed:', (err as Error)?.message ?? String(err));
       });
 
-      const rerouted = await tryFallbackChain(
+      const rerouted = await tryFallbackChainUnless(onceOpts?.suppressFallback, 
         `upstream-${upstream.status}`,
         adapter,
         model,
@@ -2272,6 +2816,7 @@ async function forwardChatCompletionOnce(
         endpointPrefix,
       );
       if (rerouted) return;
+      throwIfHedgeSuppressed(onceOpts?.suppressFallback, 'fallback-exhausted');
     }
 
     const upstreamFailed = upstream.status >= 400;
@@ -2377,7 +2922,7 @@ async function forwardChatCompletionOnce(
               message: describeForwardError(dumpErr),
             });
           });
-          res.status(retryResp.status).json(convertMiniMaxAgenticToolCall(retryResp.data));
+          res.status(retryResp.status).json(normalizeMiniMaxResponse(retryResp.data));
           return;
         }
       }
@@ -2417,6 +2962,10 @@ async function forwardChatCompletionOnce(
           completionText = cleaned;
         }
       }
+      if (upstream.data) convertMiniMaxThink(upstream.data);
+      if (firstMsg && typeof firstMsg.content === 'string') {
+        completionText = assistantContentText(firstMsg.content);
+      }
     }
 
     // Truncation detection (non-stream): flag chronic truncators for a ban.
@@ -2441,8 +2990,8 @@ async function forwardChatCompletionOnce(
       !assistantContentHasImage(firstMsg?.content) &&
       !messageHasToolCalls(firstMsg)
     ) {
-      recordModelResponse(`${adapter.id}:${model}`, 0);
-      recordRequestEnd(reqId, 0, 'empty-generated');
+      recordModelResponse(`${adapter.id}:${model}`, GARBAGE_STATUS_TEXT);
+      recordRequestEnd(reqId, GARBAGE_STATUS_TEXT, garbageInspect('empty-generated', upstream.data ?? completionText));
       logProxyError({
         provider: adapter.id,
         endpointPrefix,
@@ -2455,12 +3004,12 @@ async function forwardChatCompletionOnce(
         upstreamUrl: url,
         status: 200,
         stream: false,
-        responseBody: completionText,
+        responseBody: asDumpBody(upstream.data ?? completionText),
         error: 'empty-generated',
       }).catch((err) => {
         console.error('[request-dump] recordUsage failed:', (err as Error)?.message ?? String(err));
       });
-      const rerouted = await tryFallbackChain(
+      const rerouted = await tryFallbackChainUnless(onceOpts?.suppressFallback, 
         'empty-generated',
         adapter,
         model,
@@ -2470,6 +3019,7 @@ async function forwardChatCompletionOnce(
         endpointPrefix,
       );
       if (!rerouted) {
+        throwIfHedgeSuppressed(onceOpts?.suppressFallback, 'fallback-exhausted');
         // Fallback exhausted — return the (empty) completion as before so the
         // client's own empty-response handling can still act.
         logResponse({
@@ -2489,15 +3039,55 @@ async function forwardChatCompletionOnce(
           throughputMetrics(reqStartedAt, completionText, parseUsage(upstream.data)?.usage.completion_tokens ?? estimateTokensFromText(completionText)),
         );
         recordRequestEnd(reqId, upstream.status, completionText);
-        res.status(upstream.status).json(convertMiniMaxAgenticToolCall(upstream.data));
+        res.status(upstream.status).json(normalizeMiniMaxResponse(upstream.data));
       }
       return;
     }
 
+    // Malformed tool_calls (truncated JSON / missing name) — garbage 001, fallback
+    if (!upstreamFailed) {
+      const tcReason = malformedToolCallReason(messageToolCalls(firstMsg));
+      if (tcReason) {
+        recordModelResponse(`${adapter.id}:${model}`, GARBAGE_STATUS_MALFORMED_TOOL_CALLS);
+        recordRequestEnd(reqId, GARBAGE_STATUS_MALFORMED_TOOL_CALLS, garbageInspect('garbage-malformed-tool-calls', upstream.data ?? completionText));
+        logProxyError({
+          provider: adapter.id,
+          endpointPrefix,
+          requestedModel: requestedModelName,
+          effectiveModel: model,
+          message: `garbage 001 malformed tool_calls (${tcReason}), trying fallback chain`,
+        });
+        await recordUsage(adapter, model, null, promptEstimate, '', requestCtx, {
+          requestBody: body,
+          upstreamUrl: url,
+          status: 200,
+          stream: false,
+          responseBody: asDumpBody(upstream.data ?? completionText),
+          error: garbageError('garbage-malformed-tool-calls', completionText, tcReason),
+        }).catch((err) => {
+          console.error('[request-dump] recordUsage failed:', (err as Error)?.message ?? String(err));
+        });
+        const rerouted = await tryFallbackChainUnless(onceOpts?.suppressFallback, 
+          'garbage-malformed-tool-calls',
+          adapter,
+          model,
+          body,
+          incomingHeaders,
+          res,
+          endpointPrefix,
+        );
+        if (!rerouted) {
+          throwIfHedgeSuppressed(onceOpts?.suppressFallback, 'fallback-exhausted');
+          sendOverwhelmedResponse(res, model);
+        }
+        return;
+      }
+    }
+
     // Garbage detected in non-streaming output — treat as upstream error, try fallback
     if (!upstreamFailed && completionText && isGarbage(completionText)) {
-      recordModelResponse(`${adapter.id}:${model}`, 0);
-      recordRequestEnd(reqId, 0, 'garbage-detected');
+      recordModelResponse(`${adapter.id}:${model}`, GARBAGE_STATUS_TEXT);
+      recordRequestEnd(reqId, GARBAGE_STATUS_TEXT, garbageInspect('garbage-detected', upstream.data ?? completionText));
       const metrics = analyzeText(completionText);
       logProxyError({
         provider: adapter.id,
@@ -2511,12 +3101,12 @@ async function forwardChatCompletionOnce(
         upstreamUrl: url,
         status: 200,
         stream: false,
-        responseBody: completionText,
-        error: 'garbage-detected',
+        responseBody: asDumpBody(upstream.data ?? completionText),
+        error: garbageError('garbage-detected', completionText),
       }).catch((err) => {
         console.error('[request-dump] recordUsage failed:', (err as Error)?.message ?? String(err));
       });
-      const rerouted = await tryFallbackChain(
+      const rerouted = await tryFallbackChainUnless(onceOpts?.suppressFallback, 
         'garbage-detected',
         adapter,
         model,
@@ -2526,6 +3116,7 @@ async function forwardChatCompletionOnce(
         endpointPrefix,
       );
       if (!rerouted) {
+        throwIfHedgeSuppressed(onceOpts?.suppressFallback, 'fallback-exhausted');
         sendOverwhelmedResponse(res, model);
       }
       return;
@@ -2577,11 +3168,12 @@ async function forwardChatCompletionOnce(
       });
     });
 
-    res.status(upstream.status).json(convertMiniMaxAgenticToolCall(upstream.data));
+    res.status(upstream.status).json(normalizeMiniMaxResponse(upstream.data));
     markIncomingDone?.();
   } catch (err) {
     // Re-queue signal must propagate to the queue loop, not fallback.
     if (err instanceof QueueRetry429) throw err;
+    throwIfNoFallback(err, res, () => recordRequestEnd(reqId, 0, 'client-closed'));
     // Dump full request + failure info before trying fallback
     const message = describeForwardError(err);
     logProxyError({
@@ -2613,7 +3205,7 @@ async function forwardChatCompletionOnce(
     });
 
     // Try fallback chain before returning 502
-    const rerouted = await tryFallbackChain(
+    const rerouted = await tryFallbackChainUnless(onceOpts?.suppressFallback, 
       message,
       adapter,
       model,
@@ -2623,6 +3215,7 @@ async function forwardChatCompletionOnce(
       endpointPrefix,
     );
     if (!rerouted) {
+      throwIfHedgeSuppressed(onceOpts?.suppressFallback, 'fallback-exhausted');
       await recordUsage(adapter, model, null, promptEstimate, '', requestCtx, {
         requestBody: body,
         upstreamUrl: url,
@@ -2638,6 +3231,14 @@ async function forwardChatCompletionOnce(
       }
     }
   }
+  } finally {
+    finishLiveRequest(
+      reqId,
+      outboundAbort.aborted ? 0 : undefined,
+      outboundAbort.aborted ? 'aborted' : undefined,
+    );
+  }
+  });
 }
 
 /**
@@ -2666,9 +3267,10 @@ async function handleCollapsedEmptyStream(
   requestedModelName: string,
   completionText: string,
   streamUsage: UsageBreakdown | null,
+  onceOpts?: OnceOpts,
 ): Promise<void> {
-  recordModelResponse(`${adapter.id}:${model}`, 0);
-  recordRequestEnd(reqId, 0, 'empty-generated');
+  recordModelResponse(`${adapter.id}:${model}`, GARBAGE_STATUS_TEXT);
+  recordRequestEnd(reqId, GARBAGE_STATUS_TEXT, garbageInspect('empty-generated', chunks));
   const emptyLog = `empty / zero-width stream (no content, no tool_calls), trying fallback chain`;
   logProxyError({
     provider: adapter.id,
@@ -2683,13 +3285,13 @@ async function handleCollapsedEmptyStream(
     upstreamUrl: url,
     status: 200,
     stream: true,
-    responseBody: completionText,
+    responseBody: asDumpBody(chunks.length ? chunks : completionText),
     error: 'empty-generated',
   }).catch((err) => {
     console.error('[request-dump] recordUsage failed:', (err as Error)?.message ?? String(err));
   });
 
-  const rerouted = await tryFallbackChain(
+  const rerouted = await tryFallbackChainUnless(onceOpts?.suppressFallback, 
     'empty-generated',
     adapter,
     model,
@@ -2699,6 +3301,7 @@ async function handleCollapsedEmptyStream(
     endpointPrefix,
   );
   if (!rerouted) {
+    throwIfHedgeSuppressed(onceOpts?.suppressFallback, 'fallback-exhausted');
     // Fallback exhausted — return a protocol-complete empty completion so the
     // client's own empty-response recovery can still act (prior behaviour).
     flushBufferedChunks(res, emptySSEStream(model), 200, upstreamHeaders, markIncomingDone);
@@ -2730,7 +3333,8 @@ async function forwardStreamWithGarbageProtection(
   canRetry = true,
   reqId = '',
   markIncomingDone?: () => void,
-  upstreamAbort?: { signal: AbortSignal; ok(): void; abort(): void },
+  upstreamAbort?: { signal: AbortSignal; ok(): void; abort(): void; bindStream?(s: { destroy?: () => void } | null): void },
+  onceOpts?: OnceOpts,
 ): Promise<void> {
   const requestedModelName = String(body.model ?? '');
   let completionText = '';
@@ -2741,7 +3345,7 @@ async function forwardStreamWithGarbageProtection(
   let errorDetail: string | undefined;
 
   try {
-    const result = await bufferedStreamRequest(url, payload, headers, upstreamAbort, reqId);
+    const result = await bufferedStreamRequest(url, payload, headers, upstreamAbort, reqId, onceOpts?.onFirstByte);
     completionText = result.completionText;
     streamUsage = result.streamUsage;
     chunks = result.chunks;
@@ -2752,6 +3356,7 @@ async function forwardStreamWithGarbageProtection(
       errorDetail = formatUpstreamError(upstreamStatus, result.rawErrorBody);
     }
   } catch (err) {
+    throwIfNoFallback(err, res, () => recordRequestEnd(reqId, 0, 'client-closed'));
     const message = describeForwardError(err);
     recordModelResponse(`${adapter.id}:${model}`, 502);
     recordRequestEnd(reqId, 502, message);
@@ -2762,8 +3367,24 @@ async function forwardStreamWithGarbageProtection(
       effectiveModel: model,
       message,
     });
+    await logRequestDump({
+      provider: adapter.id,
+      model,
+      upstreamUrl: url,
+      status: 502,
+      stream: true,
+      tokensIn: 0,
+      tokensOut: 0,
+      dollars: 0,
+      requestBody: body,
+      responseBody: asDumpBody(chunks.length ? chunks : { error: message }),
+      requestCtx,
+      error: message,
+    }).catch((err) => {
+      console.error('[request-dump] logRequestDump failed:', (err as Error)?.message ?? String(err));
+    });
     // Treat network error same as garbage — try fallback
-    const rerouted = await tryFallbackChain(
+    const rerouted = await tryFallbackChainUnless(onceOpts?.suppressFallback, 
       message,
       adapter,
       model,
@@ -2773,6 +3394,7 @@ async function forwardStreamWithGarbageProtection(
       endpointPrefix,
     );
     if (!rerouted) {
+      throwIfHedgeSuppressed(onceOpts?.suppressFallback, 'fallback-exhausted');
       await recordUsage(adapter, model, null, promptEstimate, '', requestCtx, {
         requestBody: body,
         upstreamUrl: url,
@@ -2793,11 +3415,29 @@ async function forwardStreamWithGarbageProtection(
   // Upstream error — try fallback (or pass 429 through when configured)
   if (upstreamStatus >= 400) {
     recordModelResponse(`${adapter.id}:${model}`, upstreamStatus);
+    recordRequestEnd(reqId, upstreamStatus, errorDetail ?? `upstream-${upstreamStatus}`);
+    await logRequestDump({
+      provider: adapter.id,
+      model,
+      upstreamUrl: url,
+      status: upstreamStatus,
+      stream: true,
+      tokensIn: 0,
+      tokensOut: 0,
+      dollars: 0,
+      requestBody: body,
+      responseBody: asDumpBody(chunks.length ? chunks : (errorDetail ?? '')),
+      requestCtx,
+      error: errorDetail ?? `upstream-${upstreamStatus}`,
+    }).catch((err) => {
+      console.error('[request-dump] logRequestDump failed:', (err as Error)?.message ?? String(err));
+    });
     // "too many concurrent requests" with retries left → re-queue
     if (upstreamStatus === 429) {
       throwIfTooManyConcurrent(adapter, model, errorDetail ?? '', canRetry);
     }
     if (upstreamStatus === 429 && appConfig.doNotFallbackOn429) {
+      throwIfHedgeSuppressed(onceOpts?.suppressFallback, '429');
       console.log(
         `[429] DO_NOT_FALLBACK_ON_429: passing ${adapter.id}/${model} 429 through to client`,
       );
@@ -2823,7 +3463,7 @@ async function forwardStreamWithGarbageProtection(
       return;
     }
 
-    const rerouted = await tryFallbackChain(
+    const rerouted = await tryFallbackChainUnless(onceOpts?.suppressFallback, 
       `upstream-${upstreamStatus}`,
       adapter,
       model,
@@ -2833,16 +3473,7 @@ async function forwardStreamWithGarbageProtection(
       endpointPrefix,
     );
     if (!rerouted) {
-      await recordUsage(adapter, model, null, promptEstimate, '', requestCtx, {
-        requestBody: body,
-        upstreamUrl: url,
-        status: upstreamStatus,
-        stream: true,
-        responseBody: errorDetail ?? '',
-        error: errorDetail,
-      }).catch((err) => {
-        console.error('[request-dump] recordUsage failed:', (err as Error)?.message ?? String(err));
-      });
+      throwIfHedgeSuppressed(onceOpts?.suppressFallback, 'fallback-exhausted');
       flushBufferedChunks(res, chunks, upstreamStatus, upstreamHeaders, markIncomingDone);
     }
     return;
@@ -2881,8 +3512,51 @@ async function forwardStreamWithGarbageProtection(
       requestedModelName,
       completionText,
       streamUsage,
+      onceOpts,
     );
     return;
+  }
+
+  // Truncated / schema-broken tool_calls (missing name, chopped JSON args) —
+  // garbage 001. Same fallback as text garbage; distinct lastStatus.
+  {
+    const collected = collectToolCallsFromSseText(Buffer.concat(chunks).toString('utf8'));
+    const tcReason = malformedToolCallReason(collected);
+    if (tcReason) {
+      recordModelResponse(`${adapter.id}:${model}`, GARBAGE_STATUS_MALFORMED_TOOL_CALLS);
+      recordRequestEnd(reqId, GARBAGE_STATUS_MALFORMED_TOOL_CALLS, garbageInspect('garbage-malformed-tool-calls', chunks));
+      logProxyError({
+        provider: adapter.id,
+        endpointPrefix,
+        requestedModel: requestedModelName,
+        effectiveModel: model,
+        message: `garbage 001 malformed tool_calls in stream (${tcReason}), trying fallback chain`,
+      });
+      await recordUsage(adapter, model, null, promptEstimate, '', requestCtx, {
+        requestBody: body,
+        upstreamUrl: url,
+        status: 200,
+        stream: true,
+        responseBody: asDumpBody(chunks),
+        error: garbageError('garbage-malformed-tool-calls', completionText, tcReason),
+      }).catch((err) => {
+        console.error('[request-dump] recordUsage failed:', (err as Error)?.message ?? String(err));
+      });
+      const rerouted = await tryFallbackChainUnless(onceOpts?.suppressFallback, 
+        'garbage-malformed-tool-calls',
+        adapter,
+        model,
+        body,
+        incomingHeaders,
+        res,
+        endpointPrefix,
+      );
+      if (!rerouted) {
+        throwIfHedgeSuppressed(onceOpts?.suppressFallback, 'fallback-exhausted');
+        sendOverwhelmedResponse(res, model);
+      }
+      return;
+    }
   }
 
   // Placeholder/blank content (gonka text-channel collapse) — do NOT forward
@@ -2927,7 +3601,9 @@ async function forwardStreamWithGarbageProtection(
 
   // Clean output — flush to client (converting any MiniMax tool-call XML first)
   if (!isGarbage(completionText)) {
-    const outChunks = rewriteStreamForMiniMax(chunks, completionText, model);
+    const thinkChunks = rewriteStreamForMiniMaxThink(chunks, completionText, model);
+    const textForTools = splitMiniMaxThink(completionText)?.content || completionText;
+    const outChunks = rewriteStreamForMiniMax(thinkChunks, textForTools, model);
     flushBufferedChunks(res, outChunks, upstreamStatus, upstreamHeaders, markIncomingDone);
 
     await recordUsage(
@@ -2966,8 +3642,8 @@ async function forwardStreamWithGarbageProtection(
   }
 
   // Garbage detected — log, try fallback chain (no retry to same model)
-  recordModelResponse(`${adapter.id}:${model}`, 0);
-  recordRequestEnd(reqId, 0, 'garbage-detected');
+  recordModelResponse(`${adapter.id}:${model}`, GARBAGE_STATUS_TEXT);
+  recordRequestEnd(reqId, GARBAGE_STATUS_TEXT, garbageInspect('garbage-detected', chunks.length ? chunks : completionText));
   const metrics = analyzeText(completionText);
   const garbageLog = `garbage detected in stream (cjks=${metrics.maxCJK}, digits=${metrics.maxDigits}, artifacts=${metrics.artifactWords}, ratio=${metrics.garbageRatio.toFixed(3)}), trying fallback chain`;
   logProxyError({
@@ -2983,13 +3659,13 @@ async function forwardStreamWithGarbageProtection(
     upstreamUrl: url,
     status: 200,
     stream: true,
-    responseBody: completionText,
-    error: 'garbage-detected',
+    responseBody: asDumpBody(chunks.length ? chunks : completionText),
+    error: garbageError('garbage-detected', completionText),
   }).catch((err) => {
     console.error('[request-dump] recordUsage failed:', (err as Error)?.message ?? String(err));
   });
 
-  const rerouted = await tryFallbackChain(
+  const rerouted = await tryFallbackChainUnless(onceOpts?.suppressFallback, 
     'garbage-detected',
     adapter,
     model,
@@ -2999,6 +3675,7 @@ async function forwardStreamWithGarbageProtection(
     endpointPrefix,
   );
   if (!rerouted) {
+    throwIfHedgeSuppressed(onceOpts?.suppressFallback, 'fallback-exhausted');
     sendOverwhelmedResponse(res, model);
   }
 }

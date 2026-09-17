@@ -1,8 +1,12 @@
 import fs from 'fs/promises';
 import { existsSync } from 'fs';
 import path from 'path';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { appConfig } from '../config';
 import type { ChatCompletionRequest, CompletionRequestContext, ProviderId } from '../types';
+import { attachDumpFile } from './concurrency-queue';
+
+export const dumpLiveAls = new AsyncLocalStorage<string>();
 
 export interface RequestDumpEntry {
   provider: ProviderId;
@@ -133,7 +137,7 @@ export async function rotateReqLogs(): Promise<void> {
   }
 }
 
-export async function logRequestDump(entry: RequestDumpEntry): Promise<void> {
+export async function logRequestDump(entry: RequestDumpEntry): Promise<string | undefined> {
   let filePath = '';
   let filename = '';
   try {
@@ -160,6 +164,8 @@ export async function logRequestDump(entry: RequestDumpEntry): Promise<void> {
     if (entry.error) {
       headerLines.push(`error: ${entry.error}`);
     }
+    const liveId = dumpLiveAls.getStore();
+    if (liveId) headerLines.push(`live_id: ${liveId}`);
 
     const content = [
       formatSection('META', headerLines.join('\n')),
@@ -168,8 +174,59 @@ export async function logRequestDump(entry: RequestDumpEntry): Promise<void> {
     ].join('');
 
     await fs.writeFile(filePath, content, 'utf8');
+    if (liveId) attachDumpFile(liveId, filename);
+    return filename;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[request-dump] write failed: ${message}`, { filePath, filename });
   }
+  return undefined;
+}
+
+export interface RequestDumpSections {
+  meta: string;
+  request: string;
+  response: string;
+  error: string;
+  file: string;
+}
+
+function parseDumpSections(content: string): { meta: string; request: string; response: string } {
+  const parts: Record<string, string> = { META: '', REQUEST: '', RESPONSE: '' };
+  const re = /\n=== ([A-Z]+) ===\n/g;
+  const hits: Array<{ title: string; index: number; bodyStart: number }> = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(content)) !== null) {
+    hits.push({ title: m[1], index: m.index, bodyStart: m.index + m[0].length });
+  }
+  for (let i = 0; i < hits.length; i++) {
+    const end = i + 1 < hits.length ? hits[i + 1].index : content.length;
+    parts[hits[i].title] = content.slice(hits[i].bodyStart, end).trim();
+  }
+  return { meta: parts.META, request: parts.REQUEST, response: parts.RESPONSE };
+}
+
+export async function readRequestDump(filename: string): Promise<RequestDumpSections | null> {
+  if (!filename || filename.includes('..') || filename.includes('/') || filename.includes('\\')) {
+    return null;
+  }
+  const dirs = [appConfig.reqLogDir, appConfig.reqOldDir];
+  for (const dir of dirs) {
+    const filePath = path.join(dir, filename);
+    try {
+      const content = await fs.readFile(filePath, 'utf8');
+      const { meta, request, response } = parseDumpSections(content);
+      const errLine = meta.split('\n').find((l) => l.startsWith('error: '));
+      return {
+        meta,
+        request,
+        response,
+        error: errLine ? errLine.slice('error: '.length) : '',
+        file: filePath,
+      };
+    } catch {
+      continue;
+    }
+  }
+  return null;
 }
