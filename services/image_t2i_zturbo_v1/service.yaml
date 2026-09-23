@@ -1,0 +1,55 @@
+id: image_t2i_zturbo_v1
+title: "Text to Image — Z-Image Turbo (ComfyUI)"
+description: "Local Z-Image Turbo generation via ComfyUI workflow. Returns PNG files."
+version: "1.0.0"
+kind: exec
+entry: ["python3", "run.py"]
+timeout_sec: 600
+residents:
+  requires: [comfyui]
+  evicts: ["*"]
+resources:
+  vram_mb: 6000
+  ram_mb: 12000
+  cpu: 2
+  min_free_vram_mb: 1024
+estimate:
+  duration_sec: 40
+priority_default: normal
+input_schema:
+  type: object
+  required: [prompt]
+  additionalProperties: false
+  properties:
+    prompt:
+      type: string
+      minLength: 1
+      description: English prompt
+    width:
+      type: integer
+      minimum: 256
+      maximum: 2048
+      default: 1024
+    height:
+      type: integer
+      minimum: 256
+      maximum: 2048
+      default: 1024
+    seed:
+      type: integer
+      default: -1
+      description: "-1 = random"
+    steps:
+      type: integer
+      minimum: 1
+      maximum: 50
+    count:
+      type: integer
+      minimum: 1
+      maximum: 4
+      default: 1
+mcp:
+  expose: true
+  default_wait_sec: 240
+  legacy_tool_names:
+    - trigger_z_image_generation

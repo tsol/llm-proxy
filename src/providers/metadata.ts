@@ -18,7 +18,7 @@ interface ModelMeta {
   topP?: number;
   repetitionPenalty?: number;
   contextSteps?: number[];
-  gpuPrep?: { exclusive?: boolean };
+  gpuPrep?: { exclusive?: boolean; vramMb?: number };
 }
 
 interface ProviderMeta {

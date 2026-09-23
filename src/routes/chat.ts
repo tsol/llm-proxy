@@ -1,7 +1,6 @@
 import { Router, type Request, type Response } from 'express';
 import type { ChatCompletionRequest, ProviderId } from '../types';
-import { resolveModelRoute, refreshProviderLive, supportedModelIds } from '../catalog';
-import { ensureLocalUpstreamReady } from '../services/gpu-resources';
+import { resolveModelRoute, supportedModelIds } from '../catalog';
 import { getProvider, allProviders, getProviderIds } from '../providers';
 import { forwardChatCompletion } from '../services/forward';
 import { forwardCursorChatCompletion } from '../services/cursor-forward';
@@ -72,25 +71,6 @@ chatRouter.post('/chat/completions', async (req: Request, res: Response) => {
     requestedModel: String(body.model ?? ''),
   });
 
-  if (route.provider === 'local') {
-    try {
-      await ensureLocalUpstreamReady(route.upstreamModel);
-      await refreshProviderLive('local');
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : 'local model GPU prep failed';
-      // Don't return 503 here — let the forward fail naturally.
-      // The fallback chain in forward.ts will then try the next alias entry.
-      logProxyError({
-        provider: route.provider,
-        endpointPrefix: 'root',
-        requestedModel: String(body.model ?? ''),
-        effectiveModel: route.upstreamModel,
-        message,
-      });
-    }
-  }
-
   if (route.provider === 'cursor') {
     await forwardCursorChatCompletion(
       adapter as CursorProvider,
@@ -145,23 +125,6 @@ perProviderRouter.post('/chat/completions', async (req: Request, res: Response) 
     endpointPrefix: provider,
     requestedModel: String(body.model ?? ''),
   });
-
-  if (provider === 'local') {
-    try {
-      await ensureLocalUpstreamReady(model);
-      await refreshProviderLive('local');
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : 'local model GPU prep failed';
-      logProxyError({
-        provider,
-        endpointPrefix: provider,
-        requestedModel: String(body.model ?? ''),
-        effectiveModel: model,
-        message,
-      });
-    }
-  }
 
   await forwardChatCompletion(adapter, model, body, req.headers, res, provider);
 });

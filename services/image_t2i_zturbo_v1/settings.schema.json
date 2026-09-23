@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "workflow_file": { "type": "string", "default": "workflow.json" },
+    "default_steps": { "type": "integer", "default": 8, "minimum": 1, "maximum": 50 },
+    "default_cfg": { "type": "number", "default": 1.0 },
+    "poll_timeout_sec": { "type": "integer", "default": 300, "minimum": 30 },
+    "filename_prefix": { "type": "string", "default": "zturbo" }
+  }
+}

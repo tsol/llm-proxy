@@ -137,6 +137,8 @@ export interface ModelQuirkOverrides {
   gpuPrep?: {
     /** Stop ComfyUI and unload other LM Studio models so this one owns VRAM. */
     exclusive?: boolean;
+    /** Estimated VRAM footprint when loaded (MB). */
+    vramMb?: number;
   };
 }
 

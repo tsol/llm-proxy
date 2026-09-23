@@ -1,0 +1,20 @@
+id: motion_photo_scene_v1
+title: "Photo to 3D scene (motion pipeline)"
+description: "Runs photo_to_scene.py via proxy scheduler."
+version: "1.0.0"
+kind: exec
+entry: ["python3", "run.py"]
+timeout_sec: 3600
+residents: { requires: [], evicts: ["*"] }
+resources: { vram_mb: 7200, ram_mb: 18000, cpu: 4, min_free_vram_mb: 3000 }
+estimate: { duration_sec: 900 }
+priority_default: normal
+input_schema:
+  type: object
+  required: [photo_path, project_dir]
+  additionalProperties: true
+  properties:
+    photo_path: { type: string }
+    project_dir: { type: string }
+    remove_person: { type: boolean, default: false }
+mcp: { expose: false }

@@ -205,6 +205,22 @@ export const appConfig = {
       return path.join(os.homedir(), 'hermes', 'ComfyUI', 'comfyui.pid');
     })(),
   },
+  services: {
+    proxyRoot: path.resolve(__dirname, '..'),
+    dir: path.resolve(__dirname, '..', env('SERVICES_DIR', 'services')),
+    outputsRoot: env('SERVICES_OUTPUTS_ROOT', path.join(os.homedir(), 'hermes', 'outputs')),
+    outputsContainerRoot: env(
+      'SERVICES_OUTPUTS_CONTAINER_ROOT',
+      '/opt/host-resources/outputs',
+    ),
+    dbPath: path.resolve(__dirname, '..', env('SERVICES_DB', 'store/services.sqlite')),
+    settingsDir: path.resolve(__dirname, '..', 'store', 'services'),
+    vramReserveMb: envNum('SERVICES_VRAM_RESERVE_MB', 700),
+    ramReserveMb: envNum('SERVICES_RAM_RESERVE_MB', 8000),
+    localLlmVramMb: envNum('LOCAL_LLM_VRAM_MB', 6500),
+    localLlmMaxWaitSec: envNum('LOCAL_LLM_MAX_WAIT_SEC', 20),
+    tickMs: envNum('SCHEDULER_TICK_MS', 2000),
+  },
   android: {
     adbPath: env('ANDROID_ADB_PATH', 'adb'),
     tcpipPort: envNum('ANDROID_TCPIP_PORT', 5555),

@@ -9,6 +9,13 @@ import { adminRouter } from './routes/admin';
 import { aliasesRouter } from './routes/aliases';
 import { gpuRouter } from './routes/gpu';
 import { androidRouter } from './routes/android';
+import { servicesRouter } from './routes/services';
+import { jobsRouter } from './routes/jobs';
+import { schedulerRouter } from './routes/scheduler';
+import { loadRegistry } from './jobs/registry';
+import { startScheduler } from './jobs/scheduler';
+import { handleMcpRequest } from './mcp/server';
+import path from 'path';
 import { configureAndroidBridge } from './services/android-bridge';
 import { ensureReqLogDir, rotateReqLogs } from './services/request-dump-logger';
 import { startZombieReaper } from './services/concurrency-queue';
@@ -28,6 +35,21 @@ app.use('/v1', adminRouter);
 app.use('/v1', aliasesRouter);
 app.use('/v1', gpuRouter);
 app.use('/v1', androidRouter);
+app.use('/v1', servicesRouter);
+app.use('/v1', jobsRouter);
+app.use('/v1', schedulerRouter);
+
+app.post('/mcp', (req, res) => {
+  void handleMcpRequest(req, res);
+});
+app.get('/mcp', (_req, res) => res.status(405).end());
+app.delete('/mcp', (_req, res) => res.status(405).end());
+
+const webDir = path.join(appConfig.services.proxyRoot, 'dist', 'web');
+app.use('/ui', express.static(webDir));
+app.get('/ui/*', (_req, res) => {
+  res.sendFile(path.join(webDir, 'index.html'));
+});
 
 // Configure Android bridge from env
 configureAndroidBridge({
@@ -47,6 +69,9 @@ rotateReqLogs()
   .then(() => {
     // Prefer IPv4 — reduces flaky getaddrinfo / VPN DNS races on Linux.
     dns.setDefaultResultOrder('ipv4first');
+
+    loadRegistry();
+    startScheduler();
 
     app.listen(appConfig.port, appConfig.host, () => {
       startZombieReaper();

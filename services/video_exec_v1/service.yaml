@@ -1,0 +1,19 @@
+id: video_exec_v1
+title: "Videogen shell (whitelisted)"
+description: "Runs a whitelisted videogen/*.sh with argv; inner run sets VIDEOGEN_PROXY_INNER=1."
+version: "1.0.0"
+kind: exec
+entry: ["python3", "run.py"]
+timeout_sec: 7200
+residents: { requires: [], evicts: ["*"] }
+resources: { vram_mb: 7600, ram_mb: 20000, cpu: 4, min_free_vram_mb: 3500 }
+estimate: { duration_sec: 900 }
+priority_default: normal
+input_schema:
+  type: object
+  required: [script, argv]
+  additionalProperties: false
+  properties:
+    script: { type: string, minLength: 1, description: "Path relative to videogen root, e.g. face_refine.sh" }
+    argv: { type: array, items: { type: string }, default: [] }
+mcp: { expose: false }

@@ -1,0 +1,20 @@
+id: motion_photos_avatar_v1
+title: "Front/back photos to avatar (motion)"
+description: "photos_to_avatar.py via scheduler."
+version: "1.0.0"
+kind: exec
+entry: ["python3", "run.py"]
+timeout_sec: 3600
+residents: { requires: [], evicts: ["*"] }
+resources: { vram_mb: 7500, ram_mb: 18000, cpu: 4, min_free_vram_mb: 3500 }
+estimate: { duration_sec: 1200 }
+priority_default: normal
+input_schema:
+  type: object
+  required: [avatar_dir, front_path, back_path]
+  additionalProperties: false
+  properties:
+    avatar_dir: { type: string }
+    front_path: { type: string }
+    back_path: { type: string }
+mcp: { expose: false }

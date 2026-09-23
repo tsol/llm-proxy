@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "motion_root": {
+      "type": "string",
+      "default": "/home/harry/hermes/workspace/topics/video-motion-pipeline"
+    },
+    "python_bin": {
+      "type": "string",
+      "default": "/home/harry/hermes/workspace/topics/video-motion-pipeline/gem-x/.venv/bin/python"
+    }
+  }
+}

@@ -1,0 +1,20 @@
+id: motion_process_project_v1
+title: "Video motion extract (gem-x process_project)"
+description: "process_project.py via scheduler."
+version: "1.0.0"
+kind: exec
+entry: ["python3", "run.py"]
+timeout_sec: 7200
+residents: { requires: [], evicts: ["*"] }
+resources: { vram_mb: 7500, ram_mb: 20000, cpu: 4, min_free_vram_mb: 3500 }
+estimate: { duration_sec: 1800 }
+priority_default: normal
+input_schema:
+  type: object
+  required: [project_dir]
+  additionalProperties: false
+  properties:
+    project_dir: { type: string }
+    static_cam: { type: boolean, default: true }
+    full_reprocess: { type: boolean, default: false }
+mcp: { expose: false }

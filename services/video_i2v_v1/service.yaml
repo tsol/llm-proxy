@@ -1,0 +1,20 @@
+id: video_i2v_v1
+title: "Image to video (Wan2GP i2v)"
+description: "Runs videogen/i2v.sh — evicts ComfyUI/LM Studio via scheduler before Wan2GP."
+version: "1.0.0"
+kind: exec
+entry: ["python3", "run.py"]
+timeout_sec: 7200
+residents: { requires: [], evicts: ["*"] }
+resources: { vram_mb: 7600, ram_mb: 20000, cpu: 4, min_free_vram_mb: 3500 }
+estimate: { duration_sec: 900 }
+priority_default: normal
+input_schema:
+  type: object
+  required: [prompt, image_path]
+  additionalProperties: false
+  properties:
+    prompt: { type: string, minLength: 1 }
+    image_path: { type: string, minLength: 1 }
+    seed: { type: integer }
+mcp: { expose: true, default_wait_sec: 7200 }

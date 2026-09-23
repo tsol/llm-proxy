@@ -1,0 +1,20 @@
+id: motion_photo_object_v1
+title: "Photo to 3D object (motion pipeline)"
+description: "Runs video-motion-pipeline/photo_to_object.py (SF3D/TripoSR)."
+version: "1.0.0"
+kind: exec
+entry: ["python3", "run.py"]
+timeout_sec: 3600
+residents: { requires: [], evicts: ["*"] }
+resources: { vram_mb: 7000, ram_mb: 16000, cpu: 4, min_free_vram_mb: 3000 }
+estimate: { duration_sec: 600 }
+priority_default: normal
+input_schema:
+  type: object
+  required: [photo_path]
+  additionalProperties: false
+  properties:
+    photo_path: { type: string, minLength: 1 }
+    project_dir: { type: string, description: "Optional catalog dir; object.glb written here too" }
+    backend: { type: string, enum: [auto, sf3d, triposr], default: auto }
+mcp: { expose: true, default_wait_sec: 3600 }

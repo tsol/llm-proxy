@@ -34,7 +34,7 @@ echo ""; echo "─── Root /v1/models ───"
 MODELS=$(curl -sf "$BASE/v1/models" | jq -c '[.data[].id]')
 MODEL_COUNT=$(echo "$MODELS" | jq 'length')
 assert_gt "model count > 5" 5 "$MODEL_COUNT"
-assert_contains "contains kimi" '"kimi"' "$MODELS"
+assert_contains "contains gmain" '"gmain"' "$MODELS"
 assert_contains "contains gemma-4-12b" '"gemma-4-12b"' "$MODELS"
 assert_contains "contains deepseek-v4-flash" '"deepseek-v4-flash"' "$MODELS"
 # MUST NOT contain raw upstream IDs
@@ -44,34 +44,33 @@ else
   green "no raw upstream IDs in root models"
 fi
 
-# ─── 3. /v1/models/kimi detail ───
-echo ""; echo "─── /v1/models/kimi ───"
-KIMI_DETAIL=$(curl -sf "$BASE/v1/models/kimi")
-KIMI_UPSTREAM=$(echo "$KIMI_DETAIL" | jq -r '.upstream_id')
-assert "kimi upstream_id is full name" "moonshotai/Kimi-K2.6" "$KIMI_UPSTREAM"
-KIMI_PROVIDER=$(echo "$KIMI_DETAIL" | jq -r '.provider')
-assert "kimi provider is gonka" "gonka" "$KIMI_PROVIDER"
+# ─── 3. /v1/models/gmain detail ───
+echo ""; echo "─── /v1/models/gmain ───"
+GMAIN_DETAIL=$(curl -sf "$BASE/v1/models/gmain")
+GMAIN_UPSTREAM=$(echo "$GMAIN_DETAIL" | jq -r '.upstream_id')
+assert "gmain upstream_id is full name" "deepseek-ai/DeepSeek-V4-Flash-0731" "$GMAIN_UPSTREAM"
+GMAIN_PROVIDER=$(echo "$GMAIN_DETAIL" | jq -r '.provider')
+assert "gmain provider is gonka" "gonka" "$GMAIN_PROVIDER"
 
 # ─── 4. /v1/aliases ───
 echo ""; echo "─── /v1/aliases ───"
 ALIASES=$(curl -sf "$BASE/v1/aliases" | jq -c '[.data[].alias]')
-assert_contains "aliases contains kimi" '"kimi"' "$ALIASES"
+assert_contains "aliases contains gmain" '"gmain"' "$ALIASES"
 assert_contains "aliases contains gemma-4-12b" '"gemma-4-12b"' "$ALIASES"
-# kimi must be unlocked
-KIMI_LOCKED=$(curl -sf "$BASE/v1/aliases/kimi" | jq '.locked')
-assert "kimi alias is unlocked" "false" "$KIMI_LOCKED"
-KIMI_CHAIN=$(curl -sf "$BASE/v1/aliases/kimi" | jq -c '.chain')
-assert "kimi chain has 3 entries" '["gonka/Kimi-K2.6","gonka/MiniMaxAI/MiniMax-M2.7","deepseek/deepseek-v4-flash"]' "$KIMI_CHAIN"
+GMAIN_LOCKED=$(curl -sf "$BASE/v1/aliases/gmain" | jq '.locked')
+assert "gmain alias is unlocked" "false" "$GMAIN_LOCKED"
+GMAIN_CHAIN=$(curl -sf "$BASE/v1/aliases/gmain" | jq -c '.chain')
+assert "gmain chain has 3 entries" '["gonka/deepseek-ai/DeepSeek-V4-Flash-0731","gonka-api/deepseek-ai/DeepSeek-V4-Flash-0731","gonka-router-io/deepseek-ai/DeepSeek-V4-Flash-0731"]' "$GMAIN_CHAIN"
 
 # ─── 5. Root chat with alias ───
-echo ""; echo "─── POST /v1/chat/completions (kimi alias) ───"
+echo ""; echo "─── POST /v1/chat/completions (gmain alias) ───"
 CHAT=$(curl -sf "$BASE/v1/chat/completions" \
   -H "Content-Type: application/json" \
-  -d '{"model":"kimi","messages":[{"role":"user","content":"Say hello in one word"}],"max_tokens":20}')
+  -d '{"model":"gmain","messages":[{"role":"user","content":"Say hello in one word"}],"max_tokens":20}')
 CHAT_MODEL=$(echo "$CHAT" | jq -r '.model')
 CHAT_CONTENT=$(echo "$CHAT" | jq -r '.choices[0].message.content')
-assert "kimi chat model" "moonshotai/Kimi-K2.6" "$CHAT_MODEL"
-assert_gt "kimi response non-empty" 0 "$(echo "$CHAT_CONTENT" | wc -c)"
+assert_contains "gmain chat model contains deepseek" "deepseek" "$CHAT_MODEL"
+assert_gt "gmain response non-empty" 0 "$(echo "$CHAT_CONTENT" | wc -c)"
 echo "       content: $(echo "$CHAT_CONTENT" | head -c 80)"
 
 # ─── 6. Root chat with another alias ───
@@ -86,7 +85,7 @@ assert_gt "deepseek response non-empty" 0 "$(echo "$DS_CHAT" | jq -r '.choices[0
 # ─── 7. Per-provider /gonka/v1/models ───
 echo ""; echo "─── GET /gonka/v1/models (raw upstream) ───"
 GONKA_MODELS=$(curl -sf "$BASE/gonka/v1/models" | jq -c '[.data[].id]')
-assert_contains "gonka has moonshotai/Kimi-K2.6" '"moonshotai/Kimi-K2.6"' "$GONKA_MODELS"
+assert_contains "gonka has deepseek-ai/DeepSeek-V4-Flash-0731" '"deepseek-ai/DeepSeek-V4-Flash-0731"' "$GONKA_MODELS"
 assert_contains "gonka has MiniMaxAI/MiniMax-M2.7" '"MiniMaxAI/MiniMax-M2.7"' "$GONKA_MODELS"
 # Per-provider must have raw IDs, not aliases
 GONKA_HAS_KIMI_ALIAS=$(echo "$GONKA_MODELS" | grep -cF '"kimi"' || true)
@@ -96,9 +95,9 @@ assert "gonka models does NOT contain kimi alias" "0" "$GONKA_HAS_KIMI_ALIAS"
 echo ""; echo "─── POST /gonka/v1/chat/completions (direct) ───"
 DIRECT_CHAT=$(curl -sf "$BASE/gonka/v1/chat/completions" \
   -H "Content-Type: application/json" \
-  -d '{"model":"moonshotai/Kimi-K2.6","messages":[{"role":"user","content":"hi"}],"max_tokens":10}')
+  -d '{"model":"deepseek-ai/DeepSeek-V4-Flash-0731","messages":[{"role":"user","content":"hi"}],"max_tokens":10}')
 DIRECT_MODEL=$(echo "$DIRECT_CHAT" | jq -r '.model')
-assert "direct gonka chat model" "moonshotai/Kimi-K2.6" "$DIRECT_MODEL"
+assert_contains "direct gonka chat model contains deepseek" "deepseek" "$DIRECT_MODEL"
 assert_gt "direct gonka response non-empty" 0 "$(echo "$DIRECT_CHAT" | jq -r '.choices[0].message.content' | wc -c)"
 
 # ─── 9. Per-provider deepseek direct ───
@@ -154,7 +153,7 @@ assert_gt "router providers has entries" 0 "$PROVIDER_KEYS"
 echo ""; echo "─── Streaming (SSE) ───"
 SSE_OUT=$(curl -sf "$BASE/v1/chat/completions" \
   -H "Content-Type: application/json" \
-  -d '{"model":"kimi","messages":[{"role":"user","content":"Say hi"}],"max_tokens":10,"stream":true}' 2>&1 || echo "")
+  -d '{"model":"gmain","messages":[{"role":"user","content":"Say hi"}],"max_tokens":10,"stream":true}' 2>&1 || echo "")
 if echo "$SSE_OUT" | grep -q 'data:'; then
   green "streaming SSE response received"
 else

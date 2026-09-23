@@ -1,0 +1,4 @@
+id: comfyui
+title: ComfyUI
+idle_vram_mb: 3500
+idle_ram_mb: 6000

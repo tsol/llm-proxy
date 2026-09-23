@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "videogen_root": {
+      "type": "string",
+      "default": "/home/harry/hermes/workspace/code/videogen"
+    }
+  }
+}

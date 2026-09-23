@@ -66,7 +66,7 @@ import {
   type AliasGroupAcquireResult,
 } from './concurrency-queue';
 import { isModelBanned, recordBanSignal } from './ban';
-import { ensureLocalUpstreamReady } from './gpu-resources';
+import { acquireLocalLlmLease } from '../jobs/llm-lease';
 import { allProviders } from '../providers';
 import {
   messageInputModalities,
@@ -2109,6 +2109,87 @@ async function forwardChatCompletionOnce(
   incomingHeaders: IncomingHttpHeaders,
   res: Response,
   endpointPrefix: string,
+  fallbackFrom?: string,
+  canRetry = true,
+  markIncomingDone?: () => void,
+  onceOpts?: OnceOpts,
+): Promise<void> {
+  if (adapter.id !== 'local') {
+    return forwardChatCompletionOnceInner(
+      adapter,
+      activeModel,
+      body,
+      incomingHeaders,
+      res,
+      endpointPrefix,
+      fallbackFrom,
+      canRetry,
+      markIncomingDone,
+      onceOpts,
+    );
+  }
+  const model = activeModel.trim() || adapter.resolveModel(body.model);
+  const preview = captureRequestContext(body.messages).userRequestPreview ?? '';
+  const lease = await acquireLocalLlmLease({
+    model,
+    preview,
+    onClientClose: () => isClientGone(res),
+    timeoutMs: appConfig.retryQueueWaitTimeout * 1000,
+  });
+  if (!lease.ok) {
+    if (lease.reason === 'client-closed') {
+      throw new ClientClosedError();
+    }
+    throwIfHedgeSuppressed(onceOpts?.suppressFallback, 'local-gpu-busy');
+    const rerouted = await tryFallbackChainUnless(
+      onceOpts?.suppressFallback,
+      'local-gpu-busy',
+      adapter,
+      model,
+      body,
+      incomingHeaders,
+      res,
+      endpointPrefix,
+    );
+    if (rerouted) return;
+    res
+      .status(503)
+      .set('Retry-After', String(Math.ceil(lease.etaSec ?? 30)))
+      .json({
+        error: {
+          message: `Local GPU busy (eta ${Math.ceil(lease.etaSec ?? 0)}s)`,
+          type: 'gpu_busy',
+        },
+      });
+    return;
+  }
+  try {
+    await refreshProviderLive('local');
+    await forwardChatCompletionOnceInner(
+      adapter,
+      activeModel,
+      body,
+      incomingHeaders,
+      res,
+      endpointPrefix,
+      fallbackFrom,
+      canRetry,
+      markIncomingDone,
+      onceOpts,
+    );
+  } finally {
+    if (res.writableEnded || res.destroyed) lease.release();
+    else res.once('close', () => lease.release());
+  }
+}
+
+async function forwardChatCompletionOnceInner(
+  adapter: ProviderAdapter,
+  activeModel: string,
+  body: ChatCompletionRequest,
+  incomingHeaders: IncomingHttpHeaders,
+  res: Response,
+  endpointPrefix: string,
   /** Model that was originally failing (set when called from tryFallbackChain) */
   fallbackFrom?: string,
   /** Whether a QueueRetry429 re-queue is still available (RETRY_LOOP_COUNTER). */
@@ -2117,22 +2198,6 @@ async function forwardChatCompletionOnce(
   onceOpts?: OnceOpts,
 ): Promise<void> {
   const model = activeModel.trim() || adapter.resolveModel(body.model);
-
-  if (adapter.id === 'local') {
-    try {
-      await ensureLocalUpstreamReady(model);
-      await refreshProviderLive('local');
-    } catch (err) {
-      logProxyError({
-        provider: adapter.id,
-        endpointPrefix,
-        requestedModel: String(body.model ?? ''),
-        effectiveModel: model,
-        message:
-          err instanceof Error ? err.message : 'local model GPU prep failed',
-      });
-    }
-  }
 
   const requestCtx = captureRequestContext(body.messages);
   const promptEstimate = estimateTokensFromMessages(body.messages);

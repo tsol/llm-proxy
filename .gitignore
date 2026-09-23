@@ -3,3 +3,9 @@ dist/
 ../logs/
 *.pid
 .env
+store/*.sqlite*
+store/services/
+services/**/venv/
+services/**/.venv/
+services/_engines/
+services/_models/

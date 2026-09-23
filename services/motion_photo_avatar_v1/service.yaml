@@ -1,0 +1,19 @@
+id: motion_photo_avatar_v1
+title: "Photo to avatar GLB (motion)"
+description: "photo_to_avatar.py via scheduler."
+version: "1.0.0"
+kind: exec
+entry: ["python3", "run.py"]
+timeout_sec: 3600
+residents: { requires: [], evicts: ["*"] }
+resources: { vram_mb: 7500, ram_mb: 18000, cpu: 4, min_free_vram_mb: 3500 }
+estimate: { duration_sec: 1200 }
+priority_default: normal
+input_schema:
+  type: object
+  required: [project_dir, photo_path]
+  additionalProperties: false
+  properties:
+    project_dir: { type: string }
+    photo_path: { type: string }
+mcp: { expose: false }
