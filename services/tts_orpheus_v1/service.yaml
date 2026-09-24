@@ -1,0 +1,45 @@
+id: tts_orpheus_v1
+title: "Text to speech (Orpheus TTS)"
+description: "Runs Orpheus TTS via a host engine (LM Studio + SNAC decoder). Generates speech.mp3/.ogg from text in JOB_DIR. Requires LM Studio resident (scheduler starts it and loads the model)."
+version: "1.0.0"
+kind: exec
+entry: ["python3", "run.py"]
+timeout_sec: 600
+residents:
+  requires: [lmstudio]
+  evicts: ["*"]
+resources:
+  vram_mb: 6500
+  ram_mb: 20000
+  cpu: 2
+  min_free_vram_mb: 3000
+estimate:
+  duration_sec: 60
+priority_default: normal
+input_schema:
+  type: object
+  required: [text]
+  additionalProperties: false
+  properties:
+    text:
+      type: string
+      minLength: 1
+      maxLength: 4000
+      description: "Text to synthesize into speech"
+    voice:
+      type: string
+      enum: [tara, leah, jess, leo, dan, mia, zac, zoe]
+      description: "Orpheus voice. Default: tara"
+    temperature:
+      type: number
+      description: "Sampling temperature (default 0.6)"
+    top_p:
+      type: number
+      description: "Top-p sampling (default 0.9)"
+    repetition_penalty:
+      type: number
+      description: "Repetition penalty, >=1.1 for stable generation (default 1.1)"
+mcp:
+  expose: true
+  default_wait_sec: 600
+  legacy_tool_names: [tts_orpheus]

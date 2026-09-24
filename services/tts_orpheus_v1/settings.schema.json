@@ -1,0 +1,32 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "engine_root": {
+      "type": "string",
+      "default": "/home/harry/hermes/workspace/code/orpheus-tts",
+      "description": "Root dir of the Orpheus engine on the host (tts.sh + engine.py live here). Edit this one place if the path differs."
+    },
+    "output_format": {
+      "type": "string",
+      "enum": ["ogg", "mp3", "wav"],
+      "default": "ogg",
+      "description": "Container audio format returned in JOB_DIR. ogg preferred for Telegram."
+    },
+    "default_voice": {
+      "type": "string",
+      "enum": ["tara", "leah", "jess", "leo", "dan", "mia", "zac", "zoe"],
+      "default": "tara"
+    },
+    "lm_native_url": {
+      "type": "string",
+      "default": "http://127.0.0.1:1234",
+      "description": "LM Studio native/OpenAI API base (native for /api/v1/models/load, completions for /v1/completions)."
+    },
+    "model_key": {
+      "type": "string",
+      "default": "unsloth/orpheus-3b-0.1-ft-GGUF",
+      "description": "LM Studio model key used to load the Orpheus GGUF."
+    }
+  }
+}
