@@ -6,7 +6,7 @@ kind: exec
 entry: ["python3", "run.py"]
 timeout_sec: 7200
 residents: { requires: [], evicts: ["*"] }
-resources: { vram_mb: 7600, ram_mb: 20000, cpu: 4, min_free_vram_mb: 3500 }
+resources: { vram_mb: 7200, ram_mb: 20000, cpu: 4, min_free_vram_mb: 3000 }
 estimate: { duration_sec: 1200 }
 priority_default: normal
 input_schema:
