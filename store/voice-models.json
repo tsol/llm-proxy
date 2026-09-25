@@ -1,0 +1,31 @@
+{
+  "models": {
+    "voice": {
+      "backend": "orpheus"
+    }
+  },
+  "backends": {
+    "orpheus": {
+      "service_id": "tts_orpheus_v1",
+      "default_voice": "tara",
+      "voices": {
+        "alloy": "tara",
+        "echo": "leo",
+        "fable": "mia",
+        "onyx": "dan",
+        "nova": "jess",
+        "shimmer": "leah",
+        "ash": "zac",
+        "coral": "zoe",
+        "tara": "tara",
+        "leah": "leah",
+        "jess": "jess",
+        "leo": "leo",
+        "dan": "dan",
+        "mia": "mia",
+        "zac": "zac",
+        "zoe": "zoe"
+      }
+    }
+  }
+}

@@ -25,8 +25,13 @@
     },
     "model_key": {
       "type": "string",
-      "default": "unsloth/orpheus-3b-0.1-ft-GGUF",
+      "default": "orpheus-3b-0.1-ft",
       "description": "LM Studio model key used to load the Orpheus GGUF."
+    },
+    "transliterate_russian": {
+      "type": "boolean",
+      "default": false,
+      "description": "Optional: transliterate Cyrillic to Latin (hack for non-English). Default off — use English input only."
     }
   }
 }

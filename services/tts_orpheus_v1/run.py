@@ -54,10 +54,11 @@ def main() -> int:
     )
 
     engine_root = settings.get("engine_root", DEFAULT_ENGINE_ROOT)
-    output_format = settings.get("output_format", "ogg")
+    output_format = str(inp.get("format") or settings.get("output_format", "ogg"))
     default_voice = settings.get("default_voice", "tara")
     lm_native_url = settings.get("lm_native_url", "http://127.0.0.1:1234")
-    model_key = settings.get("model_key", "unsloth/orpheus-3b-0.1-ft-GGUF")
+    model_key = settings.get("model_key", "orpheus-3b-0.1-ft")
+    transliterate_russian = settings.get("transliterate_russian", False)
 
     if output_format not in ("ogg", "mp3", "wav"):
         return fail(f"unsupported output_format {output_format!r}")
@@ -92,11 +93,17 @@ def main() -> int:
     ):
         if inp.get(key) is not None:
             cmd += [flag, str(inp[key])]
+    if transliterate_russian:
+        cmd.append("--translit")
+
+    env = os.environ.copy()
+    env["MODEL_KEY"] = str(model_key)
+    env["LM_NATIVE_URL"] = str(lm_native_url)
 
     emit({"type": "progress", "ratio": 0.05, "stage": "tts", "message": f"starting tts.sh voice={voice} format={output_format}"})
     t0 = time.time()
     try:
-        proc = subprocess.run(cmd, cwd=engine_root, capture_output=True, text=True, timeout=540)
+        proc = subprocess.run(cmd, cwd=engine_root, capture_output=True, text=True, timeout=540, env=env)
     except subprocess.TimeoutExpired:
         return fail("tts.sh timed out (>540s)")
     log_path = os.path.join(JOB_DIR, "tts.log")

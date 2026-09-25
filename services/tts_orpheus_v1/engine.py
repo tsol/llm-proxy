@@ -38,7 +38,7 @@ LMS_MODELS_DIR = os.path.expanduser("~/.lmstudio/models")
 LM_NATIVE_URL = os.environ.get("LM_NATIVE_URL", "http://127.0.0.1:1234")
 LM_COMPLETIONS_URL = os.path.join(LM_NATIVE_URL, "v1", "completions")
 LM_LOAD_URL = os.path.join(LM_NATIVE_URL, "api", "v1", "models", "load")
-MODEL_KEY = os.environ.get("MODEL_KEY", "unsloth/orpheus-3b-0.1-ft-GGUF")
+MODEL_KEY = os.environ.get("MODEL_KEY", "orpheus-3b-0.1-ft")
 # Where to download a fresh GGUF if not present. MUST match LM Studio naming
 # so the model shows up as MODEL_KEY under /api/v1/models.
 MODEL_URL = os.environ.get(
@@ -69,8 +69,8 @@ def log(msg: str) -> None:
 def format_prompt(text: str, voice: str) -> str:
     if voice not in VOICES:
         raise ValueError(f"unknown voice {voice!r}; choose from {', '.join(VOICES)}")
-    return (f"<|audio|><|{voice}|><|audio|><|text_start|>"
-            f"{text}<|text_end|><|eot_id|>")
+    # isaiahbjork/orpheus-tts-local (LM Studio completions)
+    return f"<|audio|>{voice}: {text}<|eot_id|>"
 
 
 # ---------------------------------------------------------------- LM Studio helpers
@@ -78,7 +78,7 @@ def lm_models():  # -> list[dict]
     import urllib.request
     with urllib.request.urlopen(f"{LM_NATIVE_URL}/api/v1/models", timeout=10) as r:
         data = json.load(r)
-    return data.get("data", [])
+    return data.get("models", data.get("data", []))
 
 
 def lm_server_up() -> bool:
@@ -98,9 +98,14 @@ def ensure_lm_server():
 
 def model_loaded() -> bool:
     try:
-        names = [m.get("id", "") for m in lm_models()]
-        # LM Studio models list reports loaded model as id (e.g. model name or path)
-        return len(names) > 0 and any(MODEL_KEY in n or "orpheus" in n.lower() for n in names)
+        for m in lm_models():
+            key = m.get("key") or m.get("id") or ""
+            if MODEL_KEY not in key and "orpheus" not in key.lower():
+                continue
+            loaded = m.get("loaded_instances") or []
+            if loaded:
+                return True
+        return False
     except Exception:
         return False
 
@@ -123,6 +128,7 @@ def generate_tokens(prompt: str, temperature, top_p, repetition_penalty, max_tok
     """Yield audio token strings from LM Studio /v1/completions (streaming)."""
     import urllib.request
     payload = {
+        "model": MODEL_KEY,
         "prompt": prompt,
         "max_tokens": max_tokens,
         "temperature": temperature,
@@ -154,46 +160,6 @@ def generate_tokens(prompt: str, temperature, top_p, repetition_penalty, max_tok
                 continue
             if tok:
                 yield tok
-
-
-def turn_token_into_id(token_str: str, index: int) -> int:
-    """Standard Orpheus helper — maps a raw float-string token to an int code."""
-    s = token_str.strip()
-    try:
-        f = float(s)
-    except Exception:
-        return -1
-    return round(f) % 8192 if f > 0 else round(f) % 8192
-
-
-# ---------------------------------------------------------------- decode via snac
-def decode_frames(tokens, snac_model):
-    """Group consecutive ints into frames of 7 SNAC codes, decode -> float samples."""
-    import numpy as np
-    import torch
-
-    raw = []
-    for t in tokens:
-        v = round(float(t)) if _is_num(t) else None
-        if v is not None and v > 0:
-            raw.append(v)
-    # Orpheus emits 7 codes per frame (root + 3 levels x2)
-    frame_size = 7
-    frames = [raw[i:i + frame_size] for i in range(0, len(raw) - (len(raw) % frame_size), frame_size)]
-    if not frames:
-        return np.zeros(0, dtype=np.float32)
-    codes = torch.tensor(frames, dtype=torch.int64, device=snac_model.device)
-    with torch.no_grad():
-        audio_float = snac_model.decode(codes).cpu().numpy().flatten()
-    return audio_float
-
-
-def _is_num(s: str) -> bool:
-    try:
-        float(s)
-        return True
-    except Exception:
-        return False
 
 
 # ---------------------------------------------------------------- wav / encode
@@ -273,6 +239,11 @@ def main() -> int:
     ap.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
     ap.add_argument("--top_p", type=float, default=DEFAULT_TOP_P)
     ap.add_argument("--repetition_penalty", type=float, default=DEFAULT_REPETITION_PENALTY)
+    ap.add_argument(
+        "--translit",
+        action="store_true",
+        help="Transliterate Cyrillic to Latin before synthesis (off by default; English-only use)",
+    )
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -280,42 +251,59 @@ def main() -> int:
 
     # 0) autonomous setup
     ensure_model_downloaded()
-    venv = ensure_snac_venv(os.path.join(args.out_dir, "..", ".orpheus-venv"))
-    venv = os.path.abspath(venv)
+    engine_dir = os.path.dirname(os.path.abspath(__file__))
+    venv = ensure_snac_venv(os.path.join(engine_dir, ".venv"))
 
     # 1) server + model
     ensure_lm_server()
     ensure_model_loaded()
 
     # 2) generate tokens via LM Studio
-    prompt = format_prompt(args.text, args.voice)
-    log(f"voice={args.voice} len={len(args.text)} prompt={prompt[:60]}...")
+    from _text_prep import prepare_text_for_orpheus
+
+    translit = args.translit or os.environ.get("ORPHEUS_TRANSLIT", "") == "1"
+    speak_text, did_translit = prepare_text_for_orpheus(args.text, transliterate=translit)
+    if did_translit:
+        log(f"transliterated Cyrillic → Latin: {speak_text[:120]}")
+    prompt = format_prompt(speak_text, args.voice)
+    log(f"voice={args.voice} len={len(speak_text)} prompt={prompt[:80]}...")
     token_gen = generate_tokens(prompt, args.temperature, args.top_p, args.repetition_penalty)
 
     # 3) decode via snac (run in the engine venv as a subprocess to isolate deps)
     #    Simpler: import snac in-process if available, else spawn venv helper.
-    helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_decode.py")
-    import traceback
+    helper = os.path.join(engine_dir, "_decode.py")
+    wav_path = os.path.join(args.out_dir, "speech.wav")
+    used_helper = False
     try:
         from snac import SNAC  # in-process
-        snac_model = SNAC.from_pretrained(
-            "hubertsiuzdak/snac_24khz",
-            device="cuda" if os.environ.get("ORPHEUS_DEVICE") != "cpu" else "cpu",
+
+        from _snac_decode import decode_token_ids_to_samples, token_strings_to_ids
+
+        snac_device = (
+            "cpu"
+            if os.environ.get("ORPHEUS_DEVICE") == "cpu"
+            else ("cuda" if __import__("torch").cuda.is_available() else "cpu")
         )
+        snac_model = SNAC.from_pretrained("hubertsiuzdak/snac_24khz").eval().to(snac_device)
+        token_ids = token_strings_to_ids(token_gen)
+        samples = decode_token_ids_to_samples(token_ids, snac_model)
+        if samples.size == 0:
+            log("no audio samples produced")
+            return 1
+        write_wav(wav_path, samples)
     except Exception as e:
         log(f"in-process snac unavailable ({e}) — spawning venv helper")
-        samples = _run_helper(venv, helper, token_gen, args.out_dir)
-        if samples is None:
+        helper_out = _run_helper(venv, helper, token_gen, args.out_dir)
+        if not helper_out or not os.path.isfile(wav_path):
             log("helper failed to decode")
             return 1
-    else:
-        samples = decode_frames(token_gen, snac_model)
+        used_helper = True
 
-    # 4) write wav + encode
-    if samples is None or len(samples) == 0:
-        log("no audio samples produced")
+    if not used_helper and not os.path.isfile(wav_path):
+        log("no speech.wav produced")
         return 1
-    write_wav(os.path.join(args.out_dir, "speech.wav"), samples)
+
+    # 4) encode
     out = encode(args.out_dir, args.format)
     log(f"done in {time.time()-t0:.1f}s -> {out}")
 

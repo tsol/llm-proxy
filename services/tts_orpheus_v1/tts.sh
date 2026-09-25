@@ -16,9 +16,10 @@ FORMAT="ogg"
 TEMP=""
 TOP_P=""
 REP=""
+TRANSLIT=""
 
 usage() {
-  echo "usage: tts.sh --text STR [--voice NAME] [--out_dir DIR] [--format ogg|mp3|wav] [--temperature F] [--top_p F] [--repetition_penalty F]" >&2
+  echo "usage: tts.sh --text STR [--voice NAME] [--out_dir DIR] [--format ogg|mp3|wav] [--translit] [--temperature F] [--top_p F] [--repetition_penalty F]" >&2
   exit 2
 }
 
@@ -31,6 +32,7 @@ while [[ $# -gt 0 ]]; do
     --temperature) TEMP="$2"; shift 2;;
     --top_p) TOP_P="$2"; shift 2;;
     --repetition_penalty) REP="$2"; shift 2;;
+    --translit) TRANSLIT=1; shift 1;;
     *) usage;;
   esac
 done
@@ -44,6 +46,7 @@ args=(--text "$TEXT" --voice "$VOICE" --out_dir "$OUT_DIR" --format "$FORMAT")
 [[ -n "$TEMP" ]] && args+=(--temperature "$TEMP")
 [[ -n "$TOP_P" ]] && args+=(--top_p "$TOP_P")
 [[ -n "$REP" ]] && args+=(--repetition_penalty "$REP")
+[[ -n "$TRANSLIT" ]] && args+=(--translit)
 
 PY=""
 if [[ -x "$ENGINE_DIR/.venv/bin/python" ]]; then

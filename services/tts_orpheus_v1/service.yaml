@@ -6,10 +6,10 @@ kind: exec
 entry: ["python3", "run.py"]
 timeout_sec: 600
 residents:
-  requires: [lmstudio]
+  requires: [lmstudio:orpheus-3b-0.1-ft]
   evicts: ["*"]
 resources:
-  vram_mb: 6500
+  vram_mb: 6000
   ram_mb: 20000
   cpu: 2
   min_free_vram_mb: 3000
@@ -30,6 +30,10 @@ input_schema:
       type: string
       enum: [tara, leah, jess, leo, dan, mia, zac, zoe]
       description: "Orpheus voice. Default: tara"
+    format:
+      type: string
+      enum: [ogg, mp3, wav]
+      description: "Output container. Default comes from service settings (ogg)."
     temperature:
       type: number
       description: "Sampling temperature (default 0.6)"

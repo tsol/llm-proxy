@@ -12,6 +12,7 @@ import { androidRouter } from './routes/android';
 import { servicesRouter } from './routes/services';
 import { jobsRouter } from './routes/jobs';
 import { schedulerRouter } from './routes/scheduler';
+import { audioRouter } from './routes/audio';
 import { loadRegistry } from './jobs/registry';
 import { startScheduler } from './jobs/scheduler';
 import { handleMcpRequest } from './mcp/server';
@@ -38,6 +39,7 @@ app.use('/v1', androidRouter);
 app.use('/v1', servicesRouter);
 app.use('/v1', jobsRouter);
 app.use('/v1', schedulerRouter);
+app.use('/v1', audioRouter);
 
 app.post('/mcp', (req, res) => {
   void handleMcpRequest(req, res);
