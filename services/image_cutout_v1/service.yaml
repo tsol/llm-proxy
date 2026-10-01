@@ -1,0 +1,25 @@
+id: image_cutout_v1
+title: "Cut out — transparent PNG"
+description: "Cut one named object out of a photo and save it on a transparent background. Uses the Wan2GP SAM 3 mask already in the video stack. The prompt is the object to keep, such as person or red helmet, not an edit instruction. Output is a PNG with alpha. Returns a job id immediately. Poll job_status."
+version: "1.0.0"
+kind: exec
+entry: ["python3", "run.py"]
+timeout_sec: 1800
+residents: { requires: [], evicts: ["*"] }
+resources: { vram_mb: 6500, ram_mb: 12000, cpu: 4, min_free_vram_mb: 3000 }
+estimate: { duration_sec: 90 }
+priority_default: normal
+input_schema:
+  type: object
+  required: [prompt, image_path]
+  additionalProperties: false
+  properties:
+    prompt:
+      type: string
+      minLength: 1
+      description: English name of the thing to keep. Everything else becomes transparent. Example person, helmet, red mug.
+    image_path:
+      type: string
+      minLength: 1
+      description: Host path of the source photo.
+mcp: { expose: true, default_wait_sec: 0 }

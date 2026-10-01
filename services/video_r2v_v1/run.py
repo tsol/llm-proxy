@@ -30,6 +30,8 @@ def main() -> int:
         cmd.append("--cutout")
     if inp.get("resolution"):
         cmd.extend(["--resolution", inp["resolution"]])
+    if inp.get("duration_sec") not in (None, ""):
+        cmd.extend(["--seconds", str(inp["duration_sec"])])
     cmd.append(inp["prompt"])
     cmd.extend(inp["image_paths"])
     if inp.get("seed") is not None:

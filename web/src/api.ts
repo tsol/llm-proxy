@@ -19,7 +19,11 @@ export function streamScheduler(onData: (data: Record<string, unknown>) => void)
 
 export interface ServiceInfo {
   id: string;
+  kind?: string;
   title: string;
+  mcp_url?: string | null;
+  ui_url?: string | null;
+  health?: string | null;
   description: string;
   version: string;
   resources: Record<string, unknown>;

@@ -10,6 +10,19 @@ import { submitJob, waitForJob, cancelJob, snapshot } from '../jobs/scheduler';
 import { getJob } from '../jobs/db';
 import { serializeJob } from '../jobs/serialize';
 
+/**
+ * Hermes drops an MCP tool call at about 420s. A Wan render runs ~25 minutes.
+ * Cap the wait and return the live job (queued/running included) instead of
+ * holding the request until the client times out.
+ */
+const MCP_WAIT_CAP_SEC = 25;
+
+function mcpWaitSec(raw: unknown): number {
+  const n = Number(raw ?? 0);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(n, MCP_WAIT_CAP_SEC);
+}
+
 function buildTools(): Array<{
   name: string;
   description: string;
@@ -23,7 +36,8 @@ function buildTools(): Array<{
     },
     {
       name: 'job_status',
-      description: 'Get job status by id',
+      description:
+        'Immediate snapshot of one job: status, progress, stage, message, started_at, estimate_sec. Does not wait. While a render runs, message includes "alive pid=… elapsed=Ns/Ms" and progress moves with elapsed time. A running job whose elapsed value increases is healthy — do not cancel it and do not treat a progress below 1 as a hang. Poll this instead of blocking on job_result.',
       inputSchema: {
         type: 'object',
         properties: { job_id: { type: 'string' } },
@@ -32,7 +46,8 @@ function buildTools(): Array<{
     },
     {
       name: 'job_result',
-      description: 'Get job result; optionally wait up to wait_sec',
+      description:
+        'Snapshot of a job, including while it is still running. Returns status, progress, and stage without waiting for the render to finish. wait_sec is a short poll capped at 25s, not a wait for generation. Poll again with job_status or job_result. A running job is not a failure.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -59,7 +74,7 @@ function buildTools(): Array<{
   ];
 
   for (const svc of listServices()) {
-    if (!svc.mcp?.expose) continue;
+    if (svc.kind !== 'exec' || !svc.mcp?.expose) continue;
     const schema = {
       ...(svc.input_schema as Record<string, unknown>),
       type: 'object',
@@ -85,7 +100,7 @@ function buildTools(): Array<{
 
 function serviceIdForTool(name: string): string | null {
   for (const svc of listServices()) {
-    if (!svc.mcp?.expose) continue;
+    if (svc.kind !== 'exec' || !svc.mcp?.expose) continue;
     if (svc.id === name) return svc.id;
     if (svc.mcp.legacy_tool_names?.includes(name)) return svc.id;
   }
@@ -98,7 +113,7 @@ async function callServiceTool(
   legacyName?: string,
 ): Promise<{ text: string; isError: boolean }> {
   const { wait_sec, priority, principal, ...input } = args;
-  const wait = Number(wait_sec ?? 0);
+  const wait = mcpWaitSec(wait_sec);
   let row = submitJob(serviceId, {
     input: input as Record<string, unknown>,
     priority: priority as 'interactive' | 'normal' | 'batch' | undefined,
@@ -149,7 +164,7 @@ function createMcpServer(): Server {
     }
     if (name === 'job_result') {
       const id = String(args.job_id ?? '');
-      const wait = Number(args.wait_sec ?? 0);
+      const wait = mcpWaitSec(args.wait_sec);
       let row = getJob(id);
       if (row && wait > 0) row = await waitForJob(id, wait);
       return {

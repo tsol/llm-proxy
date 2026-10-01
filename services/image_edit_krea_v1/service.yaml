@@ -1,0 +1,23 @@
+id: image_edit_krea_v1
+title: "Edit image — Krea 2 Identity Edit"
+description: "Instruction edit of one photo that keeps the person, via WanGP Krea 2 Turbo Identity Edit (int8, 8 steps). Returns a job id immediately. Poll job_status. Do not cancel a running job because elapsed is still increasing."
+version: "1.0.0"
+kind: exec
+entry: ["python3", "run.py"]
+timeout_sec: 14400
+residents: { requires: [], evicts: ["*"] }
+resources: { vram_mb: 7200, ram_mb: 20000, cpu: 4, min_free_vram_mb: 3000 }
+estimate: { duration_sec: 180 }
+priority_default: normal
+input_schema:
+  type: object
+  required: [prompt, image_path]
+  additionalProperties: false
+  properties:
+    prompt:
+      type: string
+      minLength: 1
+      description: English edit instruction. Say what must stay the same.
+    image_path: { type: string, minLength: 1 }
+    seed: { type: integer }
+mcp: { expose: true, default_wait_sec: 0 }

@@ -10,9 +10,13 @@ export const servicesRouter = Router();
 servicesRouter.get('/services', (_req: Request, res: Response) => {
   const items = listServices().map((s) => ({
     id: s.id,
+    kind: s.kind,
     title: s.title,
     description: s.description,
     version: s.version,
+    mcp_url: s.external?.mcp_url ?? null,
+    ui_url: s.external?.ui_url ?? null,
+    health: s.external?.health ?? null,
     resources: s.resources,
     residents: s.residents,
     estimate_sec: s.estimate.duration_sec,
@@ -36,9 +40,13 @@ servicesRouter.get('/services/:id', (req: Request, res: Response) => {
   }
   res.json({
     id: svc.id,
+    kind: svc.kind,
     title: svc.title,
     description: svc.description,
     version: svc.version,
+    mcp_url: svc.external?.mcp_url ?? null,
+    ui_url: svc.external?.ui_url ?? null,
+    health: svc.external?.health ?? null,
     resources: svc.resources,
     residents: svc.residents,
     estimate_sec: svc.estimate.duration_sec,

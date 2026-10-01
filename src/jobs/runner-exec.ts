@@ -5,7 +5,7 @@ import { appConfig } from '../config';
 import { getService } from './registry';
 import { getSettings } from './settings-store';
 import { resolveArtifact } from './outputs';
-import { updateJob, insertStat } from './db';
+import { getJob, updateJob, insertStat } from './db';
 import { emitJobUpdate } from './events';
 import { readGpu, sampleProcessTree } from './resources';
 import type { JobRow, JobResultPayload } from './types';
@@ -59,6 +59,11 @@ export async function runExecJob(job: JobRow): Promise<void> {
   let peakRam = 0;
   let childPid: number | null = null;
   let killed = false;
+  let closed = false;
+  let childRatio = 0;
+  let childStage = '';
+  let childMessage = '';
+  let lastBeat = 0;
 
   const child = spawn(svc.entry[0], svc.entry.slice(1), {
     cwd: svc.dir,
@@ -80,10 +85,29 @@ export async function runExecJob(job: JobRow): Promise<void> {
   });
 
   const sampleTimer = setInterval(async () => {
-    if (!childPid) return;
+    if (!childPid || closed) return;
     const gpu = await readGpu();
     if (gpu) peakVram = Math.max(peakVram, gpu.used_mb);
     peakRam = Math.max(peakRam, await sampleProcessTree(childPid));
+
+    const now = Date.now();
+    if (now - lastBeat < 15_000) return;
+    lastBeat = now;
+    const current = getJob(job.id);
+    if (!current || (current.status !== 'running' && current.status !== 'preparing')) return;
+    const started = current.started_at ?? now;
+    const elapsedSec = Math.max(0, (now - started) / 1000);
+    const estimate = Math.max(current.estimate_sec || svc.estimate.duration_sec || 1, 1);
+    const timeRatio = Math.min(0.9, elapsedSec / estimate);
+    const progress = Math.round(Math.max(childRatio, timeRatio) * 1000) / 1000;
+    const gpuNote = gpu ? ` gpu=${gpu.used_mb}MiB` : '';
+    const prefix = childMessage ? `${childMessage} | ` : '';
+    const row = updateJob(job.id, {
+      progress,
+      stage: childStage || current.stage || 'running',
+      message: `${prefix}alive pid=${childPid} elapsed=${Math.round(elapsedSec)}s/${Math.round(estimate)}s${gpuNote}`,
+    });
+    if (row) emitJobUpdate(row);
   }, 2000);
 
   function tryKill(pid: number | null): void {
@@ -119,10 +143,13 @@ export async function runExecJob(job: JobRow): Promise<void> {
       try {
         const ev = JSON.parse(trimmed) as Record<string, unknown>;
         if (ev.type === 'progress') {
+          childRatio = Number(ev.ratio ?? 0);
+          childStage = String(ev.stage ?? '');
+          childMessage = String(ev.message ?? '');
           const row = updateJob(job.id, {
-            progress: Number(ev.ratio ?? 0),
-            stage: String(ev.stage ?? ''),
-            message: String(ev.message ?? ''),
+            progress: childRatio,
+            stage: childStage,
+            message: childMessage,
           });
           if (row) emitJobUpdate(row);
         } else if (ev.type === 'result') {
@@ -145,6 +172,7 @@ export async function runExecJob(job: JobRow): Promise<void> {
     child.on('close', (code) => resolve(code ?? 1));
   });
 
+  closed = true;
   clearTimeout(timeout);
   clearInterval(sampleTimer);
   cancelTokens.delete(job.id);

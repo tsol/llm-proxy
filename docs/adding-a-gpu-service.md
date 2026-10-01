@@ -8,7 +8,7 @@ Exec services are folders under `services/<service_id>/`. The scheduler admits j
 |------|------|
 | **Folder name** | Must equal `id` in `service.yaml` (e.g. `my_task_v1`). |
 | **id** | `^[a-z][a-z0-9_]{2,63}$` |
-| **kind** | Only `exec` today. |
+| **kind** | `exec` for a GPU job. `external` registers an MCP/UI elsewhere (`mcp_url`, `ui_url`, `health`) and takes no jobs or VRAM. |
 | **entry** | Non-empty argv, e.g. `["python3", "run.py"]`. **cwd** = service folder. |
 | **input_schema** | JSON Schema; validated on `POST /v1/services/:id/jobs` (Ajv, defaults + coercion). |
 | **settings.schema.json** | Optional; persisted per service under `store/services/`. Exposed in UI. |

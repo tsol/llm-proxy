@@ -20,7 +20,7 @@ onMounted(async () => { list.value = await fetchServices(); });
         <strong>{{ s.title }}</strong>
         <div class="id">{{ s.id }}</div>
       </td>
-      <td>{{ (s.resources as any)?.vram_mb }} MB</td>
+      <td>{{ s.kind === 'external' ? 'external' : `${(s.resources as any)?.vram_mb} MB` }}</td>
       <td>{{ s.estimate_sec }}</td>
       <td><router-link :to="`/services/${s.id}`">Open</router-link></td>
     </tr>

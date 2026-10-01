@@ -1,0 +1,15 @@
+id: movie_studio_v1
+title: "Movie Studio"
+description: "Talking-head movie project. No GPU. Read and edit the film through its own MCP server; this entry only registers it beside the GPU services."
+version: "1.0.0"
+kind: external
+mcp_url: http://127.0.0.1:5011/mcp
+ui_url: http://127.0.0.1:5010/
+health: http://127.0.0.1:5010/health
+timeout_sec: 30
+residents: { requires: [], evicts: [] }
+resources: { vram_mb: 0, ram_mb: 0, cpu: 0 }
+estimate: { duration_sec: 1 }
+priority_default: normal
+mcp:
+  expose: false

@@ -11,6 +11,9 @@ GPU work runs as `kind: exec` jobs under the shared scheduler (eviction, queue, 
 | `video_t2v_v1` | `videogen/t2v.sh` |
 | `video_r2v_v1` | `videogen/r2v.sh` |
 | `video_exec_v1` | Whitelisted `face_refine`, `bg_replace`, `scene_cinematic`, `dance_scene/*` |
+| `video_face_refine_v1` | `face_refine.sh` (MCP) |
+| `video_bg_replace_v1` | `bg_replace.sh` (MCP) |
+| `movie_studio_v1` | External, no GPU. MCP/UI of talking-head |
 | `motion_photo_object_v1` | `photo_to_object.py` |
 | `motion_photo_scene_v1` | `photo_to_scene.py` |
 | `motion_photo_avatar_v1` | `photo_to_avatar.py` |

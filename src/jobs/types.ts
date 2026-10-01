@@ -19,8 +19,9 @@ export interface ServiceManifest {
   title: string;
   description: string;
   version: string;
-  kind: 'exec';
+  kind: 'exec' | 'external';
   entry: string[];
+  external?: { mcp_url?: string; ui_url?: string; health?: string };
   timeout_sec: number;
   residents: { requires: string[]; evicts: string[] };
   resources: ResourceVector & { min_free_vram_mb?: number };

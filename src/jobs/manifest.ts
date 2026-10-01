@@ -20,21 +20,26 @@ export function loadServiceManifest(dir: string): ServiceManifest {
   if (id !== folderName) {
     throw new Error(`${yamlPath}: id "${id}" must match folder "${folderName}"`);
   }
+  const kind = String(raw.kind ?? 'exec');
+  if (kind !== 'exec' && kind !== 'external') {
+    throw new Error(`${yamlPath}: kind must be exec or external`);
+  }
   const entry = raw.entry;
-  if (!Array.isArray(entry) || entry.length === 0 || !entry.every((e) => typeof e === 'string')) {
+  if (kind === 'exec' && (!Array.isArray(entry) || entry.length === 0 || !entry.every((e) => typeof e === 'string'))) {
     throw new Error(`${yamlPath}: entry must be a non-empty string array`);
   }
   const residents = raw.residents as { requires?: unknown; evicts?: unknown };
   const resources = raw.resources as ServiceManifest['resources'];
   const estimate = raw.estimate as { duration_sec?: number };
   const priority_default = String(raw.priority_default ?? 'normal') as PriorityClass;
-  const input_schema = raw.input_schema;
-  if (!input_schema || typeof input_schema !== 'object') {
-    throw new Error(`${yamlPath}: input_schema required`);
-  }
-  const ajv = new Ajv({ useDefaults: true, coerceTypes: true, allErrors: true });
-  if (!ajv.validateSchema(input_schema as object)) {
-    throw new Error(`${yamlPath}: invalid input_schema`);
+  const input_schema = (raw.input_schema && typeof raw.input_schema === 'object')
+    ? raw.input_schema
+    : { type: 'object', properties: {} };
+  if (kind === 'exec') {
+    const ajv = new Ajv({ useDefaults: true, coerceTypes: true, allErrors: true });
+    if (!ajv.validateSchema(input_schema as object)) {
+      throw new Error(`${yamlPath}: invalid input_schema`);
+    }
   }
 
   let settingsSchema: object | null = null;
@@ -49,8 +54,15 @@ export function loadServiceManifest(dir: string): ServiceManifest {
     title: String(raw.title ?? id),
     description: String(raw.description ?? ''),
     version: String(raw.version ?? '0.0.0'),
-    kind: 'exec',
-    entry: entry as string[],
+    kind: kind as ServiceManifest['kind'],
+    entry: Array.isArray(entry) ? (entry as string[]) : [],
+    external: kind === 'external'
+      ? {
+          mcp_url: raw.mcp_url ? String(raw.mcp_url) : undefined,
+          ui_url: raw.ui_url ? String(raw.ui_url) : undefined,
+          health: raw.health ? String(raw.health) : undefined,
+        }
+      : undefined,
     timeout_sec: Number(raw.timeout_sec ?? 3600),
     residents: {
       requires: Array.isArray(residents?.requires)

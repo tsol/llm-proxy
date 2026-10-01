@@ -1,6 +1,6 @@
 id: video_r2v_v1
 title: "Reference to video (Wan2GP r2v)"
-description: "videogen/r2v.sh via scheduler."
+description: "videogen/r2v.sh via scheduler. Returns a job id immediately. Poll job_status or job_result while the render runs."
 version: "1.0.0"
 kind: exec
 entry: ["python3", "run.py"]
@@ -15,8 +15,15 @@ input_schema:
   additionalProperties: false
   properties:
     prompt: { type: string }
+    duration_sec:
+      type: number
+      minimum: 5.2
+      maximum: 30.7
+      default: 5.2
+      title: Duration (seconds)
+      description: Clip length. 5.2 is the shortest MiniMax H3 will render (124 frames at 24 fps). Longer values snap to its frame grid, up to about 30.7s.
     image_paths: { type: array, items: { type: string }, minItems: 1 }
     cutout: { type: boolean, default: false }
     resolution: { type: string }
     seed: { type: integer }
-mcp: { expose: true, default_wait_sec: 7200 }
+mcp: { expose: true, default_wait_sec: 0 }

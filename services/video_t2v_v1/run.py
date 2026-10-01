@@ -25,7 +25,10 @@ def main() -> int:
     settings = load_json(JOB_SETTINGS) if os.path.isfile(JOB_SETTINGS) else {}
     root = settings.get("videogen_root", "/home/harry/hermes/workspace/code/videogen")
     script = os.path.join(root, "t2v.sh")
-    cmd = [script, inp["prompt"]]
+    cmd = [script]
+    if inp.get("duration_sec") not in (None, ""):
+        cmd.extend(["--seconds", str(inp["duration_sec"])])
+    cmd.append(inp["prompt"])
     if inp.get("seed") is not None:
         cmd.append(str(inp["seed"]))
     emit({"type": "progress", "ratio": 0.05, "stage": "t2v", "message": "starting t2v.sh"})

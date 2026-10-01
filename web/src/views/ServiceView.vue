@@ -82,6 +82,11 @@ async function onCancel(jobId: string) {
     <p><router-link to="/services">← Services</router-link></p>
     <h1>{{ svc.title }}</h1>
     <p class="desc">{{ svc.description }}</p>
+    <p v-if="svc.kind === 'external'">
+      External service.
+      <a v-if="svc.ui_url" :href="svc.ui_url">Open UI</a>
+      <span v-if="svc.mcp_url"> · MCP {{ svc.mcp_url }}</span>
+    </p>
     <nav class="tabs">
       <button :class="{ active: tab === 'settings' }" :disabled="!svc.has_settings" @click="tab = 'settings'">
         Settings

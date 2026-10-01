@@ -1,6 +1,6 @@
 id: video_i2v_v1
 title: "Image to video (Wan2GP i2v)"
-description: "Runs videogen/i2v.sh — evicts ComfyUI/LM Studio via scheduler before Wan2GP."
+description: "Runs videogen/i2v.sh — evicts ComfyUI/LM Studio via scheduler before Wan2GP. Returns a job id immediately. A render takes about 25 minutes; poll job_status or job_result. Do not wait inside this call, and do not cancel a running job just because the call returned while status is running."
 version: "1.0.0"
 kind: exec
 entry: ["python3", "run.py"]
@@ -11,10 +11,27 @@ estimate: { duration_sec: 900 }
 priority_default: normal
 input_schema:
   type: object
-  required: [prompt, image_path]
+  required: [prompt]
   additionalProperties: false
+  anyOf:
+    - required: [image_path]
+    - required: [end_image_path]
   properties:
     prompt: { type: string, minLength: 1 }
-    image_path: { type: string, minLength: 1 }
+    duration_sec:
+      type: number
+      minimum: 5.2
+      maximum: 30.7
+      default: 5.2
+      title: Duration (seconds)
+      description: Clip length. 5.2 is the shortest MiniMax H3 will render (124 frames at 24 fps). Longer values snap to its frame grid, up to about 30.7s.
+    image_path:
+      type: string
+      minLength: 1
+      description: Start frame. Optional when end_image_path is set.
+    end_image_path:
+      type: string
+      minLength: 1
+      description: End frame. Optional. With image_path, the clip starts on one still and ends on the other.
     seed: { type: integer }
-mcp: { expose: true, default_wait_sec: 7200 }
+mcp: { expose: true, default_wait_sec: 0 }

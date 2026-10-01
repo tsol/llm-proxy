@@ -1,0 +1,28 @@
+id: image_edit_qwen_v1
+title: "Edit image — Qwen Image Edit Plus INT4"
+description: "Instruction edit of a photo, optionally using up to 3 extra reference photos, via WanGP Qwen Image Edit Plus Nunchaku INT4, 4 steps. The main image is the scene. Reference photos are objects to place into it, such as a sticker. Returns a job id immediately. Poll job_status. Do not cancel a running job because elapsed is still increasing."
+version: "1.0.0"
+kind: exec
+entry: ["python3", "run.py"]
+timeout_sec: 14400
+residents: { requires: [], evicts: ["*"] }
+resources: { vram_mb: 7200, ram_mb: 20000, cpu: 4, min_free_vram_mb: 3000 }
+estimate: { duration_sec: 180 }
+priority_default: normal
+input_schema:
+  type: object
+  required: [prompt, image_path]
+  additionalProperties: false
+  properties:
+    prompt:
+      type: string
+      minLength: 1
+      description: English edit instruction, e.g. "remove the jacket, keep the face and pose".
+    image_path: { type: string, minLength: 1 }
+    ref_image_paths:
+      type: array
+      maxItems: 3
+      description: Extra photos after the main image. Picture 1 is the scene being edited. These are Picture 2 onward, for example a sticker to place on a wall.
+      items: { type: string, minLength: 1 }
+    seed: { type: integer }
+mcp: { expose: true, default_wait_sec: 0 }

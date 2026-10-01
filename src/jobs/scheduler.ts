@@ -343,6 +343,7 @@ export function submitJob(
 ): JobRow {
   const svc = getService(serviceId);
   if (!svc) throw new Error(`Unknown service: ${serviceId}`);
+  if (svc.kind !== 'exec') throw new Error(`Service ${serviceId} does not run GPU jobs`);
 
   const ajv = new Ajv({ useDefaults: true, coerceTypes: true, allErrors: true });
   const validate = ajv.compile(svc.input_schema);
