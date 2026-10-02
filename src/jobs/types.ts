@@ -18,6 +18,7 @@ export interface ServiceManifest {
   id: string;
   title: string;
   description: string;
+  help: string;
   version: string;
   kind: 'exec' | 'external';
   entry: string[];

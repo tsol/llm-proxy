@@ -23,6 +23,29 @@ def load_json(path: str) -> dict:
         return json.load(f)
 
 
+def extend_h3(cmd: list, inp: dict) -> None:
+    mapping = [
+        ("music", "--music"),
+        ("speech", "--speech"),
+        ("soundscape", "--soundscape"),
+        ("steps", "--steps"),
+        ("flow_shift", "--flow-shift"),
+        ("solver", "--solver"),
+        ("attention_sparsity", "--sparsity"),
+        ("cache_threshold", "--cache"),
+        ("audio_refine", "--audio-refine"),
+        ("resolution", "--resolution"),
+    ]
+    for key, flag in mapping:
+        value = inp.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text == "" or text.lower() == "auto":
+            continue
+        cmd.extend([flag, text])
+
+
 def main() -> int:
     inp = load_json(JOB_INPUT)
     settings = load_json(JOB_SETTINGS) if os.path.isfile(JOB_SETTINGS) else {}
@@ -43,6 +66,7 @@ def main() -> int:
         cmd.extend(["--end", end])
     if inp.get("duration_sec") not in (None, ""):
         cmd.extend(["--seconds", str(inp["duration_sec"])])
+    extend_h3(cmd, inp)
     cmd.append(prompt)
     if image:
         cmd.append(image)

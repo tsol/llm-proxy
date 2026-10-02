@@ -1,6 +1,20 @@
 id: video_t2v_v1
 title: "Text to video (Wan2GP t2v)"
 description: "videogen/t2v.sh via scheduler. Returns a job id immediately. Poll job_status or job_result while the render runs."
+help: |
+  MiniMax H3 не принимает негативный промпт. Звук задаётся текстом, а не отдельным полем.
+
+  Музыка: пустое поле — музыки нет (non_diegetic_music: N/A). Иначе опишите музыку, которую слышит зритель, а не персонажи.
+  Речь: пустое поле — персонажи молчат и закадра нет. Иначе точная реплика. Модель произнесёт её как (S1) <d>[English] …</d>.
+  Звуковой фон: шорохи и атмосфера без голосов. Диалог туда не пишите.
+
+  Если промпт уже содержит integrated_multimodal_description: или subject_definitions:, сервис отправит его как есть и не допишет музыку и речь.
+
+  Это режим без фото: модель придумывает кадр целиком из текста. Чтобы начать с картинки, используйте Image to video. Чтобы держать лицо, используйте Reference to video.
+
+  Окна длинного ролика пишутся в самом промпте:
+  [/duration=5s] — длина окна, [/overlap=18] — плавный стык, [/new_shot] — жёсткий монтажный стык.
+  Пустая строка отделяет окна. Поля одного окна держите без пустых строк.
 version: "1.0.0"
 kind: exec
 entry: ["python3", "run.py"]
@@ -23,5 +37,62 @@ input_schema:
       default: 5.2
       title: Duration (seconds)
       description: Clip length. 5.2 is the shortest MiniMax H3 will render (124 frames at 24 fps). Longer values snap to its frame grid, up to about 30.7s.
-    seed: { type: integer }
+    seed: { type: integer, title: Seed }
+    music:
+      type: string
+      default: ""
+      title: Музыка
+      description: Пусто — музыки нет. Иначе музыка, которую слышит зритель.
+    speech:
+      type: string
+      default: ""
+      title: Речь
+      description: Пусто — персонажи молчат. Иначе точная реплика.
+    soundscape:
+      type: string
+      default: "Quiet room tone and soft movement sounds. No voices."
+      title: Звуковой фон
+      description: Шорохи и атмосфера без голосов и музыки.
+    resolution:
+      type: string
+      enum: ["auto", "832x480", "480x832", "832x832"]
+      default: "832x480"
+      title: Разрешение
+      description: auto для текста означает 832x480.
+    steps:
+      type: integer
+      minimum: 4
+      maximum: 40
+      default: 18
+      title: Шаги
+    flow_shift:
+      type: number
+      minimum: 1
+      maximum: 20
+      default: 12
+      title: Flow shift
+    solver:
+      type: string
+      enum: [euler, res_multistep, ralston_2s]
+      default: euler
+      title: Solver
+    attention_sparsity:
+      type: number
+      minimum: 0
+      maximum: 4
+      default: 1.3
+      title: Разреженность внимания
+      description: Выше — быстрее и грубее. Ниже — ближе к промпту.
+    cache_threshold:
+      type: number
+      minimum: 0
+      maximum: 1
+      default: 0.08
+      title: Порог кэша
+    audio_refine:
+      type: string
+      enum: [none, enabled]
+      default: none
+      title: Доработка звука
+      description: enabled добавляет 6 шагов для звука.
 mcp: { expose: true, default_wait_sec: 0 }

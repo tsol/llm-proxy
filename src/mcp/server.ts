@@ -85,7 +85,7 @@ function buildTools(): Array<{
         principal: { type: 'string' },
       },
     };
-    const desc = `${svc.title}. ${svc.description}`;
+    const desc = [svc.title, svc.description, svc.help].filter(Boolean).join('\n\n');
     tools.push({ name: svc.id, description: desc, inputSchema: schema });
     for (const legacy of svc.mcp.legacy_tool_names ?? []) {
       tools.push({
@@ -153,7 +153,15 @@ function createMcpServer(): Server {
 
     if (name === 'list_services') {
       return {
-        content: [{ type: 'text', text: JSON.stringify(listServices().map((s) => s.id)) }],
+        content: [{
+          type: 'text',
+          text: JSON.stringify(listServices().map((s) => ({
+            id: s.id,
+            title: s.title,
+            description: s.description,
+            help: s.help,
+          }))),
+        }],
       };
     }
     if (name === 'job_status') {

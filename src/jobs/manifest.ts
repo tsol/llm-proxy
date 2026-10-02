@@ -53,6 +53,7 @@ export function loadServiceManifest(dir: string): ServiceManifest {
     id,
     title: String(raw.title ?? id),
     description: String(raw.description ?? ''),
+    help: String(raw.help ?? ''),
     version: String(raw.version ?? '0.0.0'),
     kind: kind as ServiceManifest['kind'],
     entry: Array.isArray(entry) ? (entry as string[]) : [],

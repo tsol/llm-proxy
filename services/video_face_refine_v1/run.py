@@ -38,8 +38,15 @@ def main() -> int:
         cmd.extend(["--strength", str(inp["strength"])])
     if inp.get("faces") is not None:
         cmd.extend(["--faces", str(inp["faces"])])
-    if inp.get("ref_image_path"):
-        cmd.extend(["--ref", str(inp["ref_image_path"])])
+    refs = []
+    raw_refs = inp.get("ref_image_paths")
+    if isinstance(raw_refs, list):
+        refs.extend(str(path).strip() for path in raw_refs if str(path).strip())
+    single = str(inp.get("ref_image_path") or "").strip()
+    if single and single not in refs:
+        refs.append(single)
+    for ref in refs:
+        cmd.extend(["--ref", ref])
     if inp.get("prompt"):
         cmd.extend(["--prompt", str(inp["prompt"])])
     cmd.append(str(inp["video_path"]))

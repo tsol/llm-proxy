@@ -19,6 +19,12 @@ input_schema:
     quality: { type: string, enum: [light, normal, strong] }
     strength: { type: number }
     faces: { type: integer }
-    ref_image_path: { type: string }
+    ref_image_path:
+      type: string
+      description: Одно фото лица. Необязательно.
+    ref_image_paths:
+      type: array
+      items: { type: string }
+      description: Фото лиц, по одному на человека. Необязательно.
     seed: { type: integer }
 mcp: { expose: true, default_wait_sec: 0 }
